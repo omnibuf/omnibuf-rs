@@ -1,0 +1,22 @@
+[package]
+name = "conformance-rs"
+description = "Cross-language conformance suite adapter binary for OmniBuf Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "conformance-rs"
+path = "src/main.rs"
+
+[dependencies]
+omnibuf.workspace = true
+prost.workspace = true
+prost-reflect.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+prost-reflect-build.workspace = true

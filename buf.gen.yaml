@@ -1,0 +1,5 @@
+version: v2
+plugins:
+  - local: ./target/debug/protoc-gen-omnibuf-rs
+    out: crates/conformance-rs/src/generated
+    strategy: all

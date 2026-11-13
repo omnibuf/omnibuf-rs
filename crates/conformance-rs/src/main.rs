@@ -1,0 +1,952 @@
+mod generated;
+
+use std::collections::HashMap;
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::panic::{self, AssertUnwindSafe};
+use std::process;
+
+use omnibuf::wire::{WIRE_UINT, append_varint};
+use omnibuf::{
+    EncodeOptions, Message, OmniBuf, decode_blind, opaque, prost_codec, stringify_blind_json,
+};
+
+pub mod proto_types {
+    use std::sync::LazyLock;
+
+    use prost_reflect::DescriptorPool;
+
+    pub static DESCRIPTOR_POOL: LazyLock<DescriptorPool> = LazyLock::new(|| {
+        DescriptorPool::decode(
+            include_bytes!(concat!(env!("OUT_DIR"), "/file_descriptor_set.bin")).as_ref(),
+        )
+        .expect("valid embedded FileDescriptorSet")
+    });
+
+    pub mod omnibuf {
+        pub mod bench {
+            include!(concat!(env!("OUT_DIR"), "/omnibuf.bench.rs"));
+        }
+        pub mod conformance {
+            include!(concat!(env!("OUT_DIR"), "/omnibuf.conformance.rs"));
+        }
+    }
+}
+
+const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+const WIRE_FORMAT_JSON: u32 = 2;
+
+const TIER_PLUGIN: u32 = 1;
+const TIER_PROTOBUF_TYPES: u32 = 2;
+const TIER_ANNOTATED_STRUCT: u32 = 3;
+const TIER_BLIND: u32 = 4;
+
+// ============================================================================
+// IPC Framing Request & Response Messages
+// ============================================================================
+
+#[derive(Clone, Debug, Default, OmniBuf)]
+#[omnibuf(name = "ConformanceRequest")]
+struct ConformanceRequest {
+    #[omnibuf(id = 1, name = "test_name")]
+    test_name: String,
+    #[omnibuf(id = 2, name = "message_type")]
+    message_type: String,
+    #[omnibuf(id = 3, name = "tier")]
+    tier: u32,
+    #[omnibuf(id = 4, name = "requested_output_format")]
+    requested_output_format: u32,
+    #[omnibuf(id = 5, name = "omnibuf_payload")]
+    omnibuf_payload: Vec<u8>,
+    #[omnibuf(id = 6, name = "json_payload")]
+    json_payload: String,
+    #[omnibuf(id = 7, name = "self_describing")]
+    self_describing: bool,
+    #[omnibuf(id = 8, name = "test_opaque_splice")]
+    test_opaque_splice: bool,
+    #[omnibuf(id = 9, name = "test_opaque_splice_shrink")]
+    test_opaque_splice_shrink: bool,
+}
+
+#[derive(Clone, Debug, Default, OmniBuf)]
+#[omnibuf(name = "ConformanceResponse")]
+struct ConformanceResponse {
+    #[omnibuf(id = 1, name = "parse_error", omitempty)]
+    parse_error: String,
+    #[omnibuf(id = 2, name = "serialize_error", omitempty)]
+    serialize_error: String,
+    #[omnibuf(id = 3, name = "runtime_error", omitempty)]
+    runtime_error: String,
+    #[omnibuf(id = 4, name = "skipped", omitempty)]
+    skipped: String,
+    #[omnibuf(id = 5, name = "omnibuf_payload", omitempty)]
+    omnibuf_payload: Vec<u8>,
+    #[omnibuf(id = 6, name = "json_payload", omitempty)]
+    json_payload: String,
+}
+
+impl ConformanceResponse {
+    fn parse_err(msg: impl Into<String>) -> Self {
+        Self {
+            parse_error: msg.into(),
+            ..Self::default()
+        }
+    }
+
+    fn serialize_err(msg: impl Into<String>) -> Self {
+        Self {
+            serialize_error: msg.into(),
+            ..Self::default()
+        }
+    }
+
+    fn runtime_err(msg: impl Into<String>) -> Self {
+        Self {
+            runtime_error: msg.into(),
+            ..Self::default()
+        }
+    }
+
+    fn skipped_reason(msg: impl Into<String>) -> Self {
+        Self {
+            skipped: msg.into(),
+            ..Self::default()
+        }
+    }
+
+    fn wire(bytes: Vec<u8>) -> Self {
+        Self {
+            omnibuf_payload: bytes,
+            ..Self::default()
+        }
+    }
+
+    fn json(s: String) -> Self {
+        Self {
+            json_payload: s,
+            ..Self::default()
+        }
+    }
+}
+
+// ============================================================================
+// Tier 3: Native Rust Annotated Structs (`#[derive(OmniBuf)]`)
+// ============================================================================
+
+#[derive(Clone, Debug, Default, PartialEq, OmniBuf)]
+#[omnibuf(name = "Location")]
+struct AnnotatedLocation {
+    #[omnibuf(id = 1, name = "region")]
+    region: String,
+    #[omnibuf(id = 2, name = "datacenter")]
+    datacenter: String,
+    #[omnibuf(id = 3, name = "city")]
+    city: String,
+    #[omnibuf(id = 4, name = "rack")]
+    rack: u32,
+    #[omnibuf(id = 5, name = "latitude")]
+    latitude: f32,
+    #[omnibuf(id = 6, name = "longitude")]
+    longitude: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, OmniBuf)]
+#[omnibuf(name = "Neighbor")]
+struct AnnotatedNeighbor {
+    #[omnibuf(id = 1, name = "peer_asn")]
+    peer_asn: u32,
+    #[omnibuf(id = 2, name = "router")]
+    router: String,
+    #[omnibuf(id = 3, name = "latency_us")]
+    latency_us: u32,
+    #[omnibuf(id = 4, name = "established")]
+    established: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, OmniBuf)]
+#[omnibuf(name = "PeerUpdate")]
+struct AnnotatedPeerUpdate {
+    #[omnibuf(id = 1, name = "asn")]
+    asn: u32,
+    #[omnibuf(id = 2, name = "router_id")]
+    router_id: String,
+    #[omnibuf(id = 3, name = "active")]
+    active: bool,
+    #[omnibuf(id = 4, name = "uptime_sec")]
+    uptime_sec: u64,
+    #[omnibuf(id = 5, name = "rssi_dbm")]
+    rssi_dbm: i32,
+    #[omnibuf(id = 6, name = "cpu_load")]
+    cpu_load: f64,
+    #[omnibuf(id = 7, name = "tags")]
+    tags: Vec<String>,
+    #[omnibuf(id = 8, name = "prefixes")]
+    prefixes: Vec<u32>,
+    #[omnibuf(id = 9, name = "location")]
+    location: AnnotatedLocation,
+    #[omnibuf(id = 10, name = "neighbors")]
+    neighbors: Vec<AnnotatedNeighbor>,
+    #[omnibuf(id = 11, name = "sequence")]
+    sequence: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, OmniBuf)]
+#[omnibuf(name = "AllTypesSubMsg")]
+struct AnnotatedAllTypesSubMsg {
+    #[omnibuf(id = 1, name = "id")]
+    id: u32,
+    #[omnibuf(id = 2, name = "label")]
+    label: String,
+    #[omnibuf(id = 3, name = "flag")]
+    flag: bool,
+    #[omnibuf(id = 4, name = "score", wire = "sint")]
+    score: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, OmniBuf)]
+#[omnibuf(name = "TestAllTypes")]
+struct AnnotatedTestAllTypes {
+    #[omnibuf(id = 1, name = "f1_uint32")]
+    f1_uint32: u32,
+    #[omnibuf(id = 2, name = "f2_uint64")]
+    f2_uint64: u64,
+    #[omnibuf(id = 3, name = "f3_sint32", wire = "sint")]
+    f3_sint32: i32,
+    #[omnibuf(id = 4, name = "f4_sint64", wire = "sint")]
+    f4_sint64: i64,
+    #[omnibuf(id = 5, name = "f5_bool")]
+    f5_bool: bool,
+    #[omnibuf(id = 6, name = "f6_string")]
+    f6_string: String,
+    #[omnibuf(id = 7, name = "f7_bytes")]
+    f7_bytes: Vec<u8>,
+    #[omnibuf(id = 8, name = "f8_sub_msg")]
+    f8_sub_msg: Option<AnnotatedAllTypesSubMsg>,
+    #[omnibuf(id = 9, name = "f9_string_arr")]
+    f9_string_arr: Vec<String>,
+    #[omnibuf(id = 10, name = "f10_uint32_arr")]
+    f10_uint32_arr: Vec<u32>,
+    #[omnibuf(id = 11, name = "f11_sub_msg_arr")]
+    f11_sub_msg_arr: Vec<AnnotatedAllTypesSubMsg>,
+    #[omnibuf(id = 12, name = "f12_map_str_uint")]
+    f12_map_str_uint: HashMap<String, u64>,
+    #[omnibuf(id = 13, name = "f13_float32")]
+    f13_float32: f32,
+    #[omnibuf(id = 14, name = "f14_float64")]
+    f14_float64: f64,
+    #[omnibuf(id = 15, name = "f15_fixed32", wire = "fixed32")]
+    f15_fixed32: u32,
+    #[omnibuf(id = 16, name = "f16_fixed64", wire = "fixed64")]
+    f16_fixed64: u64,
+    #[omnibuf(id = 20, name = "f20_overflow_str")]
+    f20_overflow_str: String,
+}
+
+#[allow(clippy::vec_box)]
+#[derive(Clone, Debug, Default, PartialEq, OmniBuf)]
+#[omnibuf(name = "TreeNode")]
+struct AnnotatedTreeNode {
+    #[omnibuf(id = 1, name = "id")]
+    id: u32,
+    #[omnibuf(id = 2, name = "name")]
+    name: String,
+    #[omnibuf(id = 3, name = "weight", wire = "sint")]
+    weight: i64,
+    #[omnibuf(id = 4, name = "primary")]
+    primary: Option<Box<AnnotatedTreeNode>>,
+    #[omnibuf(id = 5, name = "children")]
+    children: Vec<AnnotatedTreeNode>,
+    #[omnibuf(id = 6, name = "branches")]
+    branches: Vec<Box<AnnotatedTreeNode>>,
+    #[omnibuf(id = 7, name = "labels")]
+    labels: HashMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, OmniBuf)]
+#[omnibuf(name = "NestedNIC")]
+struct AnnotatedNestedNic {
+    #[omnibuf(id = 1, name = "if_index")]
+    if_index: u32,
+    #[omnibuf(id = 2, name = "mac")]
+    mac: String,
+    #[omnibuf(id = 3, name = "ips")]
+    ips: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, OmniBuf)]
+#[omnibuf(name = "NestedServer")]
+struct AnnotatedNestedServer {
+    #[omnibuf(id = 1, name = "server_id")]
+    server_id: u32,
+    #[omnibuf(id = 2, name = "hostname")]
+    hostname: String,
+    #[omnibuf(id = 3, name = "nics")]
+    nics: Vec<AnnotatedNestedNic>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, OmniBuf)]
+#[omnibuf(name = "NestedRack")]
+struct AnnotatedNestedRack {
+    #[omnibuf(id = 1, name = "rack_id")]
+    rack_id: u32,
+    #[omnibuf(id = 2, name = "zone")]
+    zone: String,
+    #[omnibuf(id = 3, name = "servers")]
+    servers: Vec<AnnotatedNestedServer>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, OmniBuf)]
+#[omnibuf(name = "NestedCluster")]
+struct AnnotatedNestedCluster {
+    #[omnibuf(id = 1, name = "cluster_name")]
+    cluster_name: String,
+    #[omnibuf(id = 2, name = "racks")]
+    racks: Vec<AnnotatedNestedRack>,
+    #[omnibuf(id = 3, name = "epoch")]
+    epoch: u64,
+}
+
+// ============================================================================
+// Main IPC Frame Loop
+// ============================================================================
+
+fn main() {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut reader = BufReader::new(stdin.lock());
+    let mut writer = BufWriter::new(stdout.lock());
+
+    loop {
+        let req = match read_frame(&mut reader) {
+            Ok(Some(req)) => req,
+            Ok(None) => break,
+            Err(err) => {
+                eprintln!("conformance-rs read frame error: {err}");
+                process::exit(1);
+            }
+        };
+
+        let _ = (&req.test_name, &req.json_payload);
+
+        let resp = match panic::catch_unwind(AssertUnwindSafe(|| handle_request(&req))) {
+            Ok(r) => r,
+            Err(payload) => {
+                let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                    (*s).to_owned()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "panic during conformance request".to_owned()
+                };
+                ConformanceResponse::runtime_err(format!("panic: {msg}"))
+            }
+        };
+
+        if let Err(err) = write_frame(&mut writer, &resp) {
+            eprintln!("conformance-rs write frame error: {err}");
+            process::exit(1);
+        }
+    }
+}
+
+fn read_frame<R: Read>(reader: &mut R) -> io::Result<Option<ConformanceRequest>> {
+    let mut len_buf = [0u8; 4];
+    let first = reader.read(&mut len_buf[..1])?;
+    if first == 0 {
+        return Ok(None);
+    }
+    reader.read_exact(&mut len_buf[1..])?;
+    let size = u32::from_le_bytes(len_buf) as usize;
+    if size > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame size {size} exceeds limit {MAX_FRAME_BYTES}"),
+        ));
+    }
+    let mut payload = vec![0u8; size];
+    if size > 0 {
+        reader.read_exact(&mut payload)?;
+    }
+    ConformanceRequest::from_omnibuf(&payload)
+        .map(Some)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+}
+
+fn write_frame<W: Write>(writer: &mut W, resp: &ConformanceResponse) -> io::Result<()> {
+    let payload = resp
+        .encode_omnibuf()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let len_bytes = (payload.len() as u32).to_le_bytes();
+    writer.write_all(&len_bytes)?;
+    if !payload.is_empty() {
+        writer.write_all(&payload)?;
+    }
+    writer.flush()
+}
+
+fn handle_request(req: &ConformanceRequest) -> ConformanceResponse {
+    match req.tier {
+        TIER_BLIND => handle_blind_tier(req),
+        TIER_PLUGIN => handle_plugin_tier(req),
+        TIER_PROTOBUF_TYPES => handle_protobuf_types_tier(req),
+        TIER_ANNOTATED_STRUCT => handle_annotated_struct_tier(req),
+        other => ConformanceResponse::runtime_err(format!("unsupported tier: {other}")),
+    }
+}
+
+// ============================================================================
+// Tier 4: Blind Inspection
+// ============================================================================
+
+fn handle_blind_tier(req: &ConformanceRequest) -> ConformanceResponse {
+    let map = match decode_blind(&req.omnibuf_payload) {
+        Ok(m) => m,
+        Err(err) => return ConformanceResponse::parse_err(err.to_string()),
+    };
+    if req.requested_output_format == WIRE_FORMAT_JSON {
+        return ConformanceResponse::json(stringify_blind_json(&map, None, true));
+    }
+    ConformanceResponse::default()
+}
+
+// ============================================================================
+// Tier 1: Plugin-Generated Code + Opaque Views & Splicing
+// ============================================================================
+
+fn handle_plugin_tier(req: &ConformanceRequest) -> ConformanceResponse {
+    use generated::conformance_omnibuf::{AllTypesSubMsg, OpaqueTestAllTypes, TestAllTypes};
+    use generated::peer_omnibuf::{Location, Neighbor, OpaquePeerUpdate, PeerUpdate};
+
+    if req.test_opaque_splice || req.test_opaque_splice_shrink {
+        if let Err(err) = check_splice_aliased_prefix(&req.omnibuf_payload) {
+            return ConformanceResponse::runtime_err(err);
+        }
+    }
+
+    match req.message_type.as_str() {
+        "omnibuf.bench.PeerUpdate" => {
+            let mut msg = PeerUpdate {
+                asn: 999_999,
+                router_id: "stale-router".to_owned(),
+                active: true,
+                uptime_sec: 123,
+                rssi_dbm: -42,
+                cpu_load: 1.5,
+                tags: vec!["stale-tag".to_owned()],
+                prefixes: vec![999],
+                location: Some(Location {
+                    region: "stale".to_owned(),
+                    datacenter: "stale-dc".to_owned(),
+                    city: "stale-city".to_owned(),
+                    rack: 999,
+                    latitude: 1.0,
+                    longitude: 2.0,
+                }),
+                neighbors: vec![Neighbor {
+                    peer_asn: 999,
+                    router: "stale-neighbor".to_owned(),
+                    latency_us: 10,
+                    established: true,
+                }],
+                sequence: 999_999,
+            };
+            if let Err(err) = msg.unmarshal_omnibuf(&req.omnibuf_payload) {
+                return ConformanceResponse::parse_err(err.to_string());
+            }
+
+            let mut op = OpaquePeerUpdate::new(&req.omnibuf_payload);
+            let want_city = msg.location.as_ref().map_or("", |loc| loc.city.as_str());
+            if op.get_asn() != msg.asn
+                || op.get_router_id() != msg.router_id
+                || op.get_active() != msg.active
+                || op.get_uptime_sec() != msg.uptime_sec
+                || op.get_rssi_dbm() != msg.rssi_dbm
+                || op.get_cpu_load().to_bits() != msg.cpu_load.to_bits()
+                || op.tags_len() != msg.tags.len()
+                || op.prefixes_len() != msg.prefixes.len()
+                || op.get_location().get_city() != want_city
+                || op.neighbors_len() != msg.neighbors.len()
+                || op.get_sequence() != msg.sequence
+            {
+                return ConformanceResponse::parse_err(
+                    "opaque PeerUpdate getter mismatch with decoded struct",
+                );
+            }
+
+            if req.test_opaque_splice {
+                let next_active = !op.get_active();
+                let next_seq = op.get_sequence().wrapping_add(1);
+                op.set_asn(1_000_000);
+                op.set_router_id("edge-rtr-fra01-".repeat(20));
+                op.set_active(next_active);
+                op.set_uptime_sec(u64::MAX);
+                op.set_rssi_dbm(-1_000_000);
+                op.set_cpu_load(99.875);
+                op.set_tags(vec![
+                    "tag-grow-a".to_owned(),
+                    "tag-grow-b".to_owned(),
+                    "long-tag-".repeat(20),
+                ]);
+                op.set_prefixes(vec![100_000, 200_000, 300_000, 400_000, 500_000, 600_000]);
+                op.set_location(Some(Location {
+                    region: "eu-central-grown".to_owned(),
+                    datacenter: "fra-dc-".repeat(25),
+                    city: "Berlin".to_owned(),
+                    rack: 999_999,
+                    latitude: 52.52,
+                    longitude: 13.405,
+                }));
+                op.set_sequence(next_seq);
+                return ConformanceResponse::wire(op.marshal());
+            }
+
+            if req.test_opaque_splice_shrink {
+                op.set_asn(1);
+                op.set_router_id("r");
+                op.set_active(false);
+                op.set_uptime_sec(5);
+                op.set_rssi_dbm(-1);
+                op.set_cpu_load(0.5);
+                op.set_tags(vec!["t".to_owned()]);
+                op.set_prefixes(vec![1]);
+                op.set_location(Some(Location {
+                    region: "r".to_owned(),
+                    datacenter: "d".to_owned(),
+                    city: "c".to_owned(),
+                    rack: 1,
+                    latitude: 1.0,
+                    longitude: 2.0,
+                }));
+                op.set_sequence(2);
+                return ConformanceResponse::wire(op.marshal());
+            }
+
+            if req.self_describing {
+                return match msg.encode_omnibuf_with_options(EncodeOptions::self_describing()) {
+                    Ok(out) => ConformanceResponse::wire(out),
+                    Err(err) => ConformanceResponse::serialize_err(err.to_string()),
+                };
+            }
+            ConformanceResponse::wire(msg.marshal_omnibuf())
+        }
+
+        "omnibuf.conformance.TestAllTypes" => {
+            let mut msg = TestAllTypes {
+                f1_uint32: 999_999,
+                f5_bool: true,
+                f6_string: "stale-str".to_owned(),
+                f7_bytes: vec![0xff],
+                f8_sub_msg: Some(AllTypesSubMsg {
+                    id: 999,
+                    label: "stale-sub".to_owned(),
+                    flag: true,
+                    score: -999,
+                }),
+                f9_string_arr: vec!["stale".to_owned()],
+                f10_uint32_arr: vec![999],
+                f11_sub_msg_arr: vec![AllTypesSubMsg {
+                    id: 999,
+                    label: "stale-elem".to_owned(),
+                    flag: false,
+                    score: 0,
+                }],
+                f12_map_str_uint: HashMap::from([("stale".to_owned(), 999)]),
+                f20_overflow_str: "stale-overflow".to_owned(),
+                ..TestAllTypes::default()
+            };
+
+            if let Err(err) = msg.unmarshal_omnibuf(&req.omnibuf_payload) {
+                return ConformanceResponse::parse_err(err.to_string());
+            }
+
+            let mut op = OpaqueTestAllTypes::new(&req.omnibuf_payload);
+            let _ = op.lookup_f12_map_str_uint("k");
+            let default_sub = AllTypesSubMsg::default();
+            let want_sub = msg.f8_sub_msg.as_ref().unwrap_or(&default_sub);
+            let op_sub = op.get_f8_sub_msg();
+            if op.get_f1_uint32() != msg.f1_uint32
+                || op.get_f2_uint64() != msg.f2_uint64
+                || op.get_f3_sint32() != msg.f3_sint32
+                || op.get_f4_sint64() != msg.f4_sint64
+                || op.get_f5_bool() != msg.f5_bool
+                || op.get_f6_string() != msg.f6_string
+                || op.get_f7_bytes() != msg.f7_bytes.as_slice()
+                || op_sub.get_id() != want_sub.id
+                || op_sub.get_label() != want_sub.label
+                || op_sub.get_flag() != want_sub.flag
+                || op_sub.get_score() != want_sub.score
+                || op.f9_string_arr_len() != msg.f9_string_arr.len()
+                || op.f10_uint32_arr_len() != msg.f10_uint32_arr.len()
+                || op.f11_sub_msg_arr_len() != msg.f11_sub_msg_arr.len()
+                || float32_canonical_bits(op.get_f13_float32())
+                    != float32_canonical_bits(msg.f13_float32)
+                || float64_canonical_bits(op.get_f14_float64())
+                    != float64_canonical_bits(msg.f14_float64)
+                || op.get_f15_fixed32() != msg.f15_fixed32
+                || op.get_f16_fixed64() != msg.f16_fixed64
+                || op.get_f20_overflow_str() != msg.f20_overflow_str
+            {
+                return ConformanceResponse::parse_err(
+                    "opaque TestAllTypes getter mismatch with decoded struct",
+                );
+            }
+
+            if req.test_opaque_splice {
+                let next_bool = !op.get_f5_bool();
+                op.set_f1_uint32(1_000_000);
+                op.set_f2_uint64(u64::MAX);
+                op.set_f3_sint32(-1_000_000);
+                op.set_f4_sint64(i64::MIN);
+                op.set_f5_bool(next_bool);
+                op.set_f6_string("grown-str-".repeat(30));
+                op.set_f7_bytes([0xabu8, 0xcdu8].repeat(130));
+                op.set_f8_sub_msg(Some(AllTypesSubMsg {
+                    id: 888_888,
+                    label: "sub-grown-".repeat(20),
+                    flag: true,
+                    score: -999_999_999,
+                }));
+                op.set_f9_string_arr(vec![
+                    "arr-grow-1".to_owned(),
+                    "arr-grow-2".to_owned(),
+                    "arr-grow-3-".repeat(15),
+                ]);
+                op.set_f10_uint32_arr(vec![100_000, 200_000, 300_000, 400_000, 500_000]);
+                op.set_f11_sub_msg_arr(vec![
+                    AllTypesSubMsg {
+                        id: 100_001,
+                        label: "elem0-".repeat(25),
+                        flag: true,
+                        score: -500_000,
+                    },
+                    AllTypesSubMsg {
+                        id: 100_002,
+                        label: "elem1-grown".to_owned(),
+                        flag: false,
+                        score: 500_000,
+                    },
+                ]);
+                op.set_f12_map_str_uint(HashMap::from([
+                    ("k1".to_owned(), 1_000_000),
+                    ("k2".to_owned(), u64::MAX),
+                    ("k3_long_key".to_owned(), 424_242),
+                ]));
+                op.set_f13_float32(-1234.5);
+                op.set_f14_float64(std::f64::consts::PI);
+                op.set_f15_fixed32(0xdead_beef);
+                op.set_f16_fixed64(0xcafe_babe_dead_beef);
+                op.set_f20_overflow_str("overflow20-".repeat(20));
+                return ConformanceResponse::wire(op.marshal());
+            }
+
+            if req.test_opaque_splice_shrink {
+                op.set_f1_uint32(1);
+                op.set_f2_uint64(2);
+                op.set_f3_sint32(-1);
+                op.set_f4_sint64(-2);
+                op.set_f5_bool(false);
+                op.set_f6_string("s");
+                op.set_f7_bytes(vec![0x01]);
+                op.set_f8_sub_msg(Some(AllTypesSubMsg {
+                    id: 1,
+                    label: "x".to_owned(),
+                    flag: false,
+                    score: -1,
+                }));
+                op.set_f9_string_arr(vec!["a".to_owned()]);
+                op.set_f10_uint32_arr(vec![7]);
+                op.set_f11_sub_msg_arr(vec![AllTypesSubMsg {
+                    id: 1,
+                    label: "e".to_owned(),
+                    flag: true,
+                    score: 1,
+                }]);
+                op.set_f12_map_str_uint(HashMap::from([("k".to_owned(), 1)]));
+                op.set_f13_float32(0.5);
+                op.set_f14_float64(-0.25);
+                op.set_f15_fixed32(7);
+                op.set_f16_fixed64(9);
+                op.set_f20_overflow_str("z");
+                return ConformanceResponse::wire(op.marshal());
+            }
+
+            ConformanceResponse::wire(msg.marshal_omnibuf())
+        }
+
+        _ => ConformanceResponse::skipped_reason(
+            "plugin tier generated for PeerUpdate and TestAllTypes",
+        ),
+    }
+}
+
+fn check_splice_aliased_prefix(packet: &[u8]) -> Result<(), String> {
+    let append_dirty = |dst: &mut Vec<u8>, fnum: u16| {
+        append_varint(dst, (u64::from(fnum) << 4) | u64::from(WIRE_UINT));
+        append_varint(dst, 1u64 << 40);
+    };
+    let original = packet.to_vec();
+    let spliced = opaque::splice_fields_vec(packet, 1 << 1, 2, append_dirty);
+
+    for prefix_len in [0usize, 3, 32] {
+        for extra_cap in [0usize, 512] {
+            let prefix = vec![0xa5u8; prefix_len];
+            let mut dst = Vec::with_capacity(prefix_len + packet.len() + extra_cap);
+            dst.extend_from_slice(&prefix);
+
+            let mut want = prefix;
+            want.extend_from_slice(&spliced);
+
+            opaque::splice_fields(&mut dst, packet, 1 << 1, 2, append_dirty);
+            if dst != want {
+                return Err(format!(
+                    "opaque splice with {prefix_len}-byte prefix changed prefix or output"
+                ));
+            }
+            if packet != original.as_slice() {
+                return Err(format!(
+                    "opaque splice with {prefix_len}-byte prefix modified source packet"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+fn float32_canonical_bits(f: f32) -> u32 {
+    if f.is_nan() { 0x7fc0_0000 } else { f.to_bits() }
+}
+
+#[inline]
+fn float64_canonical_bits(f: f64) -> u64 {
+    if f.is_nan() {
+        0x7ff8_0000_0000_0000
+    } else {
+        f.to_bits()
+    }
+}
+
+// ============================================================================
+// Tier 2: Standard `prost` Protobuf Types
+// ============================================================================
+
+fn handle_protobuf_types_tier(req: &ConformanceRequest) -> ConformanceResponse {
+    use proto_types::omnibuf::bench::{Location, Neighbor, PeerUpdate};
+    use proto_types::omnibuf::conformance::{AllTypesSubMsg, TestAllTypes};
+
+    let opts = EncodeOptions {
+        deterministic: true,
+        self_describing: req.self_describing,
+    };
+
+    match req.message_type.as_str() {
+        "omnibuf.bench.PeerUpdate" => {
+            let mut msg = PeerUpdate {
+                asn: 999_999,
+                router_id: "stale-router".to_owned(),
+                active: true,
+                uptime_sec: 55,
+                rssi_dbm: -12,
+                cpu_load: 42.0,
+                tags: vec!["stale".to_owned()],
+                prefixes: vec![999],
+                location: Some(Location {
+                    region: "stale".to_owned(),
+                    datacenter: "stale".to_owned(),
+                    city: "stale".to_owned(),
+                    rack: 999,
+                    latitude: 1.0,
+                    longitude: 2.0,
+                }),
+                neighbors: vec![Neighbor {
+                    peer_asn: 999,
+                    router: "stale".to_owned(),
+                    latency_us: 1,
+                    established: true,
+                }],
+                sequence: 999,
+            };
+            let mut reflected = msg.clone();
+            if let Err(err) = prost_codec::decode_prost(&req.omnibuf_payload, &mut reflected) {
+                return ConformanceResponse::parse_err(err.to_string());
+            }
+            if let Err(err) = msg.decode_omnibuf(&req.omnibuf_payload) {
+                return ConformanceResponse::parse_err(err.to_string());
+            }
+            match msg.encode_omnibuf_with_options(opts) {
+                Ok(out) => ConformanceResponse::wire(out),
+                Err(err) => ConformanceResponse::serialize_err(err.to_string()),
+            }
+        }
+
+        "omnibuf.conformance.TestAllTypes" => {
+            let mut msg = TestAllTypes {
+                f1_uint32: 999_999,
+                f5_bool: true,
+                f6_string: "stale".to_owned(),
+                f7_bytes: vec![0xaa],
+                f8_sub_msg: Some(AllTypesSubMsg {
+                    id: 999,
+                    label: "stale".to_owned(),
+                    flag: true,
+                    score: -999,
+                }),
+                f9_string_arr: vec!["stale".to_owned()],
+                f10_uint32_arr: vec![999],
+                f11_sub_msg_arr: vec![AllTypesSubMsg {
+                    id: 999,
+                    label: "stale".to_owned(),
+                    flag: false,
+                    score: 0,
+                }],
+                f12_map_str_uint: HashMap::from([("stale".to_owned(), 999)]),
+                f20_overflow_str: "stale".to_owned(),
+                ..TestAllTypes::default()
+            };
+            let mut reflected = msg.clone();
+            if let Err(err) = prost_codec::decode_prost(&req.omnibuf_payload, &mut reflected) {
+                return ConformanceResponse::parse_err(err.to_string());
+            }
+            if let Err(err) = msg.decode_omnibuf(&req.omnibuf_payload) {
+                return ConformanceResponse::parse_err(err.to_string());
+            }
+            match msg.encode_omnibuf_with_options(opts) {
+                Ok(out) => ConformanceResponse::wire(out),
+                Err(err) => ConformanceResponse::serialize_err(err.to_string()),
+            }
+        }
+
+        _ => ConformanceResponse::skipped_reason(
+            "protobuf types tier generated for PeerUpdate and TestAllTypes",
+        ),
+    }
+}
+
+// ============================================================================
+// Tier 3: Plain Annotated Rust Structs (`#[derive(OmniBuf)]`)
+// ============================================================================
+
+fn handle_annotated_struct_tier(req: &ConformanceRequest) -> ConformanceResponse {
+    let opts = EncodeOptions {
+        deterministic: true,
+        self_describing: req.self_describing,
+    };
+
+    match req.message_type.as_str() {
+        "omnibuf.bench.PeerUpdate" => {
+            let mut msg = AnnotatedPeerUpdate {
+                asn: 999_999,
+                router_id: "stale-router".to_owned(),
+                active: true,
+                uptime_sec: 123,
+                rssi_dbm: -70,
+                cpu_load: 12.5,
+                tags: vec!["stale-tag".to_owned()],
+                prefixes: vec![999],
+                location: AnnotatedLocation {
+                    region: "stale-region".to_owned(),
+                    datacenter: "stale-dc".to_owned(),
+                    city: "stale-city".to_owned(),
+                    rack: 999,
+                    latitude: 1.0,
+                    longitude: 2.0,
+                },
+                neighbors: vec![AnnotatedNeighbor {
+                    peer_asn: 999,
+                    router: "stale-neighbor".to_owned(),
+                    latency_us: 5,
+                    established: true,
+                }],
+                sequence: 999_999,
+            };
+            round_trip_annotated(&req.omnibuf_payload, &mut msg, opts)
+        }
+
+        "omnibuf.conformance.TreeNode" => {
+            let mut msg = AnnotatedTreeNode {
+                id: 999,
+                name: "stale-root".to_owned(),
+                weight: -999,
+                primary: Some(Box::new(AnnotatedTreeNode {
+                    id: 888,
+                    name: "stale-primary".to_owned(),
+                    ..AnnotatedTreeNode::default()
+                })),
+                children: vec![AnnotatedTreeNode {
+                    id: 777,
+                    name: "stale-child".to_owned(),
+                    ..AnnotatedTreeNode::default()
+                }],
+                branches: vec![Box::new(AnnotatedTreeNode {
+                    id: 666,
+                    name: "stale-branch".to_owned(),
+                    ..AnnotatedTreeNode::default()
+                })],
+                labels: HashMap::from([("stale".to_owned(), 1)]),
+            };
+            round_trip_annotated(&req.omnibuf_payload, &mut msg, opts)
+        }
+
+        "omnibuf.conformance.NestedCluster" => {
+            let mut msg = AnnotatedNestedCluster {
+                cluster_name: "stale-cluster".to_owned(),
+                racks: vec![AnnotatedNestedRack {
+                    rack_id: 999,
+                    zone: "stale-zone".to_owned(),
+                    servers: vec![AnnotatedNestedServer {
+                        server_id: 999,
+                        hostname: "stale-host".to_owned(),
+                        nics: vec![AnnotatedNestedNic {
+                            if_index: 99,
+                            mac: "ff:ff:ff:ff:ff:ff".to_owned(),
+                            ips: vec![123],
+                        }],
+                    }],
+                }],
+                epoch: 999,
+            };
+            round_trip_annotated(&req.omnibuf_payload, &mut msg, opts)
+        }
+
+        _ => {
+            let mut msg = AnnotatedTestAllTypes {
+                f1_uint32: 999_999,
+                f5_bool: true,
+                f6_string: "stale-str".to_owned(),
+                f7_bytes: vec![0xff],
+                f8_sub_msg: Some(AnnotatedAllTypesSubMsg {
+                    id: 999,
+                    label: "stale-sub".to_owned(),
+                    flag: true,
+                    score: -999,
+                }),
+                f9_string_arr: vec!["stale".to_owned()],
+                f10_uint32_arr: vec![999],
+                f11_sub_msg_arr: vec![AnnotatedAllTypesSubMsg {
+                    id: 999,
+                    label: "stale-elem".to_owned(),
+                    flag: false,
+                    score: 0,
+                }],
+                f12_map_str_uint: HashMap::from([("stale".to_owned(), 999)]),
+                f20_overflow_str: "stale-overflow".to_owned(),
+                ..AnnotatedTestAllTypes::default()
+            };
+            round_trip_annotated(&req.omnibuf_payload, &mut msg, opts)
+        }
+    }
+}
+
+fn round_trip_annotated<M: Message>(
+    payload: &[u8],
+    msg: &mut M,
+    opts: EncodeOptions,
+) -> ConformanceResponse {
+    if let Err(err) = msg.decode_omnibuf(payload) {
+        return ConformanceResponse::parse_err(err.to_string());
+    }
+    match msg.encode_omnibuf_with_options(opts) {
+        Ok(out) => ConformanceResponse::wire(out),
+        Err(err) => ConformanceResponse::serialize_err(err.to_string()),
+    }
+}

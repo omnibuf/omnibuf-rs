@@ -1,0 +1,143 @@
+{
+  "language": "rust",
+  "runtime": "rustc 1.94.0",
+  "platform": "darwin",
+  "arch": "arm64",
+  "cpu": "Apple M1 Pro",
+  "workload": "PeerUpdate",
+  "categories": [
+    {
+      "id": "encode",
+      "title": "Full Message Encode Speed (PeerUpdate)",
+      "unit": "ns",
+      "results": [
+        {
+          "name": "OmniBuf (Generated)",
+          "nsPerOp": 184,
+          "opsPerSec": 5422254,
+          "wireBytes": 366,
+          "highlight": true,
+          "baseline": true
+        },
+        {
+          "name": "OmniBuf (#[derive(OmniBuf)])",
+          "nsPerOp": 189,
+          "opsPerSec": 5292516,
+          "wireBytes": 366,
+          "highlight": true
+        },
+        {
+          "name": "prost (Protobuf)",
+          "nsPerOp": 308,
+          "opsPerSec": 3243602,
+          "wireBytes": 341
+        },
+        {
+          "name": "rmp-serde (MessagePack)",
+          "nsPerOp": 829,
+          "opsPerSec": 1205552,
+          "wireBytes": 626
+        },
+        {
+          "name": "serde_json",
+          "nsPerOp": 1037,
+          "opsPerSec": 964325,
+          "wireBytes": 803
+        }
+      ]
+    },
+    {
+      "id": "decode",
+      "title": "Full Message Decode Speed (PeerUpdate)",
+      "unit": "ns",
+      "results": [
+        {
+          "name": "OmniBuf (#[derive(OmniBuf)])",
+          "nsPerOp": 660,
+          "opsPerSec": 1515958,
+          "highlight": true
+        },
+        {
+          "name": "OmniBuf (Generated)",
+          "nsPerOp": 679,
+          "opsPerSec": 1472493,
+          "highlight": true,
+          "baseline": true
+        },
+        {
+          "name": "prost (Protobuf)",
+          "nsPerOp": 861,
+          "opsPerSec": 1161797
+        },
+        {
+          "name": "rmp-serde (MessagePack)",
+          "nsPerOp": 1127,
+          "opsPerSec": 887521
+        },
+        {
+          "name": "serde_json",
+          "nsPerOp": 1723,
+          "opsPerSec": 580376
+        }
+      ]
+    },
+    {
+      "id": "lookup_city",
+      "title": "Read a Single Nested Field (peer.location.city)",
+      "unit": "ns",
+      "results": [
+        {
+          "name": "OmniBuf (Generated)",
+          "nsPerOp": 92,
+          "opsPerSec": 10832318,
+          "highlight": true,
+          "baseline": true
+        },
+        {
+          "name": "prost (Protobuf)",
+          "nsPerOp": 860,
+          "opsPerSec": 1163193
+        },
+        {
+          "name": "rmp-serde (MessagePack)",
+          "nsPerOp": 1119,
+          "opsPerSec": 893800
+        },
+        {
+          "name": "serde_json",
+          "nsPerOp": 1710,
+          "opsPerSec": 584924
+        }
+      ]
+    },
+    {
+      "id": "mutate_sequence",
+      "title": "Selective Single-Field Mutation (peer.sequence)",
+      "unit": "ns",
+      "results": [
+        {
+          "name": "OmniBuf (Generated)",
+          "nsPerOp": 116,
+          "opsPerSec": 8645383,
+          "highlight": true,
+          "baseline": true
+        },
+        {
+          "name": "prost (Protobuf)",
+          "nsPerOp": 1209,
+          "opsPerSec": 827192
+        },
+        {
+          "name": "rmp-serde (MessagePack)",
+          "nsPerOp": 1965,
+          "opsPerSec": 508907
+        },
+        {
+          "name": "serde_json",
+          "nsPerOp": 2805,
+          "opsPerSec": 356487
+        }
+      ]
+    }
+  ]
+}
