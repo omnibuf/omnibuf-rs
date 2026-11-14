@@ -1,5 +1,7 @@
 # omnibuf-rs
 
+[![CI](https://github.com/omnibuf/omnibuf-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/omnibuf/omnibuf-rs/actions/workflows/ci.yml)
+
 Rust runtime, procedural derive macro, and Buf / Protobuf code generator for the OmniBuf binary wire format. Verified against `758/758` cross-language conformance cases.
 
 ## Workspace Crates

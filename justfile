@@ -24,7 +24,7 @@ proto:
 # Alias for proto code generation
 generate: proto
 
-# Run the cross-language OmniBuf conformance suite (584 test cases across all 4 tiers)
+# Run the cross-language OmniBuf conformance suite (758 test cases across all 4 tiers)
 conformance:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -35,6 +35,8 @@ conformance:
         RUNNER="../omnibuf-go/bin/conformance-runner"
     elif command -v conformance-runner >/dev/null 2>&1; then
         RUNNER="conformance-runner"
+    elif command -v go >/dev/null 2>&1; then
+        exec go run github.com/omnibuf/omnibuf-go/cmd/conformance-runner@71dad83aadd7dc65401d662521d34cfaeb1011ab ./target/release/conformance-rs
     else
         echo "conformance-runner binary not found; set CONFORMANCE_RUNNER or install conformance-runner" >&2
         exit 1
