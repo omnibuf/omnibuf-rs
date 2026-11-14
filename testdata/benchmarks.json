@@ -12,36 +12,36 @@
       "unit": "ns",
       "results": [
         {
+          "name": "OmniBuf (#[derive(OmniBuf)])",
+          "nsPerOp": 186,
+          "opsPerSec": 5372226,
+          "wireBytes": 366,
+          "highlight": true
+        },
+        {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 184,
-          "opsPerSec": 5422254,
+          "nsPerOp": 190,
+          "opsPerSec": 5265180,
           "wireBytes": 366,
           "highlight": true,
           "baseline": true
         },
         {
-          "name": "OmniBuf (#[derive(OmniBuf)])",
-          "nsPerOp": 189,
-          "opsPerSec": 5292516,
-          "wireBytes": 366,
-          "highlight": true
-        },
-        {
           "name": "prost (Protobuf)",
-          "nsPerOp": 308,
-          "opsPerSec": 3243602,
+          "nsPerOp": 299,
+          "opsPerSec": 3344537,
           "wireBytes": 341
         },
         {
           "name": "rmp-serde (MessagePack)",
-          "nsPerOp": 829,
-          "opsPerSec": 1205552,
+          "nsPerOp": 825,
+          "opsPerSec": 1211798,
           "wireBytes": 626
         },
         {
           "name": "serde_json",
-          "nsPerOp": 1037,
-          "opsPerSec": 964325,
+          "nsPerOp": 1036,
+          "opsPerSec": 965275,
           "wireBytes": 803
         }
       ]
@@ -53,31 +53,31 @@
       "results": [
         {
           "name": "OmniBuf (#[derive(OmniBuf)])",
-          "nsPerOp": 660,
-          "opsPerSec": 1515958,
+          "nsPerOp": 658,
+          "opsPerSec": 1518803,
           "highlight": true
         },
         {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 679,
-          "opsPerSec": 1472493,
+          "nsPerOp": 677,
+          "opsPerSec": 1477397,
           "highlight": true,
           "baseline": true
         },
         {
           "name": "prost (Protobuf)",
-          "nsPerOp": 861,
-          "opsPerSec": 1161797
+          "nsPerOp": 868,
+          "opsPerSec": 1152479
         },
         {
           "name": "rmp-serde (MessagePack)",
-          "nsPerOp": 1127,
-          "opsPerSec": 887521
+          "nsPerOp": 1129,
+          "opsPerSec": 885958
         },
         {
           "name": "serde_json",
-          "nsPerOp": 1723,
-          "opsPerSec": 580376
+          "nsPerOp": 1675,
+          "opsPerSec": 597020
         }
       ]
     },
@@ -88,25 +88,25 @@
       "results": [
         {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 92,
-          "opsPerSec": 10832318,
+          "nsPerOp": 93,
+          "opsPerSec": 10800015,
           "highlight": true,
           "baseline": true
         },
         {
           "name": "prost (Protobuf)",
-          "nsPerOp": 860,
-          "opsPerSec": 1163193
+          "nsPerOp": 866,
+          "opsPerSec": 1154576
         },
         {
           "name": "rmp-serde (MessagePack)",
-          "nsPerOp": 1119,
-          "opsPerSec": 893800
+          "nsPerOp": 1127,
+          "opsPerSec": 887619
         },
         {
           "name": "serde_json",
-          "nsPerOp": 1710,
-          "opsPerSec": 584924
+          "nsPerOp": 1675,
+          "opsPerSec": 597167
         }
       ]
     },
@@ -117,25 +117,25 @@
       "results": [
         {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 116,
-          "opsPerSec": 8645383,
+          "nsPerOp": 115,
+          "opsPerSec": 8697237,
           "highlight": true,
           "baseline": true
         },
         {
           "name": "prost (Protobuf)",
-          "nsPerOp": 1209,
-          "opsPerSec": 827192
+          "nsPerOp": 1206,
+          "opsPerSec": 829269
         },
         {
           "name": "rmp-serde (MessagePack)",
-          "nsPerOp": 1965,
-          "opsPerSec": 508907
+          "nsPerOp": 1980,
+          "opsPerSec": 504993
         },
         {
           "name": "serde_json",
-          "nsPerOp": 2805,
-          "opsPerSec": 356487
+          "nsPerOp": 2758,
+          "opsPerSec": 362542
         }
       ]
     }
