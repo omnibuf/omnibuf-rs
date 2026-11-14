@@ -62,5 +62,38 @@ fmt-check:
     cargo fmt --all -- --check
     buf format -d --exit-code
 
+# Verify crate packaging and rustdoc for crates.io
+publish-check:
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --exclude conformance-rs --exclude omnibuf-bench --all-features
+    cargo package -p omnibuf-derive
+    cargo package -p protoc-gen-omnibuf-rs
+    cargo package -p omnibuf --no-verify
+
+# Publish omnibuf-derive, omnibuf, and protoc-gen-omnibuf-rs to crates.io in dependency order
+publish:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')
+    publish_one() {
+        local crate="$1"
+        local code
+        code=$(curl -s -o /dev/null -w "%{http_code}" -H "User-Agent: omnibuf-publish/0.1" "https://crates.io/api/v1/crates/${crate}/${VERSION}")
+        if [[ "$code" == "200" ]]; then
+            echo "${crate} v${VERSION} is already on crates.io; skipping."
+            return 0
+        fi
+        cargo publish -p "${crate}"
+    }
+    publish_one omnibuf-derive
+    echo "Waiting for omnibuf-derive v${VERSION} in crates.io sparse index..."
+    for _ in $(seq 1 30); do
+        if curl -fsSL -H "User-Agent: omnibuf-publish/0.1" "https://index.crates.io/om/ni/omnibuf-derive" 2>/dev/null | grep -q "\"vers\":\"${VERSION}\""; then
+            break
+        fi
+        sleep 3
+    done
+    publish_one omnibuf
+    publish_one protoc-gen-omnibuf-rs
+
 # Run the complete CI verification pipeline
 ci: fmt-check lint build test conformance

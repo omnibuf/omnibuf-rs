@@ -8,6 +8,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/protoc-gen-omnibuf-rs"
 readme = "../../README.md"
 keywords = ["protobuf", "protoc", "codegen", "serialization", "buf"]
 categories = ["encoding", "development-tools::build-utils"]

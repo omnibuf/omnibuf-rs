@@ -1,3 +1,5 @@
+#![cfg(feature = "derive")]
+
 use std::collections::{BTreeMap, HashMap};
 
 use omnibuf::wire::{

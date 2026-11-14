@@ -8,9 +8,13 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/omnibuf"
 readme = "../../README.md"
 keywords = ["serialization", "protobuf", "wire-format", "zero-copy", "rpc"]
 categories = ["encoding", "network-programming", "data-structures"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 default = ["derive", "prost", "buffa"]

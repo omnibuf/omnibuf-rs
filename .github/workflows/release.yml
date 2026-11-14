@@ -1,0 +1,104 @@
+name: Release & Publish to crates.io
+
+on:
+  release:
+    types: [published]
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build, Verify & Publish to crates.io
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install tools via mise
+        uses: jdx/mise-action@v5
+        with:
+          install: true
+
+      - name: Install rustfmt and clippy components
+        run: rustup component add rustfmt clippy
+
+      - name: Sync workspace crate versions with release tag
+        run: |
+          RAW_TAG="${GITHUB_REF_NAME:-}"
+          VERSION="${RAW_TAG#v}"
+          if [[ -n "$VERSION" && "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "Syncing workspace crate versions to $VERSION"
+            python3 - "$VERSION" <<'PY'
+          import re, pathlib, sys
+          ver = sys.argv[1]
+          p = pathlib.Path("Cargo.toml")
+          txt = p.read_text()
+          txt = re.sub(r'(?m)^version = "[^"]+"', f'version = "{ver}"', txt, count=1)
+          for dep in ("omnibuf", "omnibuf-derive", "protoc-gen-omnibuf-rs"):
+              txt = re.sub(
+                  rf'({re.escape(dep)}\s*=\s*\{{[^}}]*version\s*=\s*")[^"]+(")',
+                  rf'\g<1>{ver}\g<2>',
+                  txt,
+              )
+          p.write_text(txt)
+          PY
+            cargo check --workspace
+          fi
+
+      - name: Install conformance-runner
+        run: |
+          mise use -g go@1.27
+          GOBIN="$HOME/.local/bin" mise exec -- go install github.com/omnibuf/omnibuf-go/cmd/conformance-runner@71dad83aadd7dc65401d662521d34cfaeb1011ab
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run full CI and rustdoc verification
+        run: |
+          just ci
+          RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --exclude conformance-rs --exclude omnibuf-bench --all-features
+
+      - name: Authenticate with crates.io via OIDC Trusted Publishing
+        id: oidc_auth
+        if: ${{ secrets.CARGO_REGISTRY_TOKEN == '' }}
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish workspace crates to crates.io in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN || steps.oidc_auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')
+
+          publish_crate() {
+            local crate="$1"
+            local http_code
+            http_code=$(curl -s -o /dev/null -w "%{http_code}" -H "User-Agent: omnibuf-release/0.1" "https://crates.io/api/v1/crates/${crate}/${VERSION}")
+            if [[ "$http_code" == "200" ]]; then
+              echo "${crate} v${VERSION} is already published on crates.io; skipping."
+              return 0
+            fi
+            echo "Publishing ${crate} v${VERSION}..."
+            cargo publish -p "${crate}" --allow-dirty
+          }
+
+          publish_crate omnibuf-derive
+
+          echo "Waiting for omnibuf-derive v${VERSION} in crates.io sparse index..."
+          for attempt in $(seq 1 30); do
+            if curl -fsSL -H "User-Agent: omnibuf-release/0.1" "https://index.crates.io/om/ni/omnibuf-derive" 2>/dev/null | grep -q "\"vers\":\"${VERSION}\""; then
+              echo "omnibuf-derive v${VERSION} visible in sparse index."
+              break
+            fi
+            sleep 3
+          done
+
+          publish_crate omnibuf
+          publish_crate protoc-gen-omnibuf-rs

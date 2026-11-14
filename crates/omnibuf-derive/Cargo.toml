@@ -8,6 +8,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/omnibuf-derive"
 readme = "../../README.md"
 keywords = ["serialization", "protobuf", "derive", "macro", "wire-format"]
 categories = ["encoding", "development-tools::procedural-macro-helpers"]
