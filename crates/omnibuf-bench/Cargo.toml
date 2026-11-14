@@ -13,6 +13,8 @@ name = "omnibuf-bench"
 path = "src/main.rs"
 
 [dependencies]
+buffa.workspace = true
+buffa-descriptor.workspace = true
 omnibuf.workspace = true
 prost.workspace = true
 rmp-serde.workspace = true
@@ -20,6 +22,7 @@ serde.workspace = true
 serde_json.workspace = true
 
 [build-dependencies]
+buffa-build.workspace = true
 prost.workspace = true
 prost-build.workspace = true
 prost-types.workspace = true

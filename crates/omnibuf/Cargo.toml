@@ -1,18 +1,26 @@
 [package]
 name = "omnibuf"
-description = "Core runtime, wire primitives, blind decoder, opaque splicing, and prost bridge for OmniBuf"
+description = "Core runtime, wire primitives, blind decoder, opaque splicing, and prost/buffa bridges for OmniBuf"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["serialization", "protobuf", "wire-format", "zero-copy", "rpc"]
+categories = ["encoding", "network-programming", "data-structures"]
 
 [features]
-default = ["derive", "prost"]
+default = ["derive", "prost", "buffa"]
 derive = ["dep:omnibuf-derive"]
 prost = ["dep:prost", "dep:prost-reflect", "dep:prost-types"]
+buffa = ["dep:buffa", "dep:buffa-descriptor"]
 
 [dependencies]
+buffa = { workspace = true, optional = true }
+buffa-descriptor = { workspace = true, optional = true }
 itoa.workspace = true
 omnibuf-derive = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }

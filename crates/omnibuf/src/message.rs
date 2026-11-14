@@ -1,14 +1,17 @@
+use core::any::TypeId;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 
 use crate::error::{Error, Result};
-use crate::field0::SchemaMeta;
+use crate::field0::{SchemaMeta, validate_field0_with_max_depth};
 use crate::wire::{
-    MAX_NESTING_DEPTH, WIRE_ARRAY, WIRE_BOOL_FALSE, WIRE_BOOL_TRUE, WIRE_BYTES, WIRE_FIXED32,
-    WIRE_FIXED64, WIRE_FLOAT32, WIRE_FLOAT64, WIRE_MAP, WIRE_SFIXED32, WIRE_SFIXED64, WIRE_SINT,
-    WIRE_STRING, WIRE_SUB_MSG, WIRE_UINT, append_tag, append_varint, backpatch_container_len,
-    decode_varint, decode_zigzag, encode_zigzag, grow_capacity, parse_array_header,
-    parse_map_header, read_len_slice, read_str_slice,
+    MAX_FIELD_NUMBER, MAX_NESTING_DEPTH, WIRE_ARRAY, WIRE_BOOL_FALSE, WIRE_BOOL_TRUE, WIRE_BYTES,
+    WIRE_EXTENDED, WIRE_FIXED32, WIRE_FIXED64, WIRE_FLOAT32, WIRE_FLOAT64, WIRE_MAP, WIRE_SFIXED32,
+    WIRE_SFIXED64, WIRE_SINT, WIRE_STRING, WIRE_SUB_MSG, WIRE_UINT, append_bytes_elem, append_tag,
+    append_varint, backpatch_container_len, cold_parse_err, decode_varint, decode_zigzag,
+    encode_zigzag, fast_skip_value, grow_capacity, parse_array_header, parse_map_header,
+    put_varint_raw, read_len_slice, read_str_slice, read_varint_at, write_bool_tagged,
+    write_bytes_tagged, write_fixed_tagged, write_varint_tagged,
 };
 
 /// Options controlling OmniBuf serialization.
@@ -42,8 +45,272 @@ impl EncodeOptions {
     }
 }
 
+/// Resource limits enforced when decoding untrusted OmniBuf packets (Spec §10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodeOptions {
+    /// Maximum allowed input packet byte length (`default = 64 MiB`).
+    pub max_message_bytes: usize,
+    /// Maximum cumulative container element count across arrays and maps (`default = 4,194,304`).
+    pub max_elements: usize,
+    /// Maximum cumulative allocation budget for strings, byte slices, and container slots (`default = 64 MiB`).
+    pub max_alloc_bytes: usize,
+    /// Maximum allowed sub-message and container nesting depth (`default = MAX_NESTING_DEPTH = 32`).
+    pub max_depth: usize,
+}
+
+impl DecodeOptions {
+    /// Returns the default safe decoding limits.
+    #[inline]
+    pub const fn default_limits() -> Self {
+        Self {
+            max_message_bytes: 64 * 1024 * 1024,
+            max_elements: 4 * 1024 * 1024,
+            max_alloc_bytes: 64 * 1024 * 1024,
+            max_depth: MAX_NESTING_DEPTH,
+        }
+    }
+}
+
+impl Default for DecodeOptions {
+    #[inline]
+    fn default() -> Self {
+        Self::default_limits()
+    }
+}
+
+#[derive(Default)]
+struct BudgetTracker {
+    elements: usize,
+    alloc_bytes: usize,
+}
+
+impl BudgetTracker {
+    #[inline]
+    fn add_elements(&mut self, count: usize, opts: &DecodeOptions) -> Result<()> {
+        self.elements = self
+            .elements
+            .checked_add(count)
+            .ok_or_else(|| Error::parse("element count budget overflow"))?;
+        if self.elements > opts.max_elements {
+            return Err(Error::parse(format!(
+                "container element count {} exceeds max_elements {}",
+                self.elements, opts.max_elements
+            )));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn add_alloc(&mut self, bytes: usize, opts: &DecodeOptions) -> Result<()> {
+        self.alloc_bytes = self
+            .alloc_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| Error::parse("allocation budget overflow"))?;
+        if self.alloc_bytes > opts.max_alloc_bytes {
+            return Err(Error::parse(format!(
+                "allocation budget {} exceeds max_alloc_bytes {}",
+                self.alloc_bytes, opts.max_alloc_bytes
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Validates `data` against explicit [`DecodeOptions`] resource limits before materializing values.
+pub(crate) fn enforce_decode_options(data: &[u8], opts: &DecodeOptions) -> Result<()> {
+    if data.len() > opts.max_message_bytes {
+        return Err(Error::parse(format!(
+            "message length {} exceeds max_message_bytes {}",
+            data.len(),
+            opts.max_message_bytes
+        )));
+    }
+    let effective_depth = opts.max_depth.min(MAX_NESTING_DEPTH);
+    let mut tracker = BudgetTracker::default();
+    validate_message_with_limits(data, 0, effective_depth, opts, &mut tracker)
+}
+
+fn validate_message_with_limits(
+    data: &[u8],
+    depth: usize,
+    max_depth: usize,
+    opts: &DecodeOptions,
+    tracker: &mut BudgetTracker,
+) -> Result<()> {
+    if depth > max_depth {
+        return Err(Error::DepthLimitExceeded(depth));
+    }
+    let mut pos = 0usize;
+    let n = data.len();
+    while pos < n {
+        let (tag, tn) = decode_varint(&data[pos..])
+            .ok_or_else(|| Error::parse(format!("invalid or truncated tag at {pos}")))?;
+        if (tag >> 4) > MAX_FIELD_NUMBER {
+            return Err(Error::parse("field number exceeds maximum 29-bit limit"));
+        }
+        pos += tn;
+        let fnum = tag >> 4;
+        let wt = (tag & 0x0F) as u8;
+        if fnum == 0 {
+            if wt != WIRE_SUB_MSG {
+                return Err(Error::parse(format!("invalid Field #0 wire type {wt}")));
+            }
+            let end = validate_field0_with_max_depth(data, pos, depth, max_depth)?;
+            tracker.add_alloc(end.saturating_sub(pos), opts)?;
+            pos = end;
+        } else {
+            pos = validate_value_with_limits(data, pos, wt, depth, max_depth, opts, tracker)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_value_with_limits(
+    data: &[u8],
+    pos: usize,
+    wt: u8,
+    depth: usize,
+    max_depth: usize,
+    opts: &DecodeOptions,
+    tracker: &mut BudgetTracker,
+) -> Result<usize> {
+    if depth > max_depth {
+        return Err(Error::DepthLimitExceeded(depth));
+    }
+    match wt {
+        WIRE_STRING => {
+            let (s, end) = read_str_slice(data, pos)?;
+            tracker.add_alloc(s.len(), opts)?;
+            Ok(end)
+        }
+        WIRE_BYTES => {
+            let (b, end) = read_len_slice(data, pos, 0)?;
+            tracker.add_alloc(b.len(), opts)?;
+            Ok(end)
+        }
+        WIRE_SUB_MSG => {
+            let (body, end) = read_len_slice(data, pos, 0)?;
+            validate_message_with_limits(body, depth + 1, max_depth, opts, tracker)?;
+            Ok(end)
+        }
+        WIRE_ARRAY => {
+            if depth + 1 > max_depth {
+                return Err(Error::DepthLimitExceeded(depth + 1));
+            }
+            let (body, end) = read_len_slice(data, pos, 2)?;
+            let (elem_wt, count, mut p) =
+                parse_array_header(body).ok_or_else(|| Error::parse("invalid array header"))?;
+            tracker.add_elements(count, opts)?;
+            tracker.add_alloc(count.saturating_mul(8), opts)?;
+            match elem_wt {
+                WIRE_BOOL_FALSE => {
+                    if body.len() - p != count {
+                        return Err(Error::parse("invalid bool array length"));
+                    }
+                    for &b in &body[p..p + count] {
+                        if b > 1 {
+                            return Err(Error::parse("invalid bool byte in array"));
+                        }
+                    }
+                    return Ok(end);
+                }
+                WIRE_FIXED32 | WIRE_SFIXED32 | WIRE_FLOAT32 => {
+                    if body.len() - p != count.saturating_mul(4) {
+                        return Err(Error::parse("invalid 32-bit array length"));
+                    }
+                    return Ok(end);
+                }
+                WIRE_FIXED64 | WIRE_SFIXED64 | WIRE_FLOAT64 => {
+                    if body.len() - p != count.saturating_mul(8) {
+                        return Err(Error::parse("invalid 64-bit array length"));
+                    }
+                    return Ok(end);
+                }
+                _ => {}
+            }
+            for _ in 0..count {
+                p = validate_entry_with_limits(
+                    body,
+                    p,
+                    elem_wt,
+                    depth + 1,
+                    max_depth,
+                    opts,
+                    tracker,
+                )?;
+            }
+            if p != body.len() {
+                return Err(Error::parse("trailing array bytes"));
+            }
+            Ok(end)
+        }
+        WIRE_MAP => {
+            if depth + 1 > max_depth {
+                return Err(Error::DepthLimitExceeded(depth + 1));
+            }
+            let (body, end) = read_len_slice(data, pos, 3)?;
+            let (key_wt, val_wt, count, mut p) =
+                parse_map_header(body).ok_or_else(|| Error::parse("invalid map header"))?;
+            tracker.add_elements(count, opts)?;
+            tracker.add_alloc(count.saturating_mul(24), opts)?;
+            for _ in 0..count {
+                p = validate_entry_with_limits(
+                    body,
+                    p,
+                    key_wt,
+                    depth + 1,
+                    max_depth,
+                    opts,
+                    tracker,
+                )?;
+                p = validate_entry_with_limits(
+                    body,
+                    p,
+                    val_wt,
+                    depth + 1,
+                    max_depth,
+                    opts,
+                    tracker,
+                )?;
+            }
+            if p != body.len() {
+                return Err(Error::parse("trailing map bytes"));
+            }
+            Ok(end)
+        }
+        WIRE_EXTENDED => {
+            let (b, end) = read_len_slice(data, pos, 1)?;
+            tracker.add_alloc(b.len(), opts)?;
+            Ok(end)
+        }
+        _ => fast_skip_value(data, pos, wt)
+            .ok_or_else(|| Error::parse(format!("truncated or invalid wireType {wt} at {pos}"))),
+    }
+}
+
+fn validate_entry_with_limits(
+    body: &[u8],
+    p: usize,
+    wt: u8,
+    depth: usize,
+    max_depth: usize,
+    opts: &DecodeOptions,
+    tracker: &mut BudgetTracker,
+) -> Result<usize> {
+    if wt == WIRE_BOOL_FALSE {
+        let b = *body
+            .get(p)
+            .ok_or_else(|| Error::parse("truncated bool in container"))?;
+        if b > 1 {
+            return Err(Error::parse("invalid bool byte in container"));
+        }
+        return Ok(p + 1);
+    }
+    validate_value_with_limits(body, p, wt, depth, max_depth, opts, tracker)
+}
+
 /// Trait implemented by Rust types that serialize and deserialize in OmniBuf wire format.
-pub trait Message: Default + Sized {
+pub trait Message: Default + Sized + 'static {
     /// Appends the OmniBuf wire representation of `self` to `dst`.
     fn encode_omnibuf_append(&self, dst: &mut Vec<u8>, deterministic: bool) -> Result<()>;
 
@@ -57,12 +324,25 @@ pub trait Message: Default + Sized {
 
     /// Builds the `Field #0` [`SchemaMeta`] descriptor for `Self`, using `active` and `depth`
     /// to bound recursive message graphs.
-    fn build_schema_meta(active: &mut HashSet<&'static str>, depth: usize) -> Option<SchemaMeta>;
+    fn build_schema_meta(active: &mut HashSet<TypeId>, depth: usize) -> Option<SchemaMeta>;
+
+    /// Returns `true` if `Self` or any reachable child sub-message schema contains a recursion cycle.
+    fn is_schema_cyclic(active: &mut HashSet<TypeId>, depth: usize) -> bool {
+        let _ = (active, depth);
+        false
+    }
+
+    /// Builds an instance-aware [`SchemaMeta`] for `self` at `depth`, expanding populated
+    /// recursive sub-message values up to `MAX_NESTING_DEPTH`.
+    fn build_value_schema_meta(&self, depth: usize) -> Option<SchemaMeta> {
+        let mut active = HashSet::new();
+        Self::build_schema_meta(&mut active, depth)
+    }
 
     /// Returns the root [`SchemaMeta`] for `Self`.
     fn schema_meta() -> SchemaMeta {
         let mut active = HashSet::new();
-        Self::build_schema_meta(&mut active, 0).unwrap_or_default()
+        Self::build_schema_meta(&mut active, 1).unwrap_or_default()
     }
 
     /// Encodes `self` into a newly allocated `Vec<u8>`.
@@ -85,7 +365,12 @@ pub trait Message: Default + Sized {
         opts: EncodeOptions,
     ) -> Result<()> {
         if opts.self_describing {
-            let meta = Self::schema_meta();
+            let mut active = HashSet::new();
+            let meta = if Self::is_schema_cyclic(&mut active, 1) {
+                self.build_value_schema_meta(1).unwrap_or_default()
+            } else {
+                Self::schema_meta()
+            };
             meta.append_field0(dst);
         }
         self.encode_omnibuf_append(dst, opts.deterministic)
@@ -94,7 +379,7 @@ pub trait Message: Default + Sized {
     /// Encodes `self` into a newly allocated `Vec<u8>` using explicit [`EncodeOptions`].
     #[inline]
     fn encode_omnibuf_with_options(&self, opts: EncodeOptions) -> Result<Vec<u8>> {
-        let mut dst = Vec::with_capacity(512);
+        let mut dst = Vec::with_capacity(128);
         self.encode_omnibuf_with_options_append(&mut dst, opts)?;
         Ok(dst)
     }
@@ -105,11 +390,27 @@ pub trait Message: Default + Sized {
         self.decode_omnibuf_at_depth(data, 0, false)
     }
 
+    /// Decodes `data` into `self` while enforcing explicit [`DecodeOptions`] resource limits.
+    #[inline]
+    fn decode_omnibuf_with_options(&mut self, data: &[u8], opts: DecodeOptions) -> Result<()> {
+        enforce_decode_options(data, &opts)?;
+        self.decode_omnibuf_at_depth(data, 0, false)
+    }
+
     /// Allocates a default instance of `Self` and decodes `data` into it.
     #[inline]
     fn from_omnibuf(data: &[u8]) -> Result<Self> {
         let mut msg = Self::default();
-        msg.decode_omnibuf(data)?;
+        msg.decode_omnibuf_at_depth(data, 0, true)?;
+        Ok(msg)
+    }
+
+    /// Allocates a default instance of `Self` and decodes `data` under explicit [`DecodeOptions`].
+    #[inline]
+    fn from_omnibuf_with_options(data: &[u8], opts: DecodeOptions) -> Result<Self> {
+        enforce_decode_options(data, &opts)?;
+        let mut msg = Self::default();
+        msg.decode_omnibuf_at_depth(data, 0, true)?;
         Ok(msg)
     }
 }
@@ -138,15 +439,67 @@ pub fn from_slice<M: Message>(data: &[u8]) -> Result<M> {
     M::from_omnibuf(data)
 }
 
+/// Decodes an OmniBuf byte slice into `M` while enforcing explicit [`DecodeOptions`].
+#[inline]
+pub fn from_slice_with_options<M: Message>(data: &[u8], opts: DecodeOptions) -> Result<M> {
+    M::from_omnibuf_with_options(data, opts)
+}
+
 /// Decodes an OmniBuf byte slice into an existing `dst` instance, clearing absent fields.
 #[inline]
 pub fn decode_into<M: Message>(data: &[u8], dst: &mut M) -> Result<()> {
     dst.decode_omnibuf(data)
 }
 
+/// Decodes an OmniBuf byte slice into `dst` while enforcing explicit [`DecodeOptions`].
+#[inline]
+pub fn decode_into_with_options<M: Message>(
+    data: &[u8],
+    dst: &mut M,
+    opts: DecodeOptions,
+) -> Result<()> {
+    dst.decode_omnibuf_with_options(data, opts)
+}
+
 /// Low-level codec primitives invoked by `#[derive(OmniBuf)]` and `protoc-gen-omnibuf-rs`.
 pub mod codec {
     use super::*;
+
+    /// Trait implemented by `#[derive(OmniBuf)]` on Protobuf/OmniBuf `oneof` enums.
+    pub trait Oneof: Sized + 'static {
+        /// Appends the active oneof variant's tagged field to `dst`.
+        fn encode_oneof(&self, dst: &mut Vec<u8>, deterministic: bool) -> Result<()>;
+
+        /// Attempts to decode field `(fnum, wt)` at `data[pos..]` into `slot`.
+        ///
+        /// Returns `Ok(Some(next_pos))` when `(fnum, wt)` matched one of this oneof's arms
+        /// with its expected wire type, or `Ok(None)` when `(fnum, wt)` was not handled.
+        fn decode_oneof_arm(
+            slot: &mut Option<Self>,
+            fnum: u32,
+            wt: u8,
+            data: &[u8],
+            pos: usize,
+            depth: usize,
+        ) -> Result<Option<usize>>;
+
+        /// Registers all variant field numbers and names of this oneof into `meta.fields`.
+        fn register_schema_fields(meta: &mut SchemaMeta);
+
+        /// Registers sub-message children of this oneof into `meta.children`.
+        fn register_schema_meta(meta: &mut SchemaMeta, active: &mut HashSet<TypeId>, depth: usize);
+
+        /// Returns `true` if any sub-message variant of this oneof introduces a schema cycle.
+        fn is_schema_cyclic(active: &mut HashSet<TypeId>, depth: usize) -> bool {
+            let _ = (active, depth);
+            false
+        }
+
+        /// Registers the active sub-message variant's value-driven [`SchemaMeta`] into `meta.children`.
+        fn register_value_schema_meta(&self, meta: &mut SchemaMeta, depth: usize) {
+            let _ = (meta, depth);
+        }
+    }
 
     /// Checks whether a field value is considered zero/empty when `omitempty` is enabled.
     pub trait IsEmpty {
@@ -231,75 +584,244 @@ pub mod codec {
         }
     }
 
-    #[inline]
+    #[inline(always)]
+    fn begin_tagged_container(dst: &mut Vec<u8>, field_num: u32, wire_type: u8) -> usize {
+        let tag = (field_num << 4) | u32::from(wire_type & 0x0F);
+        if tag <= 127 {
+            let b0 = ((tag as u8) << 1) | 1;
+            dst.reserve(3);
+            unsafe {
+                let len = dst.len();
+                let ptr = dst.as_mut_ptr().add(len);
+                *ptr = b0;
+                *ptr.add(1) = 0;
+                *ptr.add(2) = 0;
+                dst.set_len(len + 3);
+                len + 1
+            }
+        } else if tag <= 16_383 {
+            let tb = (((tag as u16) << 2) | 2).to_le_bytes();
+            dst.reserve(4);
+            unsafe {
+                let len = dst.len();
+                let ptr = dst.as_mut_ptr().add(len);
+                *ptr = tb[0];
+                *ptr.add(1) = tb[1];
+                *ptr.add(2) = 0;
+                *ptr.add(3) = 0;
+                dst.set_len(len + 4);
+                len + 2
+            }
+        } else {
+            append_tag(dst, field_num, wire_type);
+            let len_pos = dst.len();
+            dst.extend_from_slice(&[0, 0]);
+            len_pos
+        }
+    }
+
+    #[inline(always)]
+    fn begin_tagged_array(dst: &mut Vec<u8>, field_num: u32, elem_wt: u8, count: usize) -> usize {
+        let tag = (u64::from(field_num) << 4) | u64::from(WIRE_ARRAY);
+        dst.reserve(9 + 3 + 9);
+        unsafe {
+            let len = dst.len();
+            let ptr = dst.as_mut_ptr().add(len);
+            let tn = put_varint_raw(ptr, tag);
+            let len_pos = len + tn;
+            *ptr.add(tn) = 0;
+            *ptr.add(tn + 1) = 0;
+            *ptr.add(tn + 2) = elem_wt;
+            let cn = put_varint_raw(ptr.add(tn + 3), count as u64);
+            dst.set_len(len + tn + 3 + cn);
+            len_pos
+        }
+    }
+
+    #[inline(always)]
+    pub fn assign_str(slot: &mut String, s: &str) {
+        if slot.capacity() == 0 {
+            if !s.is_empty() {
+                *slot = s.to_owned();
+            }
+        } else {
+            slot.clear();
+            slot.push_str(s);
+        }
+    }
+
+    #[inline(always)]
+    pub fn assign_bytes(slot: &mut Vec<u8>, b: &[u8]) {
+        if slot.capacity() == 0 {
+            if !b.is_empty() {
+                *slot = b.to_vec();
+            }
+        } else {
+            slot.clear();
+            slot.extend_from_slice(b);
+        }
+    }
+
+    #[inline(always)]
     pub fn write_uint_field(dst: &mut Vec<u8>, field_num: u32, v: u64) {
-        append_tag(dst, field_num, WIRE_UINT);
-        append_varint(dst, v);
+        let tag = (field_num << 4) | u32::from(WIRE_UINT);
+        if tag <= 127 {
+            write_varint_tagged(dst, [((tag as u8) << 1) | 1], v);
+        } else if tag <= 16_383 {
+            let u = ((tag as u16) << 2) | 2;
+            write_varint_tagged(dst, u.to_le_bytes(), v);
+        } else {
+            append_tag(dst, field_num, WIRE_UINT);
+            append_varint(dst, v);
+        }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn write_sint_field(dst: &mut Vec<u8>, field_num: u32, v: i64) {
-        append_tag(dst, field_num, WIRE_SINT);
-        append_varint(dst, encode_zigzag(v));
+        let z = encode_zigzag(v);
+        let tag = (field_num << 4) | u32::from(WIRE_SINT);
+        if tag <= 127 {
+            write_varint_tagged(dst, [((tag as u8) << 1) | 1], z);
+        } else if tag <= 16_383 {
+            let u = ((tag as u16) << 2) | 2;
+            write_varint_tagged(dst, u.to_le_bytes(), z);
+        } else {
+            append_tag(dst, field_num, WIRE_SINT);
+            append_varint(dst, z);
+        }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn write_bool_field(dst: &mut Vec<u8>, field_num: u32, v: bool) {
-        append_tag(
-            dst,
-            field_num,
-            if v { WIRE_BOOL_TRUE } else { WIRE_BOOL_FALSE },
-        );
+        let tf = (field_num << 4) | u32::from(WIRE_BOOL_FALSE);
+        let tt = (field_num << 4) | u32::from(WIRE_BOOL_TRUE);
+        if tt <= 127 {
+            write_bool_tagged(dst, [((tf as u8) << 1) | 1], [((tt as u8) << 1) | 1], v);
+        } else if tt <= 16_383 {
+            write_bool_tagged(
+                dst,
+                (((tf as u16) << 2) | 2).to_le_bytes(),
+                (((tt as u16) << 2) | 2).to_le_bytes(),
+                v,
+            );
+        } else {
+            append_tag(
+                dst,
+                field_num,
+                if v { WIRE_BOOL_TRUE } else { WIRE_BOOL_FALSE },
+            );
+        }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn write_fixed32_field(dst: &mut Vec<u8>, field_num: u32, v: u32) {
-        append_tag(dst, field_num, WIRE_FIXED32);
-        dst.extend_from_slice(&v.to_le_bytes());
+        let tag = (field_num << 4) | u32::from(WIRE_FIXED32);
+        let bytes = v.to_le_bytes();
+        if tag <= 127 {
+            write_fixed_tagged(dst, [((tag as u8) << 1) | 1], bytes);
+        } else if tag <= 16_383 {
+            write_fixed_tagged(dst, (((tag as u16) << 2) | 2).to_le_bytes(), bytes);
+        } else {
+            append_tag(dst, field_num, WIRE_FIXED32);
+            dst.extend_from_slice(&bytes);
+        }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn write_fixed64_field(dst: &mut Vec<u8>, field_num: u32, v: u64) {
-        append_tag(dst, field_num, WIRE_FIXED64);
-        dst.extend_from_slice(&v.to_le_bytes());
+        let tag = (field_num << 4) | u32::from(WIRE_FIXED64);
+        let bytes = v.to_le_bytes();
+        if tag <= 127 {
+            write_fixed_tagged(dst, [((tag as u8) << 1) | 1], bytes);
+        } else if tag <= 16_383 {
+            write_fixed_tagged(dst, (((tag as u16) << 2) | 2).to_le_bytes(), bytes);
+        } else {
+            append_tag(dst, field_num, WIRE_FIXED64);
+            dst.extend_from_slice(&bytes);
+        }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn write_sfixed32_field(dst: &mut Vec<u8>, field_num: u32, v: i32) {
-        append_tag(dst, field_num, WIRE_SFIXED32);
-        dst.extend_from_slice(&v.to_le_bytes());
+        let tag = (field_num << 4) | u32::from(WIRE_SFIXED32);
+        let bytes = v.to_le_bytes();
+        if tag <= 127 {
+            write_fixed_tagged(dst, [((tag as u8) << 1) | 1], bytes);
+        } else if tag <= 16_383 {
+            write_fixed_tagged(dst, (((tag as u16) << 2) | 2).to_le_bytes(), bytes);
+        } else {
+            append_tag(dst, field_num, WIRE_SFIXED32);
+            dst.extend_from_slice(&bytes);
+        }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn write_sfixed64_field(dst: &mut Vec<u8>, field_num: u32, v: i64) {
-        append_tag(dst, field_num, WIRE_SFIXED64);
-        dst.extend_from_slice(&v.to_le_bytes());
+        let tag = (field_num << 4) | u32::from(WIRE_SFIXED64);
+        let bytes = v.to_le_bytes();
+        if tag <= 127 {
+            write_fixed_tagged(dst, [((tag as u8) << 1) | 1], bytes);
+        } else if tag <= 16_383 {
+            write_fixed_tagged(dst, (((tag as u16) << 2) | 2).to_le_bytes(), bytes);
+        } else {
+            append_tag(dst, field_num, WIRE_SFIXED64);
+            dst.extend_from_slice(&bytes);
+        }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn write_float32_field(dst: &mut Vec<u8>, field_num: u32, v: f32) {
-        append_tag(dst, field_num, WIRE_FLOAT32);
-        dst.extend_from_slice(&v.to_bits().to_le_bytes());
+        let tag = (field_num << 4) | u32::from(WIRE_FLOAT32);
+        let bytes = v.to_bits().to_le_bytes();
+        if tag <= 127 {
+            write_fixed_tagged(dst, [((tag as u8) << 1) | 1], bytes);
+        } else if tag <= 16_383 {
+            write_fixed_tagged(dst, (((tag as u16) << 2) | 2).to_le_bytes(), bytes);
+        } else {
+            append_tag(dst, field_num, WIRE_FLOAT32);
+            dst.extend_from_slice(&bytes);
+        }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn write_float64_field(dst: &mut Vec<u8>, field_num: u32, v: f64) {
-        append_tag(dst, field_num, WIRE_FLOAT64);
-        dst.extend_from_slice(&v.to_bits().to_le_bytes());
+        let tag = (field_num << 4) | u32::from(WIRE_FLOAT64);
+        let bytes = v.to_bits().to_le_bytes();
+        if tag <= 127 {
+            write_fixed_tagged(dst, [((tag as u8) << 1) | 1], bytes);
+        } else if tag <= 16_383 {
+            write_fixed_tagged(dst, (((tag as u16) << 2) | 2).to_le_bytes(), bytes);
+        } else {
+            append_tag(dst, field_num, WIRE_FLOAT64);
+            dst.extend_from_slice(&bytes);
+        }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn write_string_field(dst: &mut Vec<u8>, field_num: u32, s: &str) {
-        append_tag(dst, field_num, WIRE_STRING);
-        append_varint(dst, s.len() as u64);
-        dst.extend_from_slice(s.as_bytes());
+        let tag = (field_num << 4) | u32::from(WIRE_STRING);
+        let bytes = s.as_bytes();
+        if tag <= 127 {
+            write_bytes_tagged(dst, [((tag as u8) << 1) | 1], bytes);
+        } else if tag <= 16_383 {
+            write_bytes_tagged(dst, (((tag as u16) << 2) | 2).to_le_bytes(), bytes);
+        } else {
+            append_tag(dst, field_num, WIRE_STRING);
+            append_bytes_elem(dst, bytes);
+        }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn write_bytes_field(dst: &mut Vec<u8>, field_num: u32, b: &[u8]) {
-        append_tag(dst, field_num, WIRE_BYTES);
-        append_varint(dst, b.len() as u64);
-        dst.extend_from_slice(b);
+        let tag = (field_num << 4) | u32::from(WIRE_BYTES);
+        if tag <= 127 {
+            write_bytes_tagged(dst, [((tag as u8) << 1) | 1], b);
+        } else if tag <= 16_383 {
+            write_bytes_tagged(dst, (((tag as u16) << 2) | 2).to_le_bytes(), b);
+        } else {
+            append_tag(dst, field_num, WIRE_BYTES);
+            append_bytes_elem(dst, b);
+        }
     }
 
     #[inline]
@@ -309,9 +831,7 @@ pub mod codec {
         msg: &M,
         deterministic: bool,
     ) -> Result<()> {
-        append_tag(dst, field_num, WIRE_SUB_MSG);
-        let len_pos = dst.len();
-        dst.extend_from_slice(&[0, 0]);
+        let len_pos = begin_tagged_container(dst, field_num, WIRE_SUB_MSG);
         msg.encode_omnibuf_append(dst, deterministic)?;
         backpatch_container_len(dst, len_pos);
         Ok(())
@@ -339,8 +859,14 @@ pub mod codec {
         merge: bool,
     ) -> Result<usize> {
         let (sub_bytes, next_pos) = read_len_slice(data, pos, 0)?;
-        let msg = slot.get_or_insert_with(M::default);
-        msg.decode_omnibuf_at_depth(sub_bytes, depth + 1, merge)?;
+        match slot {
+            Some(msg) => msg.decode_omnibuf_at_depth(sub_bytes, depth + 1, merge)?,
+            None => {
+                let mut msg = M::default();
+                msg.decode_omnibuf_at_depth(sub_bytes, depth + 1, true)?;
+                *slot = Some(msg);
+            }
+        }
         Ok(next_pos)
     }
 
@@ -353,9 +879,57 @@ pub mod codec {
         merge: bool,
     ) -> Result<usize> {
         let (sub_bytes, next_pos) = read_len_slice(data, pos, 0)?;
-        let msg = slot.get_or_insert_with(|| Box::new(M::default()));
-        msg.decode_omnibuf_at_depth(sub_bytes, depth + 1, merge)?;
+        match slot {
+            Some(msg) => msg.decode_omnibuf_at_depth(sub_bytes, depth + 1, merge)?,
+            None => {
+                let mut msg = Box::new(M::default());
+                msg.decode_omnibuf_at_depth(sub_bytes, depth + 1, true)?;
+                *slot = Some(msg);
+            }
+        }
         Ok(next_pos)
+    }
+
+    /// Encodes a `WireArray` of varint-encoded scalar elements in a single buffer reservation.
+    #[inline]
+    pub fn write_varint_vec_field<T, F>(
+        dst: &mut Vec<u8>,
+        field_num: u32,
+        elem_wt: u8,
+        items: &[T],
+        mut to_u64: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&T) -> u64,
+    {
+        let tag = (u64::from(field_num) << 4) | u64::from(WIRE_ARRAY);
+        let count = items.len();
+        let needed = count
+            .checked_mul(9)
+            .and_then(|n| n.checked_add(21))
+            .expect("capacity overflow");
+        dst.reserve(needed);
+        let len_pos = unsafe {
+            let start_len = dst.len();
+            let base = dst.as_mut_ptr();
+            let mut ptr = base.add(start_len);
+            let tn = put_varint_raw(ptr, tag);
+            let lp = start_len + tn;
+            *ptr.add(tn) = 0;
+            *ptr.add(tn + 1) = 0;
+            *ptr.add(tn + 2) = elem_wt;
+            let cn = put_varint_raw(ptr.add(tn + 3), count as u64);
+            ptr = ptr.add(tn + 3 + cn);
+            for item in items {
+                let vn = put_varint_raw(ptr, to_u64(item));
+                ptr = ptr.add(vn);
+            }
+            let total_len = ptr.offset_from(base) as usize;
+            dst.set_len(total_len);
+            lp
+        };
+        backpatch_container_len(dst, len_pos);
+        Ok(())
     }
 
     /// Encodes a `WireArray` of scalar elements using `write_elem`.
@@ -370,10 +944,7 @@ pub mod codec {
     where
         F: FnMut(&mut Vec<u8>, &T) -> Result<()>,
     {
-        append_tag(dst, field_num, WIRE_ARRAY);
-        let len_pos = dst.len();
-        dst.extend_from_slice(&[0, 0, elem_wt]);
-        append_varint(dst, items.len() as u64);
+        let len_pos = begin_tagged_array(dst, field_num, elem_wt, items.len());
         for item in items {
             write_elem(dst, item)?;
         }
@@ -403,13 +974,15 @@ pub mod codec {
             items.clear();
         }
         let (elem_wt, count, mut p) =
-            parse_array_header(body).ok_or_else(|| Error::parse("invalid WireArray header"))?;
+            parse_array_header(body).ok_or_else(|| cold_parse_err("invalid WireArray header"))?;
         if elem_wt != exp_elem_wt {
-            return Err(Error::parse("WireArray element wire type mismatch"));
+            return Err(cold_parse_err("WireArray element wire type mismatch"));
         }
-        let total = items.len() + count;
+        let base = items.len();
+        let cap_add = count.min(4096);
+        let total = base.saturating_add(cap_add);
         if items.capacity() < total {
-            items.reserve(grow_capacity(items.capacity(), total) - items.len());
+            items.reserve(grow_capacity(items.capacity(), total) - base);
         }
         for _ in 0..count {
             let (val, next_p) = read_elem(body, p)?;
@@ -417,7 +990,7 @@ pub mod codec {
             p = next_p;
         }
         if p != body.len() {
-            return Err(Error::parse("WireArray trailing bytes"));
+            return Err(cold_parse_err("WireArray trailing bytes"));
         }
         Ok(next_pos)
     }
@@ -430,15 +1003,9 @@ pub mod codec {
         items: &[M],
         deterministic: bool,
     ) -> Result<()> {
-        append_tag(dst, field_num, WIRE_ARRAY);
-        let len_pos = dst.len();
-        dst.extend_from_slice(&[0, 0, WIRE_SUB_MSG]);
-        append_varint(dst, items.len() as u64);
+        let len_pos = begin_tagged_array(dst, field_num, WIRE_SUB_MSG, items.len());
         for item in items {
-            let elem_pos = dst.len();
-            dst.extend_from_slice(&[0, 0]);
-            item.encode_omnibuf_append(dst, deterministic)?;
-            backpatch_container_len(dst, elem_pos);
+            write_sub_msg_elem(dst, item, deterministic)?;
         }
         backpatch_container_len(dst, len_pos);
         Ok(())
@@ -452,15 +1019,9 @@ pub mod codec {
         items: &[Box<M>],
         deterministic: bool,
     ) -> Result<()> {
-        append_tag(dst, field_num, WIRE_ARRAY);
-        let len_pos = dst.len();
-        dst.extend_from_slice(&[0, 0, WIRE_SUB_MSG]);
-        append_varint(dst, items.len() as u64);
+        let len_pos = begin_tagged_array(dst, field_num, WIRE_SUB_MSG, items.len());
         for item in items {
-            let elem_pos = dst.len();
-            dst.extend_from_slice(&[0, 0]);
-            item.encode_omnibuf_append(dst, deterministic)?;
-            backpatch_container_len(dst, elem_pos);
+            write_sub_msg_elem(dst, item.as_ref(), deterministic)?;
         }
         backpatch_container_len(dst, len_pos);
         Ok(())
@@ -483,23 +1044,25 @@ pub mod codec {
             items.clear();
         }
         let (elem_wt, count, mut p) =
-            parse_array_header(body).ok_or_else(|| Error::parse("invalid WireArray header"))?;
+            parse_array_header(body).ok_or_else(|| cold_parse_err("invalid WireArray header"))?;
         if elem_wt != WIRE_SUB_MSG {
-            return Err(Error::parse("expected WireArray(WireSubMsg)"));
+            return Err(cold_parse_err("expected WireArray(WireSubMsg)"));
         }
-        let total = items.len() + count;
+        let base = items.len();
+        let cap_add = count.min(4096);
+        let total = base.saturating_add(cap_add);
         if items.capacity() < total {
-            items.reserve(grow_capacity(items.capacity(), total) - items.len());
+            items.reserve(grow_capacity(items.capacity(), total) - base);
         }
         for _ in 0..count {
             let (elem_bytes, next_p) = read_len_slice(body, p, 0)?;
             let mut elem = M::default();
-            elem.decode_omnibuf_at_depth(elem_bytes, depth + 2, false)?;
+            elem.decode_omnibuf_at_depth(elem_bytes, depth + 2, true)?;
             items.push(elem);
             p = next_p;
         }
         if p != body.len() {
-            return Err(Error::parse("WireArray(WireSubMsg) trailing bytes"));
+            return Err(cold_parse_err("WireArray(WireSubMsg) trailing bytes"));
         }
         Ok(next_pos)
     }
@@ -520,112 +1083,263 @@ pub mod codec {
             items.clear();
         }
         let (elem_wt, count, mut p) =
-            parse_array_header(body).ok_or_else(|| Error::parse("invalid WireArray header"))?;
+            parse_array_header(body).ok_or_else(|| cold_parse_err("invalid WireArray header"))?;
         if elem_wt != WIRE_SUB_MSG {
-            return Err(Error::parse(format!(
-                "expected WireArray(WireSubMsg), got element type {elem_wt}"
-            )));
+            return Err(cold_parse_err("expected WireArray(WireSubMsg)"));
         }
-        let total = items.len() + count;
+        let base = items.len();
+        let cap_add = count.min(4096);
+        let total = base.saturating_add(cap_add);
         if items.capacity() < total {
-            items.reserve(grow_capacity(items.capacity(), total) - items.len());
+            items.reserve(grow_capacity(items.capacity(), total) - base);
         }
         for _ in 0..count {
             let (elem_bytes, next_p) = read_len_slice(body, p, 0)?;
             let mut elem = Box::new(M::default());
-            elem.decode_omnibuf_at_depth(elem_bytes, depth + 2, false)?;
+            elem.decode_omnibuf_at_depth(elem_bytes, depth + 2, true)?;
             items.push(elem);
             p = next_p;
         }
         if p != body.len() {
-            return Err(Error::parse("WireArray(WireSubMsg) trailing bytes"));
+            return Err(cold_parse_err("WireArray(WireSubMsg) trailing bytes"));
         }
         Ok(next_pos)
+    }
+
+    /// Encodes an untagged `WireSubMsg` element inside a `WireArray` or `WireMap`.
+    #[inline]
+    pub fn write_sub_msg_elem<M: Message>(
+        dst: &mut Vec<u8>,
+        msg: &M,
+        deterministic: bool,
+    ) -> Result<()> {
+        let elem_pos = dst.len();
+        dst.extend_from_slice(&[0, 0]);
+        msg.encode_omnibuf_append(dst, deterministic)?;
+        backpatch_container_len(dst, elem_pos);
+        Ok(())
+    }
+
+    /// Decodes an untagged `WireSubMsg` element inside a `WireArray` or `WireMap`.
+    #[inline]
+    pub fn read_sub_msg_elem<M: Message>(
+        body: &[u8],
+        p: usize,
+        depth: usize,
+    ) -> Result<(M, usize)> {
+        let (elem_bytes, next_p) = read_len_slice(body, p, 0)?;
+        let mut elem = M::default();
+        elem.decode_omnibuf_at_depth(elem_bytes, depth + 1, true)?;
+        Ok((elem, next_p))
+    }
+
+    /// Decodes an untagged `WireSubMsg` element into `Box<M>`.
+    #[inline]
+    pub fn read_box_sub_msg_elem<M: Message>(
+        body: &[u8],
+        p: usize,
+        depth: usize,
+    ) -> Result<(Box<M>, usize)> {
+        let (elem_bytes, next_p) = read_len_slice(body, p, 0)?;
+        let mut elem = Box::new(M::default());
+        elem.decode_omnibuf_at_depth(elem_bytes, depth + 1, true)?;
+        Ok((elem, next_p))
+    }
+
+    /// Encodes a tagged `WireArray` field whose elements may themselves be containers.
+    #[inline]
+    pub fn write_vec_field<T, F>(
+        dst: &mut Vec<u8>,
+        field_num: u32,
+        elem_wt: u8,
+        items: &[T],
+        deterministic: bool,
+        mut write_elem: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &T, bool) -> Result<()>,
+    {
+        let len_pos = begin_tagged_array(dst, field_num, elem_wt, items.len());
+        for item in items {
+            write_elem(dst, item, deterministic)?;
+        }
+        backpatch_container_len(dst, len_pos);
+        Ok(())
+    }
+
+    /// Decodes a tagged `WireArray` field whose elements may themselves be containers.
+    pub fn read_vec_field<T, F>(
+        items: &mut Vec<T>,
+        data: &[u8],
+        pos: usize,
+        depth: usize,
+        exp_elem_wt: u8,
+        reset: bool,
+        mut read_elem: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&[u8], usize, usize) -> Result<(T, usize)>,
+    {
+        if depth + 1 > MAX_NESTING_DEPTH {
+            return Err(Error::DepthLimitExceeded(depth + 1));
+        }
+        let (body, next_pos) = read_len_slice(data, pos, 2)?;
+        if reset {
+            items.clear();
+        }
+        let (elem_wt, count, mut p) =
+            parse_array_header(body).ok_or_else(|| cold_parse_err("invalid WireArray header"))?;
+        if elem_wt != exp_elem_wt {
+            return Err(cold_parse_err("WireArray element wire type mismatch"));
+        }
+        let base = items.len();
+        let cap_add = count.min(4096);
+        let total = base.saturating_add(cap_add);
+        if items.capacity() < total {
+            items.reserve(grow_capacity(items.capacity(), total) - base);
+        }
+        for _ in 0..count {
+            let (val, next_p) = read_elem(body, p, depth + 1)?;
+            items.push(val);
+            p = next_p;
+        }
+        if p != body.len() {
+            return Err(cold_parse_err("WireArray trailing bytes"));
+        }
+        Ok(next_pos)
+    }
+
+    /// Encodes an untagged `WireArray` container inside a parent `WireArray` or `WireMap`.
+    pub fn write_vec_elem<T, F>(
+        dst: &mut Vec<u8>,
+        elem_wt: u8,
+        items: &[T],
+        deterministic: bool,
+        mut write_elem: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &T, bool) -> Result<()>,
+    {
+        let len_pos = dst.len();
+        dst.extend_from_slice(&[0, 0, elem_wt]);
+        append_varint(dst, items.len() as u64);
+        for item in items {
+            write_elem(dst, item, deterministic)?;
+        }
+        backpatch_container_len(dst, len_pos);
+        Ok(())
+    }
+
+    /// Decodes an untagged `WireArray` container inside a parent `WireArray` or `WireMap`.
+    pub fn read_vec_elem<T, F>(
+        data: &[u8],
+        pos: usize,
+        depth: usize,
+        exp_elem_wt: u8,
+        mut read_elem: F,
+    ) -> Result<(Vec<T>, usize)>
+    where
+        F: FnMut(&[u8], usize, usize) -> Result<(T, usize)>,
+    {
+        if depth + 1 > MAX_NESTING_DEPTH {
+            return Err(Error::DepthLimitExceeded(depth + 1));
+        }
+        let (body, next_pos) = read_len_slice(data, pos, 2)?;
+        let (elem_wt, count, mut p) =
+            parse_array_header(body).ok_or_else(|| cold_parse_err("invalid WireArray header"))?;
+        if elem_wt != exp_elem_wt {
+            return Err(cold_parse_err("WireArray element wire type mismatch"));
+        }
+        let mut items = Vec::with_capacity(count.min(4096));
+        for _ in 0..count {
+            let (val, next_p) = read_elem(body, p, depth + 1)?;
+            items.push(val);
+            p = next_p;
+        }
+        if p != body.len() {
+            return Err(cold_parse_err("WireArray trailing bytes"));
+        }
+        Ok((items, next_pos))
     }
 
     // ========================================================================
     // Scalar Element Payload Helpers (Inside WireArray & WireMap)
     // ========================================================================
 
-    #[inline]
+    #[inline(always)]
     pub fn read_elem_uint(body: &[u8], p: usize) -> Result<(u64, usize)> {
-        let (v, vn) = decode_varint(
-            body.get(p..)
-                .ok_or_else(|| Error::parse("uint offset out of bounds"))?,
-        )
-        .ok_or_else(|| Error::parse(format!("truncated uint element at {p}")))?;
-        Ok((v, p + vn))
+        read_varint_at(body, p)
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn read_elem_sint(body: &[u8], p: usize) -> Result<(i64, usize)> {
-        let (v, next_p) = read_elem_uint(body, p)?;
+        let (v, next_p) = read_varint_at(body, p)?;
         Ok((decode_zigzag(v), next_p))
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn read_elem_bool(body: &[u8], p: usize) -> Result<(bool, usize)> {
         let b = *body
             .get(p)
-            .ok_or_else(|| Error::parse(format!("truncated bool element at {p}")))?;
+            .ok_or_else(|| cold_parse_err("truncated bool element"))?;
         match b {
             0 => Ok((false, p + 1)),
             1 => Ok((true, p + 1)),
-            _ => Err(Error::parse(format!("invalid bool byte {b} at {p}"))),
+            _ => Err(cold_parse_err("invalid bool byte")),
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn read_elem_fixed32(body: &[u8], p: usize) -> Result<(u32, usize)> {
         let raw: [u8; 4] = body
             .get(p..p + 4)
-            .ok_or_else(|| Error::parse(format!("truncated fixed32 element at {p}")))?
+            .ok_or_else(|| cold_parse_err("truncated fixed32 element"))?
             .try_into()
             .unwrap();
         Ok((u32::from_le_bytes(raw), p + 4))
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn read_elem_fixed64(body: &[u8], p: usize) -> Result<(u64, usize)> {
         let raw: [u8; 8] = body
             .get(p..p + 8)
-            .ok_or_else(|| Error::parse(format!("truncated fixed64 element at {p}")))?
+            .ok_or_else(|| cold_parse_err("truncated fixed64 element"))?
             .try_into()
             .unwrap();
         Ok((u64::from_le_bytes(raw), p + 8))
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn read_elem_sfixed32(body: &[u8], p: usize) -> Result<(i32, usize)> {
         let (v, next_p) = read_elem_fixed32(body, p)?;
         Ok((v as i32, next_p))
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn read_elem_sfixed64(body: &[u8], p: usize) -> Result<(i64, usize)> {
         let (v, next_p) = read_elem_fixed64(body, p)?;
         Ok((v as i64, next_p))
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn read_elem_float32(body: &[u8], p: usize) -> Result<(f32, usize)> {
         let (v, next_p) = read_elem_fixed32(body, p)?;
         Ok((f32::from_bits(v), next_p))
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn read_elem_float64(body: &[u8], p: usize) -> Result<(f64, usize)> {
         let (v, next_p) = read_elem_fixed64(body, p)?;
         Ok((f64::from_bits(v), next_p))
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn read_elem_string(body: &[u8], p: usize) -> Result<(String, usize)> {
         let (s, next_p) = read_str_slice(body, p)?;
         Ok((s.to_owned(), next_p))
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn read_elem_bytes(body: &[u8], p: usize) -> Result<(Vec<u8>, usize)> {
         let (b, next_p) = read_len_slice(body, p, 0)?;
         Ok((b.to_vec(), next_p))
@@ -789,5 +1503,225 @@ pub mod codec {
             return Err(Error::parse("WireMap trailing bytes"));
         }
         Ok(next_pos)
+    }
+
+    /// Encodes an untagged `WireMap` container inside a parent `WireArray` or `WireMap`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_hash_map_elem<K, V, S, FK, FV>(
+        dst: &mut Vec<u8>,
+        key_wt: u8,
+        val_wt: u8,
+        map: &HashMap<K, V, S>,
+        deterministic: bool,
+        mut write_key: FK,
+        mut write_val: FV,
+    ) -> Result<()>
+    where
+        K: Ord,
+        FK: FnMut(&mut Vec<u8>, &K) -> Result<()>,
+        FV: FnMut(&mut Vec<u8>, &V, bool) -> Result<()>,
+    {
+        let len_pos = dst.len();
+        dst.extend_from_slice(&[0, 0, key_wt, val_wt]);
+        append_varint(dst, map.len() as u64);
+        if deterministic && map.len() > 1 {
+            let mut entries: Vec<(&K, &V)> = map.iter().collect();
+            entries.sort_unstable_by(|(ka, _), (kb, _)| ka.cmp(kb));
+            for (k, v) in entries {
+                write_key(dst, k)?;
+                write_val(dst, v, deterministic)?;
+            }
+        } else {
+            for (k, v) in map {
+                write_key(dst, k)?;
+                write_val(dst, v, deterministic)?;
+            }
+        }
+        backpatch_container_len(dst, len_pos);
+        Ok(())
+    }
+
+    /// Decodes an untagged `WireMap` container into a `HashMap<K, V, S>`.
+    pub fn read_hash_map_elem<K, V, S, FK, FV>(
+        data: &[u8],
+        pos: usize,
+        depth: usize,
+        exp_key_wt: u8,
+        exp_val_wt: u8,
+        mut read_key: FK,
+        mut read_val: FV,
+    ) -> Result<(HashMap<K, V, S>, usize)>
+    where
+        K: Eq + Hash,
+        S: Default + std::hash::BuildHasher,
+        FK: FnMut(&[u8], usize) -> Result<(K, usize)>,
+        FV: FnMut(&[u8], usize, usize) -> Result<(V, usize)>,
+    {
+        let mut map = HashMap::default();
+        let next_pos = read_hash_map_field(
+            &mut map,
+            data,
+            pos,
+            depth,
+            exp_key_wt,
+            exp_val_wt,
+            false,
+            &mut read_key,
+            &mut read_val,
+        )?;
+        Ok((map, next_pos))
+    }
+
+    /// Encodes an untagged `BTreeMap<K, V>` container inside a parent `WireArray` or `WireMap`.
+    pub fn write_btree_map_elem<K, V, FK, FV>(
+        dst: &mut Vec<u8>,
+        key_wt: u8,
+        val_wt: u8,
+        map: &BTreeMap<K, V>,
+        deterministic: bool,
+        mut write_key: FK,
+        mut write_val: FV,
+    ) -> Result<()>
+    where
+        FK: FnMut(&mut Vec<u8>, &K) -> Result<()>,
+        FV: FnMut(&mut Vec<u8>, &V, bool) -> Result<()>,
+    {
+        let len_pos = dst.len();
+        dst.extend_from_slice(&[0, 0, key_wt, val_wt]);
+        append_varint(dst, map.len() as u64);
+        for (k, v) in map {
+            write_key(dst, k)?;
+            write_val(dst, v, deterministic)?;
+        }
+        backpatch_container_len(dst, len_pos);
+        Ok(())
+    }
+
+    /// Decodes an untagged `WireMap` container into a `BTreeMap<K, V>`.
+    pub fn read_btree_map_elem<K, V, FK, FV>(
+        data: &[u8],
+        pos: usize,
+        depth: usize,
+        exp_key_wt: u8,
+        exp_val_wt: u8,
+        mut read_key: FK,
+        mut read_val: FV,
+    ) -> Result<(BTreeMap<K, V>, usize)>
+    where
+        K: Ord,
+        FK: FnMut(&[u8], usize) -> Result<(K, usize)>,
+        FV: FnMut(&[u8], usize, usize) -> Result<(V, usize)>,
+    {
+        let mut map = BTreeMap::new();
+        let next_pos = read_btree_map_field(
+            &mut map,
+            data,
+            pos,
+            depth,
+            exp_key_wt,
+            exp_val_wt,
+            false,
+            &mut read_key,
+            &mut read_val,
+        )?;
+        Ok((map, next_pos))
+    }
+
+    #[cfg(feature = "buffa")]
+    impl<T: Default, P: ::buffa::ProtoBox<T>> IsEmpty for ::buffa::MessageField<T, P> {
+        #[inline]
+        fn is_omnibuf_empty(&self) -> bool {
+            !self.is_set()
+        }
+    }
+
+    #[cfg(feature = "buffa")]
+    impl<E: ::buffa::Enumeration> IsEmpty for ::buffa::EnumValue<E> {
+        #[inline]
+        fn is_omnibuf_empty(&self) -> bool {
+            self.to_i32() == 0
+        }
+    }
+
+    /// Encodes a `buffa::MessageField<M, P>` if set.
+    #[cfg(feature = "buffa")]
+    #[inline]
+    pub fn write_buffa_message_field<M: Message, P: ::buffa::ProtoBox<M>>(
+        dst: &mut Vec<u8>,
+        field_num: u32,
+        field: &::buffa::MessageField<M, P>,
+        deterministic: bool,
+    ) -> Result<()> {
+        if let Some(m) = field.as_option() {
+            write_sub_msg_field(dst, field_num, m, deterministic)?;
+        }
+        Ok(())
+    }
+
+    /// Decodes a `WIRE_SUB_MSG` into a `buffa::MessageField<M, P>`, merging on repeat occurrences.
+    #[cfg(feature = "buffa")]
+    #[inline]
+    pub fn read_buffa_message_field<M: Message, P: ::buffa::ProtoBox<M>>(
+        slot: &mut ::buffa::MessageField<M, P>,
+        data: &[u8],
+        pos: usize,
+        depth: usize,
+        merge: bool,
+    ) -> Result<usize> {
+        let (sub_bytes, next_pos) = read_len_slice(data, pos, 0)?;
+        if !merge || !slot.is_set() {
+            let mut m = M::default();
+            m.decode_omnibuf_at_depth(sub_bytes, depth + 1, false)?;
+            *slot = ::buffa::MessageField::some(m);
+        } else {
+            slot.get_or_insert_default()
+                .decode_omnibuf_at_depth(sub_bytes, depth + 1, true)?;
+        }
+        Ok(next_pos)
+    }
+
+    /// Encodes a `buffa::EnumValue<E>` field as `WIRE_SINT`.
+    #[cfg(feature = "buffa")]
+    #[inline]
+    pub fn write_buffa_enum_field<E: ::buffa::Enumeration>(
+        dst: &mut Vec<u8>,
+        field_num: u32,
+        val: &::buffa::EnumValue<E>,
+    ) {
+        write_sint_field(dst, field_num, i64::from(val.to_i32()));
+    }
+
+    /// Decodes a `WIRE_SINT` scalar into a `buffa::EnumValue<E>`.
+    #[cfg(feature = "buffa")]
+    #[inline]
+    pub fn read_buffa_enum_elem<E: ::buffa::Enumeration>(
+        data: &[u8],
+        pos: usize,
+    ) -> Result<(::buffa::EnumValue<E>, usize)> {
+        let (v, next_pos) = read_varint_at(data, pos)?;
+        Ok((::buffa::EnumValue::from(decode_zigzag(v) as i32), next_pos))
+    }
+
+    /// Encodes `Vec<buffa::EnumValue<E>>` as `WireArray(WIRE_SINT)`.
+    #[cfg(feature = "buffa")]
+    #[inline]
+    pub fn write_buffa_enum_vec_field<E: ::buffa::Enumeration>(
+        dst: &mut Vec<u8>,
+        field_num: u32,
+        items: &[::buffa::EnumValue<E>],
+    ) -> Result<()> {
+        write_varint_vec_field(dst, field_num, WIRE_SINT, items, |v| {
+            encode_zigzag(i64::from(v.to_i32()))
+        })
+    }
+
+    /// Builds value-driven [`SchemaMeta`] for an optional `buffa::MessageField<M, P>` if present.
+    #[cfg(feature = "buffa")]
+    #[inline]
+    pub fn buffa_message_field_value_schema_meta<M: Message, P: ::buffa::ProtoBox<M>>(
+        field: &::buffa::MessageField<M, P>,
+        depth: usize,
+    ) -> Option<SchemaMeta> {
+        field.as_option()?.build_value_schema_meta(depth)
     }
 }

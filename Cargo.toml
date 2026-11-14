@@ -11,14 +11,19 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 authors = ["OmniBuf Contributors"]
+repository = "https://github.com/omnibuf/omnibuf-rs"
+homepage = "https://omnibuf.com/rs"
 
 [workspace.dependencies]
 omnibuf = { path = "crates/omnibuf", version = "0.1.0" }
 omnibuf-derive = { path = "crates/omnibuf-derive", version = "0.1.0" }
 protoc-gen-omnibuf-rs = { path = "crates/protoc-gen-omnibuf-rs", version = "0.1.0" }
+buffa = "0.9"
+buffa-build = "0.9"
+buffa-descriptor = { version = "0.9", features = ["reflect", "std"] }
 itoa = "1.0"
 proc-macro2 = "1.0"
 prost = "0.13"

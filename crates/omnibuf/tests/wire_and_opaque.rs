@@ -1,14 +1,16 @@
 use std::collections::HashMap;
 
-use omnibuf::opaque::{copy_packet, splice_fields};
+use omnibuf::opaque::{
+    copy_packet, splice_fields, try_copy_packet, try_splice_fields, try_splice_fields_vec,
+};
 use omnibuf::wire::{
     Decoder, Encoder, MAX_NESTING_DEPTH, WIRE_ARRAY, WIRE_BOOL_TRUE, WIRE_BYTES, WIRE_FIXED32,
     WIRE_FIXED64, WIRE_FLOAT32, WIRE_FLOAT64, WIRE_SFIXED32, WIRE_SFIXED64, WIRE_SINT, WIRE_STRING,
-    WIRE_SUB_MSG, WIRE_UINT, append_tag, append_varint, counted_arr_len, decode_varint,
-    decode_zigzag, encode_zigzag, locate_field, lookup_map_string_uint, read_bool, read_bytes,
-    read_fixed32, read_fixed64, read_float32, read_float64, read_map_string_uint, read_sfixed32,
-    read_sfixed64, read_sint, read_str, read_sub_msg, read_sub_msg_arr_elem, read_uint,
-    sub_msg_arr_len,
+    WIRE_SUB_MSG, WIRE_UINT, append_tag, append_varint, backpatch_container_len, counted_arr_len,
+    decode_varint, decode_zigzag, encode_zigzag, locate_field, lookup_map_string_uint,
+    patch_reserved_varint, put_overlong_2b_varint, read_bool, read_bytes, read_fixed32,
+    read_fixed64, read_float32, read_float64, read_map_string_uint, read_sfixed32, read_sfixed64,
+    read_sint, read_str, read_sub_msg, read_sub_msg_arr_elem, read_uint, sub_msg_arr_len,
 };
 
 #[test]
@@ -285,4 +287,147 @@ fn opaque_splice_grow_shrink_delete_append_and_prefix_preservation() {
     let mut framed = vec![0xAA];
     copy_packet(&mut framed, &cleaned);
     assert_eq!(framed.as_slice(), cleaned.as_slice());
+}
+
+#[test]
+fn encoder_and_patch_helpers_reject_misuse_deterministically() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    // Unmatched end calls on an empty stack panic deterministically instead of underflowing.
+    assert!(
+        catch_unwind(|| {
+            let mut enc = Encoder::default();
+            enc.end_sub_msg();
+        })
+        .is_err()
+    );
+    assert!(
+        catch_unwind(|| {
+            let mut enc = Encoder::default();
+            enc.end_sub_msg_elem();
+        })
+        .is_err()
+    );
+    assert!(
+        catch_unwind(|| {
+            let mut enc = Encoder::default();
+            enc.end_sub_msg_arr();
+        })
+        .is_err()
+    );
+
+    // Cross-frame misuse (closing sub_msg_arr with end_container or begin_sub_msg_elem inside begin_sub_msg)
+    // is rejected via FRAME_CONTAINER sentinel checks.
+    assert!(
+        catch_unwind(|| {
+            let mut enc = Encoder::default();
+            enc.begin_sub_msg_arr(1);
+            enc.end_container();
+        })
+        .is_err()
+    );
+    assert!(
+        catch_unwind(|| {
+            let mut enc = Encoder::default();
+            enc.begin_sub_msg(1);
+            enc.begin_sub_msg_elem();
+        })
+        .is_err()
+    );
+
+    // Bounds / range guards on public varint & backpatch helpers.
+    assert!(
+        catch_unwind(|| {
+            let mut short = vec![0u8; 1];
+            put_overlong_2b_varint(&mut short, 42);
+        })
+        .is_err()
+    );
+    assert!(
+        catch_unwind(|| {
+            let mut ok_len = vec![0u8; 2];
+            put_overlong_2b_varint(&mut ok_len, 20_000);
+        })
+        .is_err()
+    );
+    assert!(
+        catch_unwind(|| {
+            let mut short = vec![0u8; 1];
+            patch_reserved_varint(&mut short, 5, 10);
+        })
+        .is_err()
+    );
+
+    let mut short = vec![0xAB];
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        backpatch_container_len(&mut short, 5);
+        backpatch_container_len(&mut short, 0);
+        backpatch_container_len(&mut short, usize::MAX);
+    }));
+    assert!(res.is_ok());
+    assert_eq!(short, vec![0xAB]);
+}
+
+#[test]
+fn fallible_opaque_splicers_and_field0_validation_reject_corrupt_packets() {
+    let mut enc = Encoder::default();
+    enc.write_uint(1, 10);
+    enc.begin_sub_msg(2);
+    enc.write_string(1, "nested-ok");
+    enc.end_sub_msg();
+    let valid_raw = enc.into_vec();
+
+    // Valid fallible copy and splice succeed.
+    let mut copied = Vec::new();
+    try_copy_packet(&mut copied, &valid_raw).unwrap();
+    assert_eq!(copied, valid_raw);
+
+    let spliced = try_splice_fields_vec(&valid_raw, 1 << 1, 2, |out, fnum| {
+        if fnum == 1 {
+            append_tag(out, 1, WIRE_UINT);
+            append_varint(out, 999);
+        }
+    })
+    .unwrap();
+    assert_eq!(read_uint(&spliced, 1), Some(999));
+
+    // 1. Corrupt inner sub-message (truncated varint inside untouched field 2) must fail try_splice_fields
+    //    and preserve dst's original prefix length.
+    let mut bad_sub = Vec::new();
+    append_tag(&mut bad_sub, 1, WIRE_UINT);
+    append_varint(&mut bad_sub, 10);
+    append_tag(&mut bad_sub, 2, WIRE_SUB_MSG);
+    append_varint(&mut bad_sub, 2);
+    bad_sub.extend_from_slice(&[0x21, 0x02]); // field 1 WireUint with truncated 2B varint
+
+    let mut dst_with_prefix = vec![0xAA, 0xBB, 0xCC];
+    let err = try_splice_fields(&mut dst_with_prefix, &bad_sub, 1 << 1, 2, |out, fnum| {
+        if fnum == 1 {
+            append_tag(out, 1, WIRE_UINT);
+            append_varint(out, 20);
+        }
+    });
+    assert!(err.is_err());
+    assert_eq!(dst_with_prefix, vec![0xAA, 0xBB, 0xCC]);
+    assert!(try_copy_packet(&mut dst_with_prefix, &bad_sub).is_err());
+
+    // 2. Malformed Field #0 (invalid UTF-8 inside SchemaMeta.type_name) must be rejected by both
+    //    try_splice_fields_vec and O(1) field readers.
+    let mut bad_f0 = Vec::new();
+    append_tag(&mut bad_f0, 0, WIRE_SUB_MSG);
+    append_varint(&mut bad_f0, 3);
+    append_tag(&mut bad_f0, 1, WIRE_STRING);
+    append_varint(&mut bad_f0, 1);
+    bad_f0.push(0xFF); // invalid UTF-8
+    append_tag(&mut bad_f0, 1, WIRE_UINT);
+    append_varint(&mut bad_f0, 42);
+
+    assert_eq!(read_uint(&bad_f0, 1), None);
+    assert!(
+        try_splice_fields_vec(&bad_f0, 1 << 1, 1, |out, _| {
+            append_tag(out, 1, WIRE_UINT);
+            append_varint(out, 7);
+        })
+        .is_err()
+    );
 }

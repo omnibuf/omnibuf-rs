@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use prost::bytes::Bytes;
 use prost_reflect::{
@@ -6,8 +6,8 @@ use prost_reflect::{
 };
 
 use crate::error::{Error, Result};
-use crate::field0::{SchemaMeta, validate_field0};
-use crate::message::EncodeOptions;
+use crate::field0::{SchemaMeta, merge_schema_meta, validate_field0};
+use crate::message::{DecodeOptions, EncodeOptions, enforce_decode_options};
 use crate::wire::{
     MAX_FIELD_NUMBER, MAX_NESTING_DEPTH, WIRE_ARRAY, WIRE_BOOL_FALSE, WIRE_BOOL_TRUE, WIRE_BYTES,
     WIRE_FIXED32, WIRE_FIXED64, WIRE_FLOAT32, WIRE_FLOAT64, WIRE_MAP, WIRE_SFIXED32, WIRE_SFIXED64,
@@ -19,61 +19,141 @@ use crate::wire::{
 /// Builds an OmniBuf [`SchemaMeta`] from a Protobuf [`MessageDescriptor`], bounding cycles and depth.
 pub fn schema_meta_from_descriptor(desc: &MessageDescriptor) -> SchemaMeta {
     let mut active = HashSet::new();
-    build_descriptor_schema_meta(desc, 0, &mut active).unwrap_or_default()
+    build_descriptor_schema_meta(desc, 1, &mut active)
+        .0
+        .unwrap_or_default()
 }
 
 fn build_descriptor_schema_meta(
     desc: &MessageDescriptor,
     depth: usize,
     active: &mut HashSet<String>,
-) -> Option<SchemaMeta> {
-    let full_name = desc.full_name();
-    if depth > MAX_NESTING_DEPTH || active.contains(full_name) {
-        return None;
+) -> (Option<SchemaMeta>, bool) {
+    if depth >= MAX_NESTING_DEPTH {
+        return (None, false);
     }
-    active.insert(full_name.to_owned());
-
+    let full_name = desc.full_name();
     let mut meta = SchemaMeta {
         type_name: desc.name().to_owned(),
         ..SchemaMeta::default()
     };
 
     for fd in desc.fields() {
-        let fnum = fd.number();
-        meta.fields.insert(fnum, fd.name().to_owned());
+        meta.fields.insert(fd.number(), fd.name().to_owned());
+    }
 
-        let (child_desc, child_depth) = if fd.is_map() {
+    if active.contains(full_name) {
+        return (Some(meta), true);
+    }
+    active.insert(full_name.to_owned());
+    let mut cyclic = false;
+
+    for fd in desc.fields() {
+        if fd.is_group() {
+            continue;
+        }
+        let fnum = fd.number();
+        let child_desc = if fd.is_map() {
             if let Kind::Message(entry_desc) = fd.kind() {
                 let val_fd = entry_desc.map_entry_value_field();
                 if let Kind::Message(val_msg) = val_fd.kind() {
-                    (Some(val_msg), depth + 2)
+                    Some(val_msg)
                 } else {
-                    (None, depth)
+                    None
                 }
             } else {
-                (None, depth)
+                None
             }
         } else if let Kind::Message(sub_desc) = fd.kind() {
-            let d = if fd.is_list() { depth + 2 } else { depth + 1 };
-            (Some(sub_desc), d)
+            Some(sub_desc)
         } else {
-            (None, depth)
+            None
         };
 
-        if let Some(sub_desc) = child_desc
-            && let Some(child_meta) = build_descriptor_schema_meta(&sub_desc, child_depth, active)
-        {
-            meta.children.insert(fnum, child_meta);
+        if let Some(sub_desc) = child_desc {
+            let (child_opt, child_cyclic) =
+                build_descriptor_schema_meta(&sub_desc, depth + 2, active);
+            if child_cyclic {
+                cyclic = true;
+            }
+            if let Some(child_meta) = child_opt {
+                meta.children.insert(fnum, child_meta);
+            }
         }
     }
 
     active.remove(full_name);
+    (Some(meta), cyclic)
+}
+
+fn build_dynamic_value_schema_meta(msg: &DynamicMessage, depth: usize) -> Option<SchemaMeta> {
+    if depth >= MAX_NESTING_DEPTH {
+        return None;
+    }
+    let desc = msg.descriptor();
+    let mut meta = SchemaMeta {
+        type_name: desc.name().to_owned(),
+        ..SchemaMeta::default()
+    };
+
+    for fd in desc.fields() {
+        meta.fields.insert(fd.number(), fd.name().to_owned());
+    }
+
+    if depth + 2 >= MAX_NESTING_DEPTH {
+        return Some(meta);
+    }
+
+    for fd in desc.fields() {
+        if fd.is_group() || !msg.has_field(&fd) {
+            continue;
+        }
+        let fnum = fd.number();
+        let val = msg.get_field(&fd);
+        let mut child: Option<SchemaMeta> = None;
+
+        if fd.is_map() {
+            if let Kind::Message(entry_desc) = fd.kind()
+                && matches!(entry_desc.map_entry_value_field().kind(), Kind::Message(_))
+                && let Value::Map(ref map) = *val
+            {
+                for v in map.values() {
+                    if let Value::Message(sub) = v
+                        && let Some(cm) = build_dynamic_value_schema_meta(sub, depth + 2)
+                    {
+                        child = Some(merge_schema_meta(child, cm));
+                    }
+                }
+            }
+        } else if fd.is_list() {
+            if matches!(fd.kind(), Kind::Message(_))
+                && let Value::List(ref list) = *val
+            {
+                for item in list {
+                    if let Value::Message(sub) = item
+                        && let Some(cm) = build_dynamic_value_schema_meta(sub, depth + 2)
+                    {
+                        child = Some(merge_schema_meta(child, cm));
+                    }
+                }
+            }
+        } else if matches!(fd.kind(), Kind::Message(_))
+            && let Value::Message(ref sub) = *val
+        {
+            child = build_dynamic_value_schema_meta(sub, depth + 2);
+        }
+
+        if let Some(c) = child {
+            meta.children.insert(fnum, c);
+        }
+    }
+
     Some(meta)
 }
 
 /// Encodes a [`DynamicMessage`] directly into OmniBuf wire bytes.
 pub fn encode_dynamic(msg: &DynamicMessage, opts: EncodeOptions) -> Result<Vec<u8>> {
-    let mut dst = Vec::with_capacity(256);
+    let mut dst = Vec::with_capacity(128);
     encode_dynamic_append(&mut dst, msg, opts)?;
     Ok(dst)
 }
@@ -85,7 +165,13 @@ pub fn encode_dynamic_append(
     opts: EncodeOptions,
 ) -> Result<()> {
     if opts.self_describing {
-        let meta = schema_meta_from_descriptor(&msg.descriptor());
+        let mut active = HashSet::new();
+        let (static_meta, cyclic) = build_descriptor_schema_meta(&msg.descriptor(), 1, &mut active);
+        let meta = if cyclic {
+            build_dynamic_value_schema_meta(msg, 1).unwrap_or_default()
+        } else {
+            static_meta.unwrap_or_default()
+        };
         meta.append_field0(dst);
     }
     encode_dynamic_body(dst, msg, opts.deterministic)
@@ -93,6 +179,16 @@ pub fn encode_dynamic_append(
 
 /// Decodes OmniBuf wire bytes into a [`DynamicMessage`], clearing fields absent from `data`.
 pub fn decode_dynamic(data: &[u8], msg: &mut DynamicMessage) -> Result<()> {
+    decode_dynamic_at_depth(data, msg, 0, false)
+}
+
+/// Decodes OmniBuf wire bytes into a [`DynamicMessage`] while enforcing [`DecodeOptions`].
+pub fn decode_dynamic_with_options(
+    data: &[u8],
+    msg: &mut DynamicMessage,
+    opts: DecodeOptions,
+) -> Result<()> {
+    enforce_decode_options(data, &opts)?;
     decode_dynamic_at_depth(data, msg, 0, false)
 }
 
@@ -108,9 +204,19 @@ pub fn decode_prost<M: ReflectMessage + Default>(data: &[u8], msg: &mut M) -> Re
     decode_dynamic_at_depth(data, &mut dyn_msg, 0, false)?;
     msg.clear();
     let mut proto_buf = Vec::with_capacity(data.len() + 32);
-    encode_dynamic_proto_preserving_neg_zero(&dyn_msg, &mut proto_buf);
+    encode_dynamic_to_proto_bytes(&dyn_msg, &mut proto_buf)?;
     msg.merge(proto_buf.as_slice())
         .map_err(|e| Error::parse(format!("prost transcode merge failed: {e}")))
+}
+
+/// Decodes OmniBuf wire bytes into any [`ReflectMessage`] while enforcing [`DecodeOptions`].
+pub fn decode_prost_with_options<M: ReflectMessage + Default>(
+    data: &[u8],
+    msg: &mut M,
+    opts: DecodeOptions,
+) -> Result<()> {
+    enforce_decode_options(data, &opts)?;
+    decode_prost(data, msg)
 }
 
 fn proto_kind_wire_type(kind: &Kind) -> Result<u8> {
@@ -251,6 +357,11 @@ fn append_map_val_payload(
     val: &Value,
     deterministic: bool,
 ) -> Result<()> {
+    if val_fd.is_group() {
+        return Err(Error::serialize(
+            "proto2 groups are not supported by OmniBuf",
+        ));
+    }
     if let (Kind::Message(_), Value::Message(sub_msg)) = (val_fd.kind(), val) {
         let len_pos = dst.len();
         dst.extend_from_slice(&[0, 0]);
@@ -264,7 +375,21 @@ fn append_map_val_payload(
 
 fn encode_dynamic_body(dst: &mut Vec<u8>, msg: &DynamicMessage, deterministic: bool) -> Result<()> {
     let desc = msg.descriptor();
+    for ext in desc.extensions() {
+        if msg.has_extension(&ext) {
+            return Err(Error::serialize(format!(
+                "proto2 extensions are not supported by OmniBuf: {}",
+                ext.full_name()
+            )));
+        }
+    }
     for fd in desc.fields() {
+        if fd.is_group() {
+            return Err(Error::serialize(format!(
+                "proto2 groups are not supported by OmniBuf: {}",
+                fd.full_name()
+            )));
+        }
         let fnum = fd.number();
         if fd.supports_presence() && !msg.has_field(&fd) {
             continue;
@@ -277,6 +402,11 @@ fn encode_dynamic_body(dst: &mut Vec<u8>, msg: &DynamicMessage, deterministic: b
             };
             let key_fd = entry_desc.map_entry_key_field();
             let val_fd = entry_desc.map_entry_value_field();
+            if val_fd.is_group() {
+                return Err(Error::serialize(
+                    "proto2 groups are not supported by OmniBuf",
+                ));
+            }
             let key_wt = proto_kind_wire_type(&key_fd.kind())?;
             let val_wt = proto_kind_wire_type(&val_fd.kind())?;
             let Value::Map(ref map) = *val else {
@@ -464,6 +594,15 @@ fn decode_dynamic_at_depth(
         return Err(Error::DepthLimitExceeded(depth));
     }
     let desc = msg.descriptor();
+    for fd in desc.fields() {
+        if fd.is_group() {
+            return Err(Error::parse(format!(
+                "proto2 groups are not supported by OmniBuf: {}",
+                fd.full_name()
+            )));
+        }
+    }
+
     let n = data.len();
     let mut pos = 0usize;
     let mut seen: HashSet<u32> = HashSet::new();
@@ -484,6 +623,13 @@ fn decode_dynamic_at_depth(
             }
             pos = validate_field0(data, pos, depth)?;
             continue;
+        }
+
+        if let Some(ext) = desc.get_extension(fnum) {
+            return Err(Error::parse(format!(
+                "proto2 extensions are not supported by OmniBuf: {}",
+                ext.full_name()
+            )));
         }
 
         let Some(fd) = desc.get_field(fnum) else {
@@ -507,6 +653,9 @@ fn decode_dynamic_at_depth(
             };
             let key_fd = entry_desc.map_entry_key_field();
             let val_fd = entry_desc.map_entry_value_field();
+            if val_fd.is_group() {
+                return Err(Error::parse("proto2 groups are not supported by OmniBuf"));
+            }
             let exp_key_wt = proto_kind_wire_type(&key_fd.kind())?;
             let exp_val_wt = proto_kind_wire_type(&val_fd.kind())?;
 
@@ -569,7 +718,7 @@ fn decode_dynamic_at_depth(
             let Value::List(list) = msg.get_field_mut(&fd) else {
                 return Err(Error::parse("expected Value::List"));
             };
-            list.reserve(count);
+            list.reserve(count.min(4096));
             for _ in 0..count {
                 if let Kind::Message(sub_desc) = fd.kind() {
                     let (sub_bytes, next_p) = read_len_slice(body, p, 0)?;
@@ -642,14 +791,6 @@ fn decode_dynamic_at_depth(
     Ok(())
 }
 
-/// Encodes `dyn_msg` to standard Protobuf wire bytes AND explicitly appends `-0.0` float/double
-/// fields so `prost::Message::merge` preserves negative-zero sign bits.
-fn encode_dynamic_proto_preserving_neg_zero(dyn_msg: &DynamicMessage, dst: &mut Vec<u8>) {
-    use prost::Message as _;
-    dyn_msg.encode_raw(dst);
-    append_neg_zero_fixups(dyn_msg, dst);
-}
-
 fn write_proto_varint(dst: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
         dst.push(((v as u8) & 0x7F) | 0x80);
@@ -658,37 +799,195 @@ fn write_proto_varint(dst: &mut Vec<u8>, mut v: u64) {
     dst.push(v as u8);
 }
 
-fn append_neg_zero_fixups(dyn_msg: &DynamicMessage, dst: &mut Vec<u8>) {
-    for fd in dyn_msg.descriptor().fields() {
-        if !dyn_msg.has_field(&fd) && fd.supports_presence() {
-            continue;
-        }
-        let fnum = u64::from(fd.number());
-        let val = dyn_msg.get_field(&fd);
-        match (&fd.kind(), &*val) {
-            (Kind::Float, Value::F32(f)) if !fd.is_list() && f.to_bits() == 0x8000_0000 => {
-                write_proto_varint(dst, (fnum << 3) | 5);
-                dst.extend_from_slice(&0x8000_0000u32.to_le_bytes());
-            }
-            (Kind::Double, Value::F64(f))
-                if !fd.is_list() && f.to_bits() == 0x8000_0000_0000_0000 =>
-            {
-                write_proto_varint(dst, (fnum << 3) | 1);
-                dst.extend_from_slice(&0x8000_0000_0000_0000u64.to_le_bytes());
-            }
-            (Kind::Message(_), Value::Message(sub_msg)) if !fd.is_list() && !fd.is_map() => {
-                let mut sub_fix = Vec::new();
-                append_neg_zero_fixups(sub_msg, &mut sub_fix);
-                if !sub_fix.is_empty() {
-                    write_proto_varint(dst, (fnum << 3) | 2);
-                    write_proto_varint(dst, sub_fix.len() as u64);
-                    dst.extend_from_slice(&sub_fix);
-                }
-            }
-            _ => {}
-        }
+fn write_proto_zigzag32(v: i32) -> u64 {
+    (((v << 1) ^ (v >> 31)) as u32) as u64
+}
+
+fn write_proto_zigzag64(v: i64) -> u64 {
+    ((v << 1) ^ (v >> 63)) as u64
+}
+
+fn is_proto_default_scalar(kind: &Kind, val: &Value) -> bool {
+    match (kind, val) {
+        (Kind::Bool, Value::Bool(b)) => !*b,
+        (Kind::Uint32 | Kind::Fixed32, Value::U32(v)) => *v == 0,
+        (Kind::Uint64 | Kind::Fixed64, Value::U64(v)) => *v == 0,
+        (Kind::Int32 | Kind::Sint32 | Kind::Sfixed32, Value::I32(v)) => *v == 0,
+        (Kind::Int64 | Kind::Sint64 | Kind::Sfixed64, Value::I64(v)) => *v == 0,
+        (Kind::Enum(_), Value::EnumNumber(n)) => *n == 0,
+        (Kind::Float, Value::F32(f)) => f.to_bits() == 0,
+        (Kind::Double, Value::F64(f)) => f.to_bits() == 0,
+        (Kind::String, Value::String(s)) => s.is_empty(),
+        (Kind::Bytes, Value::Bytes(b)) => b.is_empty(),
+        _ => false,
     }
 }
 
-#[allow(dead_code)]
-type _UnusedMapAlias = HashMap<u32, u32>;
+fn write_proto_tagged_scalar(dst: &mut Vec<u8>, fnum: u32, kind: &Kind, val: &Value) -> Result<()> {
+    let f = u64::from(fnum);
+    match (kind, val) {
+        (Kind::Bool, Value::Bool(b)) => {
+            write_proto_varint(dst, f << 3);
+            dst.push(u8::from(*b));
+        }
+        (Kind::Uint32, Value::U32(v)) => {
+            write_proto_varint(dst, f << 3);
+            write_proto_varint(dst, u64::from(*v));
+        }
+        (Kind::Uint64, Value::U64(v)) => {
+            write_proto_varint(dst, f << 3);
+            write_proto_varint(dst, *v);
+        }
+        (Kind::Int32, Value::I32(v)) => {
+            write_proto_varint(dst, f << 3);
+            write_proto_varint(dst, i64::from(*v) as u64);
+        }
+        (Kind::Int64, Value::I64(v)) => {
+            write_proto_varint(dst, f << 3);
+            write_proto_varint(dst, *v as u64);
+        }
+        (Kind::Enum(_), Value::EnumNumber(n)) => {
+            write_proto_varint(dst, f << 3);
+            write_proto_varint(dst, i64::from(*n) as u64);
+        }
+        (Kind::Sint32, Value::I32(v)) => {
+            write_proto_varint(dst, f << 3);
+            write_proto_varint(dst, write_proto_zigzag32(*v));
+        }
+        (Kind::Sint64, Value::I64(v)) => {
+            write_proto_varint(dst, f << 3);
+            write_proto_varint(dst, write_proto_zigzag64(*v));
+        }
+        (Kind::Fixed32, Value::U32(v)) => {
+            write_proto_varint(dst, (f << 3) | 5);
+            dst.extend_from_slice(&v.to_le_bytes());
+        }
+        (Kind::Sfixed32, Value::I32(v)) => {
+            write_proto_varint(dst, (f << 3) | 5);
+            dst.extend_from_slice(&v.to_le_bytes());
+        }
+        (Kind::Float, Value::F32(v)) => {
+            write_proto_varint(dst, (f << 3) | 5);
+            dst.extend_from_slice(&v.to_bits().to_le_bytes());
+        }
+        (Kind::Fixed64, Value::U64(v)) => {
+            write_proto_varint(dst, (f << 3) | 1);
+            dst.extend_from_slice(&v.to_le_bytes());
+        }
+        (Kind::Sfixed64, Value::I64(v)) => {
+            write_proto_varint(dst, (f << 3) | 1);
+            dst.extend_from_slice(&v.to_le_bytes());
+        }
+        (Kind::Double, Value::F64(v)) => {
+            write_proto_varint(dst, (f << 3) | 1);
+            dst.extend_from_slice(&v.to_bits().to_le_bytes());
+        }
+        (Kind::String, Value::String(s)) => {
+            write_proto_varint(dst, (f << 3) | 2);
+            write_proto_varint(dst, s.len() as u64);
+            dst.extend_from_slice(s.as_bytes());
+        }
+        (Kind::Bytes, Value::Bytes(b)) => {
+            write_proto_varint(dst, (f << 3) | 2);
+            write_proto_varint(dst, b.len() as u64);
+            dst.extend_from_slice(b);
+        }
+        _ => {
+            return Err(Error::parse(format!(
+                "unexpected Value {val:?} for Kind {kind:?} during prost transcode"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn write_proto_map_key(dst: &mut Vec<u8>, kind: &Kind, key: &MapKey) -> Result<()> {
+    match key {
+        MapKey::Bool(b) => write_proto_tagged_scalar(dst, 1, kind, &Value::Bool(*b)),
+        MapKey::I32(v) => write_proto_tagged_scalar(dst, 1, kind, &Value::I32(*v)),
+        MapKey::I64(v) => write_proto_tagged_scalar(dst, 1, kind, &Value::I64(*v)),
+        MapKey::U32(v) => write_proto_tagged_scalar(dst, 1, kind, &Value::U32(*v)),
+        MapKey::U64(v) => write_proto_tagged_scalar(dst, 1, kind, &Value::U64(*v)),
+        MapKey::String(s) => write_proto_tagged_scalar(dst, 1, kind, &Value::String(s.clone())),
+    }
+}
+
+/// Encodes `dyn_msg` directly to Protobuf wire bytes while emitting `-0.0` float/double
+/// sign bits explicitly across singular, repeated, map, and nested submessage fields.
+fn encode_dynamic_to_proto_bytes(dyn_msg: &DynamicMessage, dst: &mut Vec<u8>) -> Result<()> {
+    for fd in dyn_msg.descriptor().fields() {
+        let fnum = fd.number();
+        let kind = fd.kind();
+        if fd.is_map() {
+            let Kind::Message(entry_desc) = kind else {
+                continue;
+            };
+            let key_kind = entry_desc.map_entry_key_field().kind();
+            let val_kind = entry_desc.map_entry_value_field().kind();
+            let val = dyn_msg.get_field(&fd);
+            let Value::Map(ref map) = *val else {
+                continue;
+            };
+            let mut entry_buf = Vec::new();
+            for (k, v) in map {
+                entry_buf.clear();
+                write_proto_map_key(&mut entry_buf, &key_kind, k)?;
+                if let Value::Message(sub_msg) = v {
+                    let mut sub_buf = Vec::new();
+                    encode_dynamic_to_proto_bytes(sub_msg, &mut sub_buf)?;
+                    write_proto_varint(&mut entry_buf, (2 << 3) | 2);
+                    write_proto_varint(&mut entry_buf, sub_buf.len() as u64);
+                    entry_buf.extend_from_slice(&sub_buf);
+                } else {
+                    write_proto_tagged_scalar(&mut entry_buf, 2, &val_kind, v)?;
+                }
+                write_proto_varint(dst, (u64::from(fnum) << 3) | 2);
+                write_proto_varint(dst, entry_buf.len() as u64);
+                dst.extend_from_slice(&entry_buf);
+            }
+            continue;
+        }
+
+        if fd.is_list() {
+            let val = dyn_msg.get_field(&fd);
+            let Value::List(ref list) = *val else {
+                continue;
+            };
+            let mut sub_buf = Vec::new();
+            for item in list {
+                if let Value::Message(sub_msg) = item {
+                    sub_buf.clear();
+                    encode_dynamic_to_proto_bytes(sub_msg, &mut sub_buf)?;
+                    write_proto_varint(dst, (u64::from(fnum) << 3) | 2);
+                    write_proto_varint(dst, sub_buf.len() as u64);
+                    dst.extend_from_slice(&sub_buf);
+                } else {
+                    write_proto_tagged_scalar(dst, fnum, &kind, item)?;
+                }
+            }
+            continue;
+        }
+
+        if fd.supports_presence() {
+            if !dyn_msg.has_field(&fd) {
+                continue;
+            }
+            let val = dyn_msg.get_field(&fd);
+            if let Value::Message(ref sub_msg) = *val {
+                let mut sub_buf = Vec::new();
+                encode_dynamic_to_proto_bytes(sub_msg, &mut sub_buf)?;
+                write_proto_varint(dst, (u64::from(fnum) << 3) | 2);
+                write_proto_varint(dst, sub_buf.len() as u64);
+                dst.extend_from_slice(&sub_buf);
+            } else {
+                write_proto_tagged_scalar(dst, fnum, &kind, &val)?;
+            }
+        } else {
+            let val = dyn_msg.get_field(&fd);
+            if !is_proto_default_scalar(&kind, &val) {
+                write_proto_tagged_scalar(dst, fnum, &kind, &val)?;
+            }
+        }
+    }
+    Ok(())
+}

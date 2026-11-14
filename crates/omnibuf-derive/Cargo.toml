@@ -1,11 +1,16 @@
 [package]
 name = "omnibuf-derive"
-description = "Procedural derive macro for OmniBuf native Rust structs"
+description = "Procedural derive macro for OmniBuf native Rust structs and oneof enums"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["serialization", "protobuf", "derive", "macro", "wire-format"]
+categories = ["encoding", "development-tools::procedural-macro-helpers"]
 
 [lib]
 proc-macro = true

@@ -37,6 +37,15 @@ fn main() {
     cfg.compile_protos(&[&peer_proto], &[&proto_root])
         .expect("failed to compile peer.proto with prost-build");
 
+    buffa_build::Config::new()
+        .descriptor_set(&fds_path)
+        .files(&["omnibuf/bench/peer.proto"])
+        .generate_views(true)
+        .generate_reflection(true)
+        .include_file("_buffa.rs")
+        .compile()
+        .expect("failed to compile peer.proto with buffa-build");
+
     let fds_bytes = fs::read(&fds_path).expect("failed to read compiled FileDescriptorSet");
     let fds = FileDescriptorSet::decode(fds_bytes.as_slice())
         .expect("failed to decode FileDescriptorSet");
@@ -55,6 +64,10 @@ fn main() {
     for file in resp.file {
         let name = file.name.expect("generated file missing name");
         let content = file.content.expect("generated file missing content");
-        fs::write(out_dir.join(name), content).expect("failed to write generated omnibuf file");
+        let out_path = out_dir.join(name);
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent).expect("failed to create generated parent directory");
+        }
+        fs::write(out_path, content).expect("failed to write generated omnibuf file");
     }
 }

@@ -8,134 +8,235 @@
   "categories": [
     {
       "id": "encode",
-      "title": "Full Message Encode Speed (PeerUpdate)",
+      "title": "Full Message Encode Speed",
       "unit": "ns",
       "results": [
         {
           "name": "OmniBuf (#[derive(OmniBuf)])",
-          "nsPerOp": 186,
-          "opsPerSec": 5372226,
+          "nsPerOp": 242,
+          "opsPerSec": 4138102,
           "wireBytes": 366,
           "highlight": true
         },
         {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 190,
-          "opsPerSec": 5265180,
+          "nsPerOp": 243,
+          "opsPerSec": 4119772,
           "wireBytes": 366,
           "highlight": true,
           "baseline": true
         },
         {
+          "name": "buffa (Protobuf)",
+          "nsPerOp": 262,
+          "opsPerSec": 3818663,
+          "wireBytes": 341
+        },
+        {
           "name": "prost (Protobuf)",
-          "nsPerOp": 299,
-          "opsPerSec": 3344537,
+          "nsPerOp": 300,
+          "opsPerSec": 3329377,
           "wireBytes": 341
         },
         {
           "name": "rmp-serde (MessagePack)",
-          "nsPerOp": 825,
-          "opsPerSec": 1211798,
+          "nsPerOp": 835,
+          "opsPerSec": 1198085,
           "wireBytes": 626
         },
         {
           "name": "serde_json",
-          "nsPerOp": 1036,
-          "opsPerSec": 965275,
+          "nsPerOp": 1041,
+          "opsPerSec": 960464,
           "wireBytes": 803
         }
       ]
     },
     {
       "id": "decode",
-      "title": "Full Message Decode Speed (PeerUpdate)",
+      "title": "Full Message Decode Speed",
       "unit": "ns",
       "results": [
         {
           "name": "OmniBuf (#[derive(OmniBuf)])",
-          "nsPerOp": 658,
-          "opsPerSec": 1518803,
+          "nsPerOp": 557,
+          "opsPerSec": 1794874,
           "highlight": true
         },
         {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 677,
-          "opsPerSec": 1477397,
+          "nsPerOp": 563,
+          "opsPerSec": 1775413,
           "highlight": true,
           "baseline": true
         },
         {
+          "name": "buffa (Protobuf)",
+          "nsPerOp": 682,
+          "opsPerSec": 1466262
+        },
+        {
           "name": "prost (Protobuf)",
-          "nsPerOp": 868,
-          "opsPerSec": 1152479
+          "nsPerOp": 887,
+          "opsPerSec": 1126910
         },
         {
           "name": "rmp-serde (MessagePack)",
-          "nsPerOp": 1129,
-          "opsPerSec": 885958
+          "nsPerOp": 1150,
+          "opsPerSec": 869291
         },
         {
           "name": "serde_json",
-          "nsPerOp": 1675,
-          "opsPerSec": 597020
+          "nsPerOp": 1676,
+          "opsPerSec": 596522
         }
       ]
     },
     {
       "id": "lookup_city",
-      "title": "Read a Single Nested Field (peer.location.city)",
+      "title": "Read a Single Nested Field",
       "unit": "ns",
       "results": [
         {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 93,
-          "opsPerSec": 10800015,
+          "nsPerOp": 91,
+          "opsPerSec": 11046081,
           "highlight": true,
           "baseline": true
         },
         {
+          "name": "buffa (Protobuf)",
+          "nsPerOp": 480,
+          "opsPerSec": 2085436
+        },
+        {
           "name": "prost (Protobuf)",
-          "nsPerOp": 866,
-          "opsPerSec": 1154576
+          "nsPerOp": 874,
+          "opsPerSec": 1144014
         },
         {
           "name": "rmp-serde (MessagePack)",
-          "nsPerOp": 1127,
-          "opsPerSec": 887619
+          "nsPerOp": 1135,
+          "opsPerSec": 880877
         },
         {
           "name": "serde_json",
-          "nsPerOp": 1675,
-          "opsPerSec": 597167
+          "nsPerOp": 1664,
+          "opsPerSec": 600924
         }
       ]
     },
     {
       "id": "mutate_sequence",
-      "title": "Selective Single-Field Mutation (peer.sequence)",
+      "title": "Selective Single-Field Mutation",
       "unit": "ns",
       "results": [
         {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 115,
-          "opsPerSec": 8697237,
+          "nsPerOp": 261,
+          "opsPerSec": 3834335,
           "highlight": true,
           "baseline": true
         },
         {
+          "name": "buffa (Protobuf)",
+          "nsPerOp": 949,
+          "opsPerSec": 1053956
+        },
+        {
           "name": "prost (Protobuf)",
-          "nsPerOp": 1206,
-          "opsPerSec": 829269
+          "nsPerOp": 1218,
+          "opsPerSec": 821105
         },
         {
           "name": "rmp-serde (MessagePack)",
-          "nsPerOp": 1980,
-          "opsPerSec": 504993
+          "nsPerOp": 2020,
+          "opsPerSec": 495142
         },
         {
           "name": "serde_json",
-          "nsPerOp": 2758,
-          "opsPerSec": 362542
+          "nsPerOp": 2762,
+          "opsPerSec": 362013
+        }
+      ]
+    },
+    {
+      "id": "encode_nested_shift",
+      "title": "Large Embedded Message Encode",
+      "unit": "ns",
+      "results": [
+        {
+          "name": "buffa (Protobuf)",
+          "nsPerOp": 1116,
+          "opsPerSec": 896133,
+          "wireBytes": 39227
+        },
+        {
+          "name": "prost (Protobuf)",
+          "nsPerOp": 1137,
+          "opsPerSec": 879392,
+          "wireBytes": 39227
+        },
+        {
+          "name": "rmp-serde (MessagePack)",
+          "nsPerOp": 2030,
+          "opsPerSec": 492562,
+          "wireBytes": 39508
+        },
+        {
+          "name": "OmniBuf (Generated)",
+          "nsPerOp": 2883,
+          "opsPerSec": 346851,
+          "wireBytes": 39256,
+          "highlight": true,
+          "baseline": true
+        },
+        {
+          "name": "OmniBuf (#[derive(OmniBuf)])",
+          "nsPerOp": 2894,
+          "opsPerSec": 345590,
+          "wireBytes": 39256,
+          "highlight": true
+        },
+        {
+          "name": "serde_json",
+          "nsPerOp": 18728,
+          "opsPerSec": 53395,
+          "wireBytes": 39681
+        }
+      ]
+    },
+    {
+      "id": "mutate_embedded_grow",
+      "title": "Embedded Message Growth",
+      "unit": "ns",
+      "results": [
+        {
+          "name": "OmniBuf (Generated)",
+          "nsPerOp": 2429,
+          "opsPerSec": 411753,
+          "highlight": true,
+          "baseline": true
+        },
+        {
+          "name": "buffa (Protobuf)",
+          "nsPerOp": 4550,
+          "opsPerSec": 219756
+        },
+        {
+          "name": "prost (Protobuf)",
+          "nsPerOp": 5330,
+          "opsPerSec": 187615
+        },
+        {
+          "name": "rmp-serde (MessagePack)",
+          "nsPerOp": 8483,
+          "opsPerSec": 117876
+        },
+        {
+          "name": "serde_json",
+          "nsPerOp": 20092,
+          "opsPerSec": 49770
         }
       ]
     }

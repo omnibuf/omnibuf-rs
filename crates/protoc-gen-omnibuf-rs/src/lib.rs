@@ -23,8 +23,41 @@ const WIRE_SUB_MSG: u8 = 12;
 const WIRE_ARRAY: u8 = 13;
 const WIRE_MAP: u8 = 14;
 
+#[derive(Clone)]
+struct MapEntryInfo {
+    key_field: FieldDescriptorProto,
+    val_field: FieldDescriptorProto,
+}
+
+#[derive(Clone)]
+struct RegisteredMsg {
+    file_name: String,
+    rust_name: String,
+    desc: DescriptorProto,
+    direct_opaque: bool,
+}
+
+#[derive(Default)]
+struct GlobalRegistry {
+    map_entries: HashMap<String, MapEntryInfo>,
+    messages: HashMap<String, RegisteredMsg>,
+    enums: HashMap<String, (String, String)>,
+}
+
 /// Executes code generation for a `protoc` [`CodeGeneratorRequest`].
 pub fn generate(req: &CodeGeneratorRequest) -> CodeGeneratorResponse {
+    let supported = Some(Feature::Proto3Optional as u64);
+    let registry = match build_registry(&req.proto_file) {
+        Ok(reg) => reg,
+        Err(err) => {
+            return CodeGeneratorResponse {
+                error: Some(err),
+                supported_features: supported,
+                file: Vec::new(),
+            };
+        }
+    };
+
     let targets: HashSet<&str> = req.file_to_generate.iter().map(String::as_str).collect();
     let mut files = Vec::new();
 
@@ -33,12 +66,12 @@ pub fn generate(req: &CodeGeneratorRequest) -> CodeGeneratorResponse {
         if !targets.contains(name) {
             continue;
         }
-        match generate_file(proto_file) {
+        match generate_file(proto_file, &registry) {
             Ok(file) => files.push(file),
             Err(err) => {
                 return CodeGeneratorResponse {
                     error: Some(err),
-                    supported_features: Some(Feature::Proto3Optional as u64),
+                    supported_features: supported,
                     file: Vec::new(),
                 };
             }
@@ -47,46 +80,234 @@ pub fn generate(req: &CodeGeneratorRequest) -> CodeGeneratorResponse {
 
     CodeGeneratorResponse {
         error: None,
-        supported_features: Some(Feature::Proto3Optional as u64),
+        supported_features: supported,
         file: files,
     }
 }
 
-#[derive(Clone)]
-struct MapEntryInfo {
-    key_field: FieldDescriptorProto,
-    val_field: FieldDescriptorProto,
+fn build_registry(proto_files: &[FileDescriptorProto]) -> Result<GlobalRegistry, String> {
+    let mut reg = GlobalRegistry::default();
+    for file in proto_files {
+        let file_name = file.name.as_deref().unwrap_or("generated.proto");
+        if !file.extension.is_empty() {
+            let ext_name = file.extension[0].name.as_deref().unwrap_or("extension");
+            return Err(format!(
+                "proto2 extensions are not supported by OmniBuf ({file_name}: {ext_name})"
+            ));
+        }
+        let pkg_prefix = match file.package.as_deref() {
+            Some(pkg) if !pkg.is_empty() => format!(".{pkg}"),
+            _ => String::new(),
+        };
+        for e in &file.enum_type {
+            let ename = e.name.as_deref().unwrap_or("UnknownEnum");
+            reg.enums.insert(
+                format!("{pkg_prefix}.{ename}"),
+                (file_name.to_owned(), to_pascal_case(ename)),
+            );
+        }
+        collect_file_messages(file_name, &pkg_prefix, "", &file.message_type, &mut reg)?;
+    }
+    Ok(reg)
 }
 
-fn generate_file(file: &FileDescriptorProto) -> Result<File, String> {
+fn has_real_oneof(desc: &DescriptorProto) -> bool {
+    desc.field
+        .iter()
+        .any(|f| f.oneof_index.is_some() && !f.proto3_optional.unwrap_or(false))
+}
+
+fn is_directly_opaque_msg(desc: &DescriptorProto) -> bool {
+    if has_real_oneof(desc) {
+        return false;
+    }
+    desc.field.iter().all(|f| {
+        let n = f.number.unwrap_or(0);
+        n > 0 && n < 64
+    })
+}
+
+fn collect_file_messages(
+    file_name: &str,
+    fq_parent: &str,
+    rust_prefix: &str,
+    messages: &[DescriptorProto],
+    reg: &mut GlobalRegistry,
+) -> Result<(), String> {
+    for m in messages {
+        let mname = m.name.as_deref().unwrap_or("UnknownMsg");
+        let fq = format!("{fq_parent}.{mname}");
+
+        if !m.extension.is_empty() || !m.extension_range.is_empty() {
+            return Err(format!(
+                "proto2 extensions are not supported by OmniBuf ({file_name}: {mname})"
+            ));
+        }
+        for f in &m.field {
+            if f.r#type() == Type::Group {
+                let fname = f.name.as_deref().unwrap_or("group");
+                return Err(format!(
+                    "proto2 groups are not supported by OmniBuf ({file_name}: {mname}.{fname})"
+                ));
+            }
+        }
+
+        if is_map_entry(m) {
+            if let (Some(kf), Some(vf)) = (
+                m.field.iter().find(|f| f.number == Some(1)).cloned(),
+                m.field.iter().find(|f| f.number == Some(2)).cloned(),
+            ) {
+                reg.map_entries.insert(
+                    fq,
+                    MapEntryInfo {
+                        key_field: kf,
+                        val_field: vf,
+                    },
+                );
+            }
+            continue;
+        }
+
+        let rust_name = if rust_prefix.is_empty() {
+            to_pascal_case(mname)
+        } else {
+            format!("{rust_prefix}{}", to_pascal_case(mname))
+        };
+
+        reg.messages.insert(
+            fq.clone(),
+            RegisteredMsg {
+                file_name: file_name.to_owned(),
+                rust_name: rust_name.clone(),
+                desc: m.clone(),
+                direct_opaque: is_directly_opaque_msg(m),
+            },
+        );
+
+        for e in &m.enum_type {
+            let ename = e.name.as_deref().unwrap_or("UnknownEnum");
+            reg.enums.insert(
+                format!("{fq}.{ename}"),
+                (
+                    file_name.to_owned(),
+                    format!("{rust_name}{}", to_pascal_case(ename)),
+                ),
+            );
+        }
+
+        collect_file_messages(file_name, &fq, &rust_name, &m.nested_type, reg)?;
+    }
+    Ok(())
+}
+
+fn out_filename_for_proto(proto_name: &str) -> String {
+    let trimmed = proto_name.trim_start_matches('/');
+    let without_ext = trimmed.strip_suffix(".proto").unwrap_or(trimmed);
+    format!("{without_ext}_omnibuf.rs")
+}
+
+fn relative_module_prefix(cur_file: &str, target_file: &str) -> Option<String> {
+    if cur_file == target_file {
+        return None;
+    }
+    let cur_clean = cur_file.trim_start_matches('/');
+    let target_clean = target_file.trim_start_matches('/');
+
+    let cur_parts: Vec<&str> = cur_clean.split('/').collect();
+    let target_parts: Vec<&str> = target_clean.split('/').collect();
+
+    let cur_dirs = &cur_parts[..cur_parts.len().saturating_sub(1)];
+    let target_dirs = &target_parts[..target_parts.len().saturating_sub(1)];
+    let target_leaf = target_parts.last().copied().unwrap_or("generated.proto");
+    let target_stem = target_leaf.strip_suffix(".proto").unwrap_or(target_leaf);
+    let target_mod = escape_rust_ident(&format!("{target_stem}_omnibuf"));
+
+    let common = cur_dirs
+        .iter()
+        .zip(target_dirs.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let ups = (cur_dirs.len() - common) + 1;
+    let mut segs = Vec::with_capacity(ups + (target_dirs.len() - common) + 1);
+    for _ in 0..ups {
+        segs.push("super".to_owned());
+    }
+    for dir in &target_dirs[common..] {
+        segs.push(escape_rust_ident(dir));
+    }
+    segs.push(target_mod);
+    Some(segs.join("::"))
+}
+
+fn resolve_msg_rust_path(
+    cur_file: &str,
+    fq_type: &str,
+    reg: &GlobalRegistry,
+) -> Result<(String, bool), String> {
+    if let Some(info) = reg.messages.get(fq_type) {
+        let path = match relative_module_prefix(cur_file, &info.file_name) {
+            Some(prefix) => format!("{prefix}::{}", info.rust_name),
+            None => info.rust_name.clone(),
+        };
+        return Ok((path, info.direct_opaque));
+    }
+    let short = fq_type.rsplit('.').next().unwrap_or(fq_type);
+    if short.is_empty() {
+        return Err(format!("unresolved proto message type {fq_type:?}"));
+    }
+    Ok((to_pascal_case(short), false))
+}
+
+fn resolve_opaque_rust_path(cur_file: &str, fq_type: &str, reg: &GlobalRegistry) -> Option<String> {
+    let info = reg.messages.get(fq_type)?;
+    if !info.direct_opaque {
+        return None;
+    }
+    let opaque_ident = format!("Opaque{}", info.rust_name);
+    Some(match relative_module_prefix(cur_file, &info.file_name) {
+        Some(prefix) => format!("{prefix}::{opaque_ident}"),
+        None => opaque_ident,
+    })
+}
+
+/// Checks if `start_fq` can reach `target_fq` through non-boxed singular message or oneof fields.
+fn can_reach_singular(
+    start_fq: &str,
+    target_fq: &str,
+    reg: &GlobalRegistry,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if start_fq == target_fq {
+        return true;
+    }
+    if !visited.insert(start_fq.to_owned()) {
+        return false;
+    }
+    let Some(info) = reg.messages.get(start_fq) else {
+        return false;
+    };
+    for f in &info.desc.field {
+        if f.label() != Label::Repeated && f.r#type() == Type::Message {
+            let next_fq = f.type_name.as_deref().unwrap_or("");
+            if !reg.map_entries.contains_key(next_fq)
+                && can_reach_singular(next_fq, target_fq, reg, visited)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn generate_file(file: &FileDescriptorProto, reg: &GlobalRegistry) -> Result<File, String> {
     let proto_name = file.name.as_deref().unwrap_or("generated.proto");
-    let stem = proto_name
-        .rsplit('/')
-        .next()
-        .unwrap_or(proto_name)
-        .strip_suffix(".proto")
-        .unwrap_or(proto_name);
-    let out_filename = format!("{stem}_omnibuf.rs");
+    let out_filename = out_filename_for_proto(proto_name);
 
     let pkg_prefix = match file.package.as_deref() {
         Some(pkg) if !pkg.is_empty() => format!(".{pkg}"),
         _ => String::new(),
     };
-
-    let mut map_entries: HashMap<String, MapEntryInfo> = HashMap::new();
-    let mut type_names: HashMap<String, String> = HashMap::new();
-    for e in &file.enum_type {
-        let ename = e.name.as_deref().unwrap_or("UnknownEnum");
-        let fq = format!("{pkg_prefix}.{ename}");
-        type_names.insert(fq, to_pascal_case(ename));
-    }
-    collect_messages(
-        &pkg_prefix,
-        "",
-        &file.message_type,
-        &mut map_entries,
-        &mut type_names,
-    );
 
     let mut code = String::with_capacity(16 * 1024);
     let _ = writeln!(
@@ -102,14 +323,7 @@ fn generate_file(file: &FileDescriptorProto) -> Result<File, String> {
     flatten_messages(&pkg_prefix, "", &file.message_type, &mut msg_list);
 
     for (fq_name, rust_name, desc) in &msg_list {
-        emit_message(
-            &mut code,
-            fq_name,
-            rust_name,
-            desc,
-            &map_entries,
-            &type_names,
-        )?;
+        emit_message(&mut code, proto_name, fq_name, rust_name, desc, reg)?;
     }
 
     Ok(File {
@@ -125,48 +339,6 @@ fn is_map_entry(desc: &DescriptorProto) -> bool {
         .as_ref()
         .and_then(|o| o.map_entry)
         .unwrap_or(false)
-}
-
-fn collect_messages(
-    fq_parent: &str,
-    rust_prefix: &str,
-    messages: &[DescriptorProto],
-    map_entries: &mut HashMap<String, MapEntryInfo>,
-    type_names: &mut HashMap<String, String>,
-) {
-    for m in messages {
-        let mname = m.name.as_deref().unwrap_or("UnknownMsg");
-        let fq = format!("{fq_parent}.{mname}");
-        if is_map_entry(m) {
-            if let (Some(kf), Some(vf)) = (
-                m.field.iter().find(|f| f.number == Some(1)).cloned(),
-                m.field.iter().find(|f| f.number == Some(2)).cloned(),
-            ) {
-                map_entries.insert(
-                    fq,
-                    MapEntryInfo {
-                        key_field: kf,
-                        val_field: vf,
-                    },
-                );
-            }
-            continue;
-        }
-        let rust_name = if rust_prefix.is_empty() {
-            to_pascal_case(mname)
-        } else {
-            format!("{rust_prefix}{}", to_pascal_case(mname))
-        };
-        type_names.insert(fq.clone(), rust_name.clone());
-        for e in &m.enum_type {
-            let ename = e.name.as_deref().unwrap_or("UnknownEnum");
-            type_names.insert(
-                format!("{fq}.{ename}"),
-                format!("{rust_name}{}", to_pascal_case(ename)),
-            );
-        }
-        collect_messages(&fq, &rust_name, &m.nested_type, map_entries, type_names);
-    }
 }
 
 fn flatten_messages<'a>(
@@ -207,16 +379,18 @@ fn emit_enum(code: &mut String, prefix: &str, e: &EnumDescriptorProto) {
     let _ = writeln!(code, "#[repr(i32)]");
     let _ = writeln!(code, "pub enum {enum_name} {{");
     let mut seen_numbers = HashSet::new();
-    for (idx, v) in e.value.iter().enumerate() {
+    let mut emitted_idx = 0usize;
+    for v in &e.value {
         let num = v.number.unwrap_or(0);
         if !seen_numbers.insert(num) {
             continue;
         }
         let vname = to_pascal_case(v.name.as_deref().unwrap_or("Unspecified"));
-        if idx == 0 {
+        if emitted_idx == 0 {
             let _ = writeln!(code, "    #[default]");
         }
         let _ = writeln!(code, "    {vname} = {num},");
+        emitted_idx += 1;
     }
     let _ = writeln!(code, "}}\n");
 }
@@ -291,20 +465,33 @@ impl ProtoScalar {
     }
 }
 
+#[derive(Clone)]
 enum GenFieldKind {
     Scalar(ProtoScalar),
     OptScalar(ProtoScalar),
-    SubMsg { rust_type: String, boxed: bool },
+    SubMsg {
+        rust_type: String,
+        opaque_type: Option<String>,
+        boxed: bool,
+    },
     ScalarArr(ProtoScalar),
-    SubMsgArr { rust_type: String },
-    Map { key: ProtoScalar, val: MapValKind },
+    SubMsgArr {
+        rust_type: String,
+        opaque_type: Option<String>,
+    },
+    Map {
+        key: ProtoScalar,
+        val: MapValKind,
+    },
 }
 
+#[derive(Clone)]
 enum MapValKind {
     Scalar(ProtoScalar),
     SubMsg { rust_type: String },
 }
 
+#[derive(Clone)]
 struct GenField {
     number: u32,
     proto_name: String,
@@ -313,55 +500,154 @@ struct GenField {
     kind: GenFieldKind,
 }
 
+#[derive(Clone)]
+enum OneofArmKind {
+    Scalar(ProtoScalar),
+    SubMsg { rust_type: String, boxed: bool },
+}
+
+#[derive(Clone)]
+struct GenOneofArm {
+    number: u32,
+    proto_name: String,
+    variant_ident: String,
+    kind: OneofArmKind,
+}
+
+#[derive(Clone)]
+struct GenOneof {
+    enum_name: String,
+    field_ident: String,
+    first_number: u32,
+    arms: Vec<GenOneofArm>,
+}
+
+enum OrderedMember {
+    Field(GenField),
+    Oneof(GenOneof),
+}
+
+fn is_reserved_opaque_stem(stem: &str) -> bool {
+    matches!(
+        stem,
+        "new"
+            | "try_new"
+            | "from_owned"
+            | "try_from_owned"
+            | "validate"
+            | "unmarshal"
+            | "try_unmarshal"
+            | "raw_bytes"
+            | "heap_mut"
+            | "marshal"
+            | "marshal_append"
+            | "try_marshal"
+            | "try_marshal_append"
+    )
+}
+
 fn emit_message(
     code: &mut String,
+    cur_file: &str,
     fq_msg: &str,
     rust_name: &str,
     desc: &DescriptorProto,
-    map_entries: &HashMap<String, MapEntryInfo>,
-    type_names: &HashMap<String, String>,
+    reg: &GlobalRegistry,
 ) -> Result<(), String> {
     for e in &desc.enum_type {
         emit_enum(code, rust_name, e);
     }
 
     let mut fields = Vec::with_capacity(desc.field.len());
+    let mut oneof_arms_map: HashMap<usize, Vec<GenOneofArm>> = HashMap::new();
+    let mut used_stems: HashSet<String> = HashSet::new();
+    let mut used_idents: HashSet<String> = HashSet::new();
+
     for f in &desc.field {
         let fnum = u32::try_from(f.number.unwrap_or(0))
             .map_err(|_| format!("invalid field number on {rust_name}"))?;
+        if fnum == 0 {
+            return Err(format!("invalid field number 0 on {rust_name}"));
+        }
         let proto_name = f.name.as_deref().unwrap_or("field").to_owned();
-        let method_stem = to_snake_case(&proto_name);
-        let rust_ident = escape_rust_ident(&method_stem);
         let label = f.label();
         let ftype = f.r#type();
         let is_proto3_opt = f.proto3_optional.unwrap_or(false);
 
+        if let Some(oneof_idx) = f.oneof_index
+            && !is_proto3_opt
+        {
+            let oidx = usize::try_from(oneof_idx)
+                .map_err(|_| format!("invalid oneof_index on {rust_name}.{proto_name}"))?;
+            let arm_kind = if ftype == Type::Message {
+                let tname = f.type_name.as_deref().unwrap_or("");
+                let (sub_rust, _) = resolve_msg_rust_path(cur_file, tname, reg)?;
+                let mut visited = HashSet::new();
+                let boxed = can_reach_singular(tname, fq_msg, reg, &mut visited);
+                OneofArmKind::SubMsg {
+                    rust_type: sub_rust,
+                    boxed,
+                }
+            } else {
+                OneofArmKind::Scalar(ProtoScalar::from_proto_type(ftype)?)
+            };
+
+            let mut var_ident = to_pascal_case(&proto_name);
+            let existing = oneof_arms_map.entry(oidx).or_default();
+            if existing.iter().any(|a| a.variant_ident == var_ident) {
+                var_ident = format!("{var_ident}{fnum}");
+            }
+            existing.push(GenOneofArm {
+                number: fnum,
+                proto_name,
+                variant_ident: var_ident,
+                kind: arm_kind,
+            });
+            continue;
+        }
+
+        let mut method_stem = to_snake_case(&proto_name);
+        if is_reserved_opaque_stem(&method_stem) || !used_stems.insert(method_stem.clone()) {
+            method_stem = format!("{method_stem}_{fnum}");
+            used_stems.insert(method_stem.clone());
+        }
+        let mut rust_ident = escape_rust_ident(&method_stem);
+        if !used_idents.insert(rust_ident.clone()) {
+            rust_ident = format!("f_{fnum}");
+            used_idents.insert(rust_ident.clone());
+        }
+
         let kind = if label == Label::Repeated && ftype == Type::Message {
             let tname = f.type_name.as_deref().unwrap_or("");
-            if let Some(entry) = map_entries.get(tname) {
+            if let Some(entry) = reg.map_entries.get(tname) {
                 let key = ProtoScalar::from_proto_type(entry.key_field.r#type())?;
                 let val = if entry.val_field.r#type() == Type::Message {
                     let vt = entry.val_field.type_name.as_deref().unwrap_or("");
-                    let v_rust = resolve_msg_name(vt, type_names)?;
+                    let (v_rust, _) = resolve_msg_rust_path(cur_file, vt, reg)?;
                     MapValKind::SubMsg { rust_type: v_rust }
                 } else {
                     MapValKind::Scalar(ProtoScalar::from_proto_type(entry.val_field.r#type())?)
                 };
                 GenFieldKind::Map { key, val }
             } else {
-                let sub_rust = resolve_msg_name(tname, type_names)?;
+                let (sub_rust, _) = resolve_msg_rust_path(cur_file, tname, reg)?;
+                let opaque_type = resolve_opaque_rust_path(cur_file, tname, reg);
                 GenFieldKind::SubMsgArr {
                     rust_type: sub_rust,
+                    opaque_type,
                 }
             }
         } else if label == Label::Repeated {
             GenFieldKind::ScalarArr(ProtoScalar::from_proto_type(ftype)?)
         } else if ftype == Type::Message {
             let tname = f.type_name.as_deref().unwrap_or("");
-            let sub_rust = resolve_msg_name(tname, type_names)?;
-            let boxed = tname == fq_msg || sub_rust == rust_name;
+            let (sub_rust, _) = resolve_msg_rust_path(cur_file, tname, reg)?;
+            let opaque_type = resolve_opaque_rust_path(cur_file, tname, reg);
+            let mut visited = HashSet::new();
+            let boxed = can_reach_singular(tname, fq_msg, reg, &mut visited);
             GenFieldKind::SubMsg {
                 rust_type: sub_rust,
+                opaque_type,
                 boxed,
             }
         } else if is_proto3_opt {
@@ -381,6 +667,54 @@ fn emit_message(
 
     fields.sort_by_key(|f| f.number);
 
+    let mut oneofs = Vec::new();
+    for (oidx, oneof_proto) in desc.oneof_decl.iter().enumerate() {
+        let Some(mut arms) = oneof_arms_map.remove(&oidx) else {
+            continue;
+        };
+        if arms.is_empty() {
+            continue;
+        }
+        arms.sort_by_key(|a| a.number);
+        let raw_oname = oneof_proto.name.as_deref().unwrap_or("oneof");
+        let enum_name = format!("{rust_name}{}", to_pascal_case(raw_oname));
+        let base_snake = to_snake_case(raw_oname);
+        let mut field_ident = escape_rust_ident(&base_snake);
+        if !used_idents.insert(field_ident.clone()) {
+            field_ident = format!("{base_snake}_oneof");
+            used_idents.insert(field_ident.clone());
+        }
+        let first_number = arms[0].number;
+        oneofs.push(GenOneof {
+            enum_name,
+            field_ident,
+            first_number,
+            arms,
+        });
+    }
+    oneofs.sort_by_key(|o| o.first_number);
+
+    // Emit oneof enums before the parent struct.
+    for oneof in &oneofs {
+        let _ = writeln!(code, "#[allow(dead_code, clippy::enum_variant_names)]");
+        let _ = writeln!(code, "#[derive(Clone, Debug, PartialEq)]");
+        let _ = writeln!(code, "pub enum {} {{", oneof.enum_name);
+        for arm in &oneof.arms {
+            let arm_ty = match &arm.kind {
+                OneofArmKind::Scalar(s) => s.rust_type().to_owned(),
+                OneofArmKind::SubMsg { rust_type, boxed } => {
+                    if *boxed {
+                        format!("::std::boxed::Box<{rust_type}>")
+                    } else {
+                        rust_type.clone()
+                    }
+                }
+            };
+            let _ = writeln!(code, "    {}({arm_ty}),", arm.variant_ident);
+        }
+        let _ = writeln!(code, "}}\n");
+    }
+
     // 1. Struct definition
     let _ = writeln!(code, "#[allow(dead_code)]");
     let _ = writeln!(code, "#[derive(Clone, Debug, Default, PartialEq)]");
@@ -388,6 +722,13 @@ fn emit_message(
     for gf in &fields {
         let fty = rust_field_type(&gf.kind);
         let _ = writeln!(code, "    pub {}: {fty},", gf.rust_ident);
+    }
+    for oneof in &oneofs {
+        let _ = writeln!(
+            code,
+            "    pub {}: ::core::option::Option<{}>,",
+            oneof.field_ident, oneof.enum_name
+        );
     }
     let _ = writeln!(code, "}}\n");
 
@@ -401,7 +742,7 @@ fn emit_message(
     );
     let _ = writeln!(
         code,
-        "        let mut dst = ::std::vec::Vec::with_capacity(512);"
+        "        let mut dst = ::std::vec::Vec::with_capacity(128);"
     );
     let _ = writeln!(code, "        self.marshal_omnibuf_append(&mut dst);");
     let _ = writeln!(code, "        dst");
@@ -429,32 +770,23 @@ fn emit_message(
     let _ = writeln!(code, "}}\n");
 
     // 3. `omnibuf::Message` implementation
-    emit_message_trait_impl(code, desc, rust_name, &fields);
+    emit_message_trait_impl(code, desc, rust_name, &fields, &oneofs);
 
-    // 4. Zero-unpack `Opaque<Msg><'a>` view & splicer (for messages with field numbers < 64)
-    if fields.iter().all(|f| f.number < 64) {
+    // 4. Zero-unpack `Opaque<Msg><'a>` view & splicer (when all field numbers < 64 and no oneofs)
+    if oneofs.is_empty() && fields.iter().all(|f| f.number < 64) {
         emit_opaque_view(code, rust_name, &fields);
     }
 
     Ok(())
 }
 
-fn resolve_msg_name(tname: &str, type_names: &HashMap<String, String>) -> Result<String, String> {
-    if let Some(found) = type_names.get(tname) {
-        return Ok(found.clone());
-    }
-    let short = tname.rsplit('.').next().unwrap_or(tname);
-    if short.is_empty() {
-        return Err(format!("unresolved proto message type {tname:?}"));
-    }
-    Ok(to_pascal_case(short))
-}
-
 fn rust_field_type(kind: &GenFieldKind) -> String {
     match kind {
         GenFieldKind::Scalar(s) => s.rust_type().to_owned(),
         GenFieldKind::OptScalar(s) => format!("::core::option::Option<{}>", s.rust_type()),
-        GenFieldKind::SubMsg { rust_type, boxed } => {
+        GenFieldKind::SubMsg {
+            rust_type, boxed, ..
+        } => {
             if *boxed {
                 format!("::core::option::Option<::std::boxed::Box<{rust_type}>>")
             } else {
@@ -462,7 +794,7 @@ fn rust_field_type(kind: &GenFieldKind) -> String {
             }
         }
         GenFieldKind::ScalarArr(s) => format!("::std::vec::Vec<{}>", s.rust_type()),
-        GenFieldKind::SubMsgArr { rust_type } => format!("::std::vec::Vec<{rust_type}>"),
+        GenFieldKind::SubMsgArr { rust_type, .. } => format!("::std::vec::Vec<{rust_type}>"),
         GenFieldKind::Map { key, val } => {
             let kt = key.rust_type();
             let vt = match val {
@@ -479,27 +811,42 @@ fn emit_message_trait_impl(
     desc: &DescriptorProto,
     rust_name: &str,
     fields: &[GenField],
+    oneofs: &[GenOneof],
 ) {
     let proto_short_name = desc.name.as_deref().unwrap_or(rust_name);
-    let num_fields = fields.len();
+    let total_members = fields.len() + oneofs.len();
+
+    let mut ordered = Vec::with_capacity(total_members);
+    for gf in fields {
+        ordered.push((gf.number, OrderedMember::Field(gf.clone())));
+    }
+    for go in oneofs {
+        ordered.push((go.first_number, OrderedMember::Oneof(go.clone())));
+    }
+    ordered.sort_by_key(|(n, _)| *n);
 
     let _ = writeln!(code, "impl ::omnibuf::Message for {rust_name} {{");
+    let _ = writeln!(code, "    #[inline]");
     let _ = writeln!(
         code,
         "    fn encode_omnibuf_append(&self, dst: &mut ::std::vec::Vec<u8>, deterministic: bool) -> ::omnibuf::Result<()> {{"
     );
     let _ = writeln!(code, "        let _ = deterministic;");
-    for gf in fields {
-        emit_encode_stmt(code, gf, "self.", true);
+    for (_, member) in &ordered {
+        match member {
+            OrderedMember::Field(gf) => emit_encode_stmt(code, gf, "self.", true),
+            OrderedMember::Oneof(go) => emit_encode_oneof(code, go),
+        }
     }
     let _ = writeln!(code, "        ::core::result::Result::Ok(())");
     let _ = writeln!(code, "    }}\n");
 
+    let _ = writeln!(code, "    #[inline]");
     let _ = writeln!(
         code,
         "    fn decode_omnibuf_at_depth(&mut self, data: &[u8], depth: usize, merge: bool) -> ::omnibuf::Result<()> {{"
     );
-    if num_fields == 0 {
+    if total_members == 0 {
         let _ = writeln!(code, "        let _ = merge;");
         let _ = writeln!(
             code,
@@ -517,50 +864,53 @@ fn emit_message_trait_impl(
             code,
             "        let mut dec = ::omnibuf::Decoder::with_depth(data, depth)?;"
         );
-        let _ = writeln!(code, "        let mut seen = [false; {num_fields}];");
+        let _ = writeln!(code, "        if !merge {{ self.clear_omnibuf(); }}");
         let _ = writeln!(
             code,
             "        while let ::core::option::Option::Some((fnum, wt)) = dec.next_tag()? {{"
         );
         let _ = writeln!(code, "            match fnum {{");
-        for (idx, gf) in fields.iter().enumerate() {
-            emit_decode_arm(code, gf, idx);
+        for gf in fields {
+            emit_decode_arm(code, gf);
+        }
+        for go in oneofs {
+            for arm in &go.arms {
+                emit_decode_oneof_arm(code, go, arm);
+            }
         }
         let _ = writeln!(code, "                _ => dec.skip_unknown(fnum, wt)?,");
         let _ = writeln!(code, "            }}");
-        let _ = writeln!(code, "        }}");
-        let _ = writeln!(code, "        if !merge {{");
-        for (idx, gf) in fields.iter().enumerate() {
-            let clear_expr = clear_stmt_for_field(gf);
-            let _ = writeln!(code, "            if !seen[{idx}] {{ {clear_expr} }}");
-        }
         let _ = writeln!(code, "        }}");
         let _ = writeln!(code, "        ::core::result::Result::Ok(())");
     }
     let _ = writeln!(code, "    }}\n");
 
+    let _ = writeln!(code, "    #[inline]");
     let _ = writeln!(code, "    fn clear_omnibuf(&mut self) {{");
     for gf in fields {
         let clear_expr = clear_stmt_for_field(gf);
         let _ = writeln!(code, "        {clear_expr}");
     }
+    for go in oneofs {
+        let fident = &go.field_ident;
+        let _ = writeln!(
+            code,
+            "        if self.{fident}.is_some() {{ self.{fident} = ::core::option::Option::None; }}"
+        );
+    }
     let _ = writeln!(code, "    }}\n");
 
     let _ = writeln!(
         code,
-        "    fn build_schema_meta(active: &mut ::std::collections::HashSet<&'static str>, depth: usize) -> ::core::option::Option<::omnibuf::SchemaMeta> {{"
+        "    fn build_schema_meta(active: &mut ::std::collections::HashSet<::core::any::TypeId>, depth: usize) -> ::core::option::Option<::omnibuf::SchemaMeta> {{"
     );
-    let _ = writeln!(
-        code,
-        "        let type_key = ::core::any::type_name::<Self>();"
-    );
-    let _ = writeln!(
-        code,
-        "        if depth > ::omnibuf::MAX_NESTING_DEPTH || active.contains(type_key) {{"
-    );
+    let _ = writeln!(code, "        if depth >= ::omnibuf::MAX_NESTING_DEPTH {{");
     let _ = writeln!(code, "            return ::core::option::Option::None;");
     let _ = writeln!(code, "        }}");
-    let _ = writeln!(code, "        active.insert(type_key);");
+    let _ = writeln!(
+        code,
+        "        let type_id = ::core::any::TypeId::of::<Self>();"
+    );
     let _ = writeln!(code, "        let mut meta = ::omnibuf::SchemaMeta {{");
     let _ = writeln!(
         code,
@@ -582,17 +932,163 @@ fn emit_message_trait_impl(
             code,
             "        meta.fields.insert({fnum}, ::std::string::String::from({pname:?}));"
         );
-        match &gf.kind {
-            GenFieldKind::SubMsg { rust_type, .. } => {
-                let _ = writeln!(
-                    code,
-                    "        if let ::core::option::Option::Some(c) = <{rust_type} as ::omnibuf::Message>::build_schema_meta(active, depth + 1) {{ meta.children.insert({fnum}, c); }}"
-                );
+    }
+    for go in oneofs {
+        for arm in &go.arms {
+            let fnum = arm.number;
+            let pname = &arm.proto_name;
+            let _ = writeln!(
+                code,
+                "        meta.fields.insert({fnum}, ::std::string::String::from({pname:?}));"
+            );
+        }
+    }
+    let _ = writeln!(code, "        if !active.insert(type_id) {{");
+    let _ = writeln!(
+        code,
+        "            return ::core::option::Option::Some(meta);"
+    );
+    let _ = writeln!(code, "        }}");
+    for gf in fields {
+        let fnum = gf.number;
+        let child_ty = match &gf.kind {
+            GenFieldKind::SubMsg { rust_type, .. } | GenFieldKind::SubMsgArr { rust_type, .. } => {
+                Some(rust_type.as_str())
             }
-            GenFieldKind::SubMsgArr { rust_type } => {
+            GenFieldKind::Map {
+                val: MapValKind::SubMsg { rust_type },
+                ..
+            } => Some(rust_type.as_str()),
+            _ => None,
+        };
+        if let Some(rt) = child_ty {
+            let _ = writeln!(
+                code,
+                "        if let ::core::option::Option::Some(c) = <{rt} as ::omnibuf::Message>::build_schema_meta(active, depth + 2) {{ meta.children.insert({fnum}, c); }}"
+            );
+        }
+    }
+    for go in oneofs {
+        for arm in &go.arms {
+            if let OneofArmKind::SubMsg { rust_type, .. } = &arm.kind {
+                let fnum = arm.number;
                 let _ = writeln!(
                     code,
                     "        if let ::core::option::Option::Some(c) = <{rust_type} as ::omnibuf::Message>::build_schema_meta(active, depth + 2) {{ meta.children.insert({fnum}, c); }}"
+                );
+            }
+        }
+    }
+    let _ = writeln!(code, "        active.remove(&type_id);");
+    let _ = writeln!(code, "        ::core::option::Option::Some(meta)");
+    let _ = writeln!(code, "    }}\n");
+
+    let _ = writeln!(
+        code,
+        "    fn is_schema_cyclic(active: &mut ::std::collections::HashSet<::core::any::TypeId>, depth: usize) -> bool {{"
+    );
+    let _ = writeln!(
+        code,
+        "        if depth >= ::omnibuf::MAX_NESTING_DEPTH {{ return false; }}"
+    );
+    let _ = writeln!(
+        code,
+        "        let type_id = ::core::any::TypeId::of::<Self>();"
+    );
+    let _ = writeln!(
+        code,
+        "        if !active.insert(type_id) {{ return true; }}"
+    );
+    for gf in fields {
+        let child_ty = match &gf.kind {
+            GenFieldKind::SubMsg { rust_type, .. } | GenFieldKind::SubMsgArr { rust_type, .. } => {
+                Some(rust_type.as_str())
+            }
+            GenFieldKind::Map {
+                val: MapValKind::SubMsg { rust_type },
+                ..
+            } => Some(rust_type.as_str()),
+            _ => None,
+        };
+        if let Some(rt) = child_ty {
+            let _ = writeln!(
+                code,
+                "        if <{rt} as ::omnibuf::Message>::is_schema_cyclic(active, depth + 2) {{ active.remove(&type_id); return true; }}"
+            );
+        }
+    }
+    for go in oneofs {
+        for arm in &go.arms {
+            if let OneofArmKind::SubMsg { rust_type, .. } = &arm.kind {
+                let _ = writeln!(
+                    code,
+                    "        if <{rust_type} as ::omnibuf::Message>::is_schema_cyclic(active, depth + 2) {{ active.remove(&type_id); return true; }}"
+                );
+            }
+        }
+    }
+    let _ = writeln!(code, "        active.remove(&type_id);");
+    let _ = writeln!(code, "        false");
+    let _ = writeln!(code, "    }}\n");
+
+    let _ = writeln!(
+        code,
+        "    fn build_value_schema_meta(&self, depth: usize) -> ::core::option::Option<::omnibuf::SchemaMeta> {{"
+    );
+    let _ = writeln!(
+        code,
+        "        if depth >= ::omnibuf::MAX_NESTING_DEPTH {{ return ::core::option::Option::None; }}"
+    );
+    let _ = writeln!(code, "        let mut meta = ::omnibuf::SchemaMeta {{");
+    let _ = writeln!(
+        code,
+        "            type_name: ::std::string::String::from({proto_short_name:?}),"
+    );
+    let _ = writeln!(
+        code,
+        "            fields: ::std::collections::BTreeMap::new(),"
+    );
+    let _ = writeln!(
+        code,
+        "            children: ::std::collections::BTreeMap::new(),"
+    );
+    let _ = writeln!(code, "        }};");
+    for gf in fields {
+        let fnum = gf.number;
+        let pname = &gf.proto_name;
+        let _ = writeln!(
+            code,
+            "        meta.fields.insert({fnum}, ::std::string::String::from({pname:?}));"
+        );
+    }
+    for go in oneofs {
+        for arm in &go.arms {
+            let fnum = arm.number;
+            let pname = &arm.proto_name;
+            let _ = writeln!(
+                code,
+                "        meta.fields.insert({fnum}, ::std::string::String::from({pname:?}));"
+            );
+        }
+    }
+    let mut child_code = String::new();
+    for gf in fields {
+        let fnum = gf.number;
+        let fident = &gf.rust_ident;
+        match &gf.kind {
+            GenFieldKind::SubMsg {
+                rust_type, boxed, ..
+            } => {
+                let sub_ref = if *boxed { "&**__sub" } else { "__sub" };
+                let _ = writeln!(
+                    child_code,
+                    "            if let ::core::option::Option::Some(ref __sub) = self.{fident} && let ::core::option::Option::Some(__c) = <{rust_type} as ::omnibuf::Message>::build_value_schema_meta({sub_ref}, depth + 2) {{ meta.children.insert({fnum}, __c); }}"
+                );
+            }
+            GenFieldKind::SubMsgArr { rust_type, .. } => {
+                let _ = writeln!(
+                    child_code,
+                    "            if !self.{fident}.is_empty() {{ let mut __ch = ::core::option::Option::None; for __el in &self.{fident} {{ if let ::core::option::Option::Some(__cm) = <{rust_type} as ::omnibuf::Message>::build_value_schema_meta(__el, depth + 2) {{ __ch = ::core::option::Option::Some(::omnibuf::merge_schema_meta(__ch, __cm)); }} }} if let ::core::option::Option::Some(__c) = __ch {{ meta.children.insert({fnum}, __c); }} }}"
                 );
             }
             GenFieldKind::Map {
@@ -600,17 +1096,157 @@ fn emit_message_trait_impl(
                 ..
             } => {
                 let _ = writeln!(
-                    code,
-                    "        if let ::core::option::Option::Some(c) = <{rust_type} as ::omnibuf::Message>::build_schema_meta(active, depth + 2) {{ meta.children.insert({fnum}, c); }}"
+                    child_code,
+                    "            if !self.{fident}.is_empty() {{ let mut __ch = ::core::option::Option::None; for __el in self.{fident}.values() {{ if let ::core::option::Option::Some(__cm) = <{rust_type} as ::omnibuf::Message>::build_value_schema_meta(__el, depth + 2) {{ __ch = ::core::option::Option::Some(::omnibuf::merge_schema_meta(__ch, __cm)); }} }} if let ::core::option::Option::Some(__c) = __ch {{ meta.children.insert({fnum}, __c); }} }}"
                 );
             }
             _ => {}
         }
     }
-    let _ = writeln!(code, "        active.remove(type_key);");
+    for go in oneofs {
+        let fident = &go.field_ident;
+        let ename = &go.enum_name;
+        let has_sub = go
+            .arms
+            .iter()
+            .any(|a| matches!(a.kind, OneofArmKind::SubMsg { .. }));
+        if has_sub {
+            let _ = writeln!(
+                child_code,
+                "            if let ::core::option::Option::Some(ref __ov) = self.{fident} {{ match __ov {{"
+            );
+            for arm in &go.arms {
+                if let OneofArmKind::SubMsg { rust_type, boxed } = &arm.kind {
+                    let fnum = arm.number;
+                    let vident = &arm.variant_ident;
+                    let sub_ref = if *boxed { "&**__v" } else { "__v" };
+                    let _ = writeln!(
+                        child_code,
+                        "                {ename}::{vident}(__v) => {{ if let ::core::option::Option::Some(__c) = <{rust_type} as ::omnibuf::Message>::build_value_schema_meta({sub_ref}, depth + 2) {{ meta.children.insert({fnum}, __c); }} }}"
+                    );
+                }
+            }
+            let _ = writeln!(child_code, "                _ => {{}}");
+            let _ = writeln!(child_code, "            }} }}");
+        }
+    }
+    if !child_code.is_empty() {
+        let _ = writeln!(
+            code,
+            "        if depth + 2 < ::omnibuf::MAX_NESTING_DEPTH {{"
+        );
+        code.push_str(&child_code);
+        let _ = writeln!(code, "        }}");
+    }
     let _ = writeln!(code, "        ::core::option::Option::Some(meta)");
     let _ = writeln!(code, "    }}");
     let _ = writeln!(code, "}}\n");
+}
+
+fn emit_encode_oneof(code: &mut String, go: &GenOneof) {
+    let fident = &go.field_ident;
+    let ename = &go.enum_name;
+    let _ = writeln!(
+        code,
+        "        if let ::core::option::Option::Some(ref __active) = self.{fident} {{"
+    );
+    let _ = writeln!(code, "            match __active {{");
+    for arm in &go.arms {
+        let fnum = arm.number;
+        let vident = &arm.variant_ident;
+        let _ = writeln!(code, "                {ename}::{vident}(__v) => {{");
+        match &arm.kind {
+            OneofArmKind::Scalar(s) => {
+                let expr = match s {
+                    ProtoScalar::String | ProtoScalar::Bytes => "__v",
+                    _ => "*__v",
+                };
+                emit_scalar_write_call(code, fnum, *s, expr);
+            }
+            OneofArmKind::SubMsg { boxed, .. } => {
+                let inner = if *boxed { "&**__v" } else { "__v" };
+                let _ = writeln!(
+                    code,
+                    "                    ::omnibuf::codec::write_sub_msg_field(dst, {fnum}, {inner}, deterministic)?;"
+                );
+            }
+        }
+        let _ = writeln!(code, "                }}");
+    }
+    let _ = writeln!(code, "            }}");
+    let _ = writeln!(code, "        }}");
+}
+
+fn emit_decode_oneof_arm(code: &mut String, go: &GenOneof, arm: &GenOneofArm) {
+    let fnum = arm.number;
+    let fident = &go.field_ident;
+    let ename = &go.enum_name;
+    let vident = &arm.variant_ident;
+
+    match &arm.kind {
+        OneofArmKind::Scalar(ProtoScalar::Bool) => {
+            let _ = writeln!(
+                code,
+                "                {fnum} if wt == ::omnibuf::wire::WIRE_BOOL_FALSE || wt == ::omnibuf::wire::WIRE_BOOL_TRUE => {{ self.{fident} = ::core::option::Option::Some({ename}::{vident}(wt == ::omnibuf::wire::WIRE_BOOL_TRUE)); }}"
+            );
+        }
+        OneofArmKind::Scalar(s) => {
+            let wt = s.wire_type();
+            let expr = scalar_decode_expr(*s);
+            let _ = writeln!(
+                code,
+                "                {fnum} if wt == {wt} => {{ self.{fident} = ::core::option::Option::Some({ename}::{vident}({expr})); }}"
+            );
+        }
+        OneofArmKind::SubMsg { rust_type, boxed } => {
+            let _ = writeln!(code, "                {fnum} if wt == {WIRE_SUB_MSG} => {{");
+            let _ = writeln!(
+                code,
+                "                    let __sb = dec.read_container(0)?;"
+            );
+            let _ = writeln!(
+                code,
+                "                    if let ::core::option::Option::Some({ename}::{vident}(ref mut __sub)) = self.{fident} {{"
+            );
+            if *boxed {
+                let _ = writeln!(
+                    code,
+                    "                        <{rust_type} as ::omnibuf::Message>::decode_omnibuf_at_depth(&mut **__sub, __sb, depth + 1, true)?;"
+                );
+            } else {
+                let _ = writeln!(
+                    code,
+                    "                        <{rust_type} as ::omnibuf::Message>::decode_omnibuf_at_depth(__sub, __sb, depth + 1, true)?;"
+                );
+            }
+            let _ = writeln!(code, "                    }} else {{");
+            if *boxed {
+                let _ = writeln!(
+                    code,
+                    "                        let mut __sub = ::std::boxed::Box::new({rust_type}::default());"
+                );
+                let _ = writeln!(
+                    code,
+                    "                        <{rust_type} as ::omnibuf::Message>::decode_omnibuf_at_depth(&mut *__sub, __sb, depth + 1, true)?;"
+                );
+            } else {
+                let _ = writeln!(
+                    code,
+                    "                        let mut __sub = {rust_type}::default();"
+                );
+                let _ = writeln!(
+                    code,
+                    "                        <{rust_type} as ::omnibuf::Message>::decode_omnibuf_at_depth(&mut __sub, __sb, depth + 1, true)?;"
+                );
+            }
+            let _ = writeln!(
+                code,
+                "                        self.{fident} = ::core::option::Option::Some({ename}::{vident}(__sub));"
+            );
+            let _ = writeln!(code, "                    }}");
+            let _ = writeln!(code, "                }}");
+        }
+    }
 }
 
 fn emit_scalar_write_call(code: &mut String, fnum: u32, scalar: ProtoScalar, expr: &str) {
@@ -723,14 +1359,10 @@ fn scalar_elem_write_snippet(scalar: ProtoScalar, var: &str) -> String {
             format!("dst.extend_from_slice(&({var}).to_bits().to_le_bytes());")
         }
         ProtoScalar::String => {
-            format!(
-                "::omnibuf::wire::append_varint(dst, ({var}).len() as u64); dst.extend_from_slice(({var}).as_bytes());"
-            )
+            format!("::omnibuf::wire::append_bytes_elem(dst, ({var}).as_bytes());")
         }
         ProtoScalar::Bytes => {
-            format!(
-                "::omnibuf::wire::append_varint(dst, ({var}).len() as u64); dst.extend_from_slice(({var}).as_slice());"
-            )
+            format!("::omnibuf::wire::append_bytes_elem(dst, ({var}).as_slice());")
         }
     }
 }
@@ -816,11 +1448,39 @@ fn emit_encode_stmt(code: &mut String, gf: &GenField, prefix: &str, fallible: bo
         }
         GenFieldKind::ScalarArr(s) => {
             let ewt = s.wire_type();
-            let ws = scalar_elem_write_snippet(*s, "item");
-            let _ = writeln!(
-                code,
-                "        ::omnibuf::codec::write_scalar_vec_field(dst, {fnum}, {ewt}, &{access}, |dst, item| {{ {ws} ::core::result::Result::Ok(()) }}){q};"
-            );
+            match s {
+                ProtoScalar::Uint32 => {
+                    let _ = writeln!(
+                        code,
+                        "        ::omnibuf::codec::write_varint_vec_field(dst, {fnum}, {ewt}, &{access}, |item| u64::from(*item)){q};"
+                    );
+                }
+                ProtoScalar::Uint64 => {
+                    let _ = writeln!(
+                        code,
+                        "        ::omnibuf::codec::write_varint_vec_field(dst, {fnum}, {ewt}, &{access}, |item| *item){q};"
+                    );
+                }
+                ProtoScalar::Sint32 | ProtoScalar::Enum => {
+                    let _ = writeln!(
+                        code,
+                        "        ::omnibuf::codec::write_varint_vec_field(dst, {fnum}, {ewt}, &{access}, |item| ::omnibuf::wire::encode_zigzag(i64::from(*item))){q};"
+                    );
+                }
+                ProtoScalar::Sint64 => {
+                    let _ = writeln!(
+                        code,
+                        "        ::omnibuf::codec::write_varint_vec_field(dst, {fnum}, {ewt}, &{access}, |item| ::omnibuf::wire::encode_zigzag(*item)){q};"
+                    );
+                }
+                _ => {
+                    let ws = scalar_elem_write_snippet(*s, "item");
+                    let _ = writeln!(
+                        code,
+                        "        ::omnibuf::codec::write_scalar_vec_field(dst, {fnum}, {ewt}, &{access}, |dst, item| {{ {ws} ::core::result::Result::Ok(()) }}){q};"
+                    );
+                }
+            }
         }
         GenFieldKind::SubMsgArr { .. } => {
             let _ = writeln!(
@@ -870,7 +1530,7 @@ fn scalar_decode_expr(scalar: ProtoScalar) -> &'static str {
     }
 }
 
-fn emit_decode_arm(code: &mut String, gf: &GenField, idx: usize) {
+fn emit_decode_arm(code: &mut String, gf: &GenField) {
     let fnum = gf.number;
     let fident = &gf.rust_ident;
 
@@ -878,13 +1538,27 @@ fn emit_decode_arm(code: &mut String, gf: &GenField, idx: usize) {
         GenFieldKind::Scalar(ProtoScalar::Bool) => {
             let _ = writeln!(
                 code,
-                "                {fnum} if wt == ::omnibuf::wire::WIRE_BOOL_FALSE || wt == ::omnibuf::wire::WIRE_BOOL_TRUE => {{ seen[{idx}] = true; self.{fident} = wt == ::omnibuf::wire::WIRE_BOOL_TRUE; }}"
+                "                {fnum} if wt == ::omnibuf::wire::WIRE_BOOL_FALSE || wt == ::omnibuf::wire::WIRE_BOOL_TRUE => {{ self.{fident} = wt == ::omnibuf::wire::WIRE_BOOL_TRUE; }}"
             );
         }
         GenFieldKind::OptScalar(ProtoScalar::Bool) => {
             let _ = writeln!(
                 code,
-                "                {fnum} if wt == ::omnibuf::wire::WIRE_BOOL_FALSE || wt == ::omnibuf::wire::WIRE_BOOL_TRUE => {{ seen[{idx}] = true; self.{fident} = ::core::option::Option::Some(wt == ::omnibuf::wire::WIRE_BOOL_TRUE); }}"
+                "                {fnum} if wt == ::omnibuf::wire::WIRE_BOOL_FALSE || wt == ::omnibuf::wire::WIRE_BOOL_TRUE => {{ self.{fident} = ::core::option::Option::Some(wt == ::omnibuf::wire::WIRE_BOOL_TRUE); }}"
+            );
+        }
+        GenFieldKind::Scalar(ProtoScalar::String) => {
+            let wt = ProtoScalar::String.wire_type();
+            let _ = writeln!(
+                code,
+                "                {fnum} if wt == {wt} => {{ let s = dec.read_str()?; ::omnibuf::codec::assign_str(&mut self.{fident}, s); }}"
+            );
+        }
+        GenFieldKind::Scalar(ProtoScalar::Bytes) => {
+            let wt = ProtoScalar::Bytes.wire_type();
+            let _ = writeln!(
+                code,
+                "                {fnum} if wt == {wt} => {{ let b = dec.read_bytes()?; ::omnibuf::codec::assign_bytes(&mut self.{fident}, b); }}"
             );
         }
         GenFieldKind::Scalar(s) => {
@@ -892,7 +1566,7 @@ fn emit_decode_arm(code: &mut String, gf: &GenField, idx: usize) {
             let expr = scalar_decode_expr(*s);
             let _ = writeln!(
                 code,
-                "                {fnum} if wt == {wt} => {{ seen[{idx}] = true; self.{fident} = {expr}; }}"
+                "                {fnum} if wt == {wt} => {{ self.{fident} = {expr}; }}"
             );
         }
         GenFieldKind::OptScalar(s) => {
@@ -900,7 +1574,7 @@ fn emit_decode_arm(code: &mut String, gf: &GenField, idx: usize) {
             let expr = scalar_decode_expr(*s);
             let _ = writeln!(
                 code,
-                "                {fnum} if wt == {wt} => {{ seen[{idx}] = true; self.{fident} = ::core::option::Option::Some({expr}); }}"
+                "                {fnum} if wt == {wt} => {{ self.{fident} = ::core::option::Option::Some({expr}); }}"
             );
         }
         GenFieldKind::SubMsg { boxed, .. } => {
@@ -911,7 +1585,7 @@ fn emit_decode_arm(code: &mut String, gf: &GenField, idx: usize) {
             };
             let _ = writeln!(
                 code,
-                "                {fnum} if wt == {WIRE_SUB_MSG} => {{ let sub_merge = merge || seen[{idx}]; seen[{idx}] = true; let pos = dec.position(); let next_pos = ::omnibuf::codec::{fn_name}(&mut self.{fident}, dec.data(), pos, depth, sub_merge)?; dec.set_position(next_pos); }}"
+                "                {fnum} if wt == {WIRE_SUB_MSG} => {{ let pos = dec.position(); let next_pos = ::omnibuf::codec::{fn_name}(&mut self.{fident}, dec.data(), pos, depth, true)?; dec.set_position(next_pos); }}"
             );
         }
         GenFieldKind::ScalarArr(s) => {
@@ -919,13 +1593,13 @@ fn emit_decode_arm(code: &mut String, gf: &GenField, idx: usize) {
             let rs_arg = scalar_elem_read_arg(*s);
             let _ = writeln!(
                 code,
-                "                {fnum} if wt == {WIRE_ARRAY} => {{ let reset = !merge && !seen[{idx}]; seen[{idx}] = true; let pos = dec.position(); let next_pos = ::omnibuf::codec::read_scalar_vec_field(&mut self.{fident}, dec.data(), pos, depth, {ewt}, reset, {rs_arg})?; dec.set_position(next_pos); }}"
+                "                {fnum} if wt == {WIRE_ARRAY} => {{ let pos = dec.position(); let next_pos = ::omnibuf::codec::read_scalar_vec_field(&mut self.{fident}, dec.data(), pos, depth, {ewt}, false, {rs_arg})?; dec.set_position(next_pos); }}"
             );
         }
         GenFieldKind::SubMsgArr { .. } => {
             let _ = writeln!(
                 code,
-                "                {fnum} if wt == {WIRE_ARRAY} => {{ let reset = !merge && !seen[{idx}]; seen[{idx}] = true; let pos = dec.position(); let next_pos = ::omnibuf::codec::read_sub_msg_vec_field(&mut self.{fident}, dec.data(), pos, depth, reset)?; dec.set_position(next_pos); }}"
+                "                {fnum} if wt == {WIRE_ARRAY} => {{ let pos = dec.position(); let next_pos = ::omnibuf::codec::read_sub_msg_vec_field(&mut self.{fident}, dec.data(), pos, depth, false)?; dec.set_position(next_pos); }}"
             );
         }
         GenFieldKind::Map { key, val } => {
@@ -939,13 +1613,13 @@ fn emit_decode_arm(code: &mut String, gf: &GenField, idx: usize) {
                 MapValKind::SubMsg { rust_type } => (
                     WIRE_SUB_MSG,
                     format!(
-                        "|b, p, d| {{ let (sb, np) = ::omnibuf::wire::read_len_slice(b, p, 0)?; let mut sub = {rust_type}::default(); <{rust_type} as ::omnibuf::Message>::decode_omnibuf_at_depth(&mut sub, sb, d + 1, false)?; ::core::result::Result::Ok((sub, np)) }}"
+                        "|b, p, d| {{ let (sb, np) = ::omnibuf::wire::read_len_slice(b, p, 0)?; let mut sub = {rust_type}::default(); <{rust_type} as ::omnibuf::Message>::decode_omnibuf_at_depth(&mut sub, sb, d + 1, true)?; ::core::result::Result::Ok((sub, np)) }}"
                     ),
                 ),
             };
             let _ = writeln!(
                 code,
-                "                {fnum} if wt == {WIRE_MAP} => {{ let reset = !merge && !seen[{idx}]; seen[{idx}] = true; let pos = dec.position(); let next_pos = ::omnibuf::codec::read_hash_map_field(&mut self.{fident}, dec.data(), pos, depth, {kwt}, {vwt}, reset, {rk_arg}, {rv})?; dec.set_position(next_pos); }}"
+                "                {fnum} if wt == {WIRE_MAP} => {{ let pos = dec.position(); let next_pos = ::omnibuf::codec::read_hash_map_field(&mut self.{fident}, dec.data(), pos, depth, {kwt}, {vwt}, false, {rk_arg}, {rv})?; dec.set_position(next_pos); }}"
             );
         }
     }
@@ -954,12 +1628,16 @@ fn emit_decode_arm(code: &mut String, gf: &GenField, idx: usize) {
 fn clear_stmt_for_field(gf: &GenField) -> String {
     let fident = &gf.rust_ident;
     match &gf.kind {
-        GenFieldKind::Scalar(ProtoScalar::String | ProtoScalar::Bytes)
-        | GenFieldKind::ScalarArr(_)
-        | GenFieldKind::SubMsgArr { .. }
-        | GenFieldKind::Map { .. } => format!("self.{fident}.clear();"),
+        GenFieldKind::Scalar(ProtoScalar::String | ProtoScalar::Bytes) => {
+            format!("self.{fident}.clear();")
+        }
+        GenFieldKind::ScalarArr(_) | GenFieldKind::SubMsgArr { .. } | GenFieldKind::Map { .. } => {
+            format!("if !self.{fident}.is_empty() {{ self.{fident}.clear(); }}")
+        }
         GenFieldKind::OptScalar(_) | GenFieldKind::SubMsg { .. } => {
-            format!("self.{fident} = ::core::option::Option::None;")
+            format!(
+                "if self.{fident}.is_some() {{ self.{fident} = ::core::option::Option::None; }}"
+            )
         }
         GenFieldKind::Scalar(_) => format!("self.{fident} = ::core::default::Default::default();"),
     }
@@ -995,7 +1673,7 @@ fn emit_opaque_view(code: &mut String, rust_name: &str, fields: &[GenField]) {
     let _ = writeln!(code, "#[allow(dead_code)]");
     let _ = writeln!(code, "#[derive(Clone, Debug, Default)]");
     let _ = writeln!(code, "pub struct {opaque_name}<'a> {{");
-    let _ = writeln!(code, "    raw: ::std::borrow::Cow<'a, [u8]>,");
+    let _ = writeln!(code, "    pub(crate) raw: ::std::borrow::Cow<'a, [u8]>,");
     let _ = writeln!(code, "    dirty: u64,");
     if has_heap {
         let _ = writeln!(
@@ -1024,6 +1702,15 @@ fn emit_opaque_view(code: &mut String, rust_name: &str, fields: &[GenField]) {
     let _ = writeln!(code, "    #[inline]");
     let _ = writeln!(
         code,
+        "    pub fn try_new(raw: &'a [u8]) -> ::omnibuf::Result<Self> {{"
+    );
+    let _ = writeln!(code, "        ::omnibuf::wire::validate_message(raw, 0)?;");
+    let _ = writeln!(code, "        ::core::result::Result::Ok(Self::new(raw))");
+    let _ = writeln!(code, "    }}\n");
+
+    let _ = writeln!(code, "    #[inline]");
+    let _ = writeln!(
+        code,
         "    pub fn from_owned(raw: ::std::vec::Vec<u8>) -> {opaque_name}<'static> {{"
     );
     let _ = writeln!(code, "        {opaque_name} {{");
@@ -1033,12 +1720,45 @@ fn emit_opaque_view(code: &mut String, rust_name: &str, fields: &[GenField]) {
     let _ = writeln!(code, "    }}\n");
 
     let _ = writeln!(code, "    #[inline]");
+    let _ = writeln!(
+        code,
+        "    pub fn try_from_owned(raw: ::std::vec::Vec<u8>) -> ::omnibuf::Result<{opaque_name}<'static>> {{"
+    );
+    let _ = writeln!(code, "        ::omnibuf::wire::validate_message(&raw, 0)?;");
+    let _ = writeln!(
+        code,
+        "        ::core::result::Result::Ok(Self::from_owned(raw))"
+    );
+    let _ = writeln!(code, "    }}\n");
+
+    let _ = writeln!(code, "    #[inline]");
+    let _ = writeln!(
+        code,
+        "    pub fn validate(&self) -> ::omnibuf::Result<()> {{"
+    );
+    let _ = writeln!(
+        code,
+        "        ::omnibuf::wire::validate_message(&self.raw, 0)"
+    );
+    let _ = writeln!(code, "    }}\n");
+
+    let _ = writeln!(code, "    #[inline]");
     let _ = writeln!(code, "    pub fn unmarshal(&mut self, raw: &'a [u8]) {{");
     let _ = writeln!(
         code,
         "        self.raw = ::std::borrow::Cow::Borrowed(raw);"
     );
     let _ = writeln!(code, "        self.dirty = 0;");
+    let _ = writeln!(code, "    }}\n");
+
+    let _ = writeln!(code, "    #[inline]");
+    let _ = writeln!(
+        code,
+        "    pub fn try_unmarshal(&mut self, raw: &'a [u8]) -> ::omnibuf::Result<()> {{"
+    );
+    let _ = writeln!(code, "        ::omnibuf::wire::validate_message(raw, 0)?;");
+    let _ = writeln!(code, "        self.unmarshal(raw);");
+    let _ = writeln!(code, "        ::core::result::Result::Ok(())");
     let _ = writeln!(code, "    }}\n");
 
     let _ = writeln!(code, "    #[inline]");
@@ -1098,6 +1818,48 @@ fn emit_opaque_view(code: &mut String, rust_name: &str, fields: &[GenField]) {
     let _ = writeln!(code, "                _ => {{}}");
     let _ = writeln!(code, "            }}");
     let _ = writeln!(code, "        }});");
+    let _ = writeln!(code, "    }}\n");
+
+    let _ = writeln!(code, "    #[inline]");
+    let _ = writeln!(
+        code,
+        "    pub fn try_marshal(&self) -> ::omnibuf::Result<::std::vec::Vec<u8>> {{"
+    );
+    let _ = writeln!(
+        code,
+        "        let mut dst = ::std::vec::Vec::with_capacity(self.raw.len() + 32);"
+    );
+    let _ = writeln!(code, "        self.try_marshal_append(&mut dst)?;");
+    let _ = writeln!(code, "        ::core::result::Result::Ok(dst)");
+    let _ = writeln!(code, "    }}\n");
+
+    let _ = writeln!(
+        code,
+        "    pub fn try_marshal_append(&self, dst: &mut ::std::vec::Vec<u8>) -> ::omnibuf::Result<()> {{"
+    );
+    let _ = writeln!(code, "        if self.dirty == 0 {{");
+    let _ = writeln!(
+        code,
+        "            return ::omnibuf::opaque::try_copy_packet(dst, &self.raw);"
+    );
+    let _ = writeln!(code, "        }}");
+    let _ = writeln!(code, "        dst.clear();");
+    let _ = writeln!(
+        code,
+        "        ::omnibuf::opaque::try_splice_fields(dst, &self.raw, self.dirty, {max_field}, |dst, fnum| {{"
+    );
+    let _ = writeln!(code, "            let deterministic = true;");
+    let _ = writeln!(code, "            let _ = deterministic;");
+    let _ = writeln!(code, "            match fnum {{");
+    for gf in fields {
+        let fnum = gf.number;
+        let _ = writeln!(code, "                {fnum} => {{");
+        emit_opaque_dirty_field(code, gf);
+        let _ = writeln!(code, "                }}");
+    }
+    let _ = writeln!(code, "                _ => {{}}");
+    let _ = writeln!(code, "            }}");
+    let _ = writeln!(code, "        }})");
     let _ = writeln!(code, "    }}");
     let _ = writeln!(code, "}}\n");
 }
@@ -1257,39 +2019,76 @@ fn emit_opaque_field_methods(code: &mut String, gf: &GenField) {
             let _ = writeln!(code, "        self.dirty |= {bit}u64;");
             let _ = writeln!(code, "    }}\n");
         }
-        GenFieldKind::SubMsg { rust_type, boxed } => {
-            let sub_opaque = format!("Opaque{rust_type}");
+        GenFieldKind::SubMsg {
+            rust_type,
+            opaque_type,
+            boxed,
+        } => {
             let set_ty = rust_field_type(&gf.kind);
             let deref_sub = if *boxed { "&**sub" } else { "sub" };
 
-            let _ = writeln!(code, "    #[inline]");
-            let _ = writeln!(code, "    pub fn get_{stem}(&self) -> {sub_opaque}<'_> {{");
-            let _ = writeln!(code, "        if (self.dirty & {bit}u64) != 0 {{");
-            let _ = writeln!(
-                code,
-                "            if let ::core::option::Option::Some(ref sub) = self.heap.as_deref().unwrap().f_{stem} {{"
-            );
-            let _ = writeln!(
-                code,
-                "                return {sub_opaque}::from_owned(({deref_sub}).marshal_omnibuf());"
-            );
-            let _ = writeln!(code, "            }}");
-            let _ = writeln!(code, "            return {sub_opaque}::new(&[]);");
-            let _ = writeln!(code, "        }}");
-            let _ = writeln!(
-                code,
-                "        match ::omnibuf::wire::read_sub_msg(&self.raw, {fnum}) {{"
-            );
-            let _ = writeln!(
-                code,
-                "            ::core::option::Option::Some(cow) => {sub_opaque} {{ raw: cow, ..{sub_opaque}::default() }},"
-            );
-            let _ = writeln!(
-                code,
-                "            ::core::option::Option::None => {sub_opaque}::new(&[]),"
-            );
-            let _ = writeln!(code, "        }}");
-            let _ = writeln!(code, "    }}");
+            if let Some(sub_opaque) = opaque_type {
+                let _ = writeln!(code, "    #[inline]");
+                let _ = writeln!(code, "    pub fn get_{stem}(&self) -> {sub_opaque}<'_> {{");
+                let _ = writeln!(code, "        if (self.dirty & {bit}u64) != 0 {{");
+                let _ = writeln!(
+                    code,
+                    "            if let ::core::option::Option::Some(ref sub) = self.heap.as_deref().unwrap().f_{stem} {{"
+                );
+                let _ = writeln!(
+                    code,
+                    "                return {sub_opaque}::from_owned(({deref_sub}).marshal_omnibuf());"
+                );
+                let _ = writeln!(code, "            }}");
+                let _ = writeln!(code, "            return {sub_opaque}::new(&[]);");
+                let _ = writeln!(code, "        }}");
+                let _ = writeln!(
+                    code,
+                    "        match ::omnibuf::wire::read_sub_msg(&self.raw, {fnum}) {{"
+                );
+                let _ = writeln!(
+                    code,
+                    "            ::core::option::Option::Some(::std::borrow::Cow::Borrowed(slice)) => {sub_opaque}::new(slice),"
+                );
+                let _ = writeln!(
+                    code,
+                    "            ::core::option::Option::Some(::std::borrow::Cow::Owned(vec)) => {sub_opaque}::from_owned(vec),"
+                );
+                let _ = writeln!(
+                    code,
+                    "            ::core::option::Option::None => {sub_opaque}::new(&[]),"
+                );
+                let _ = writeln!(code, "        }}");
+                let _ = writeln!(code, "    }}");
+            } else {
+                let _ = writeln!(code, "    #[inline]");
+                let _ = writeln!(
+                    code,
+                    "    pub fn get_{stem}(&self) -> ::core::option::Option<{rust_type}> {{"
+                );
+                let _ = writeln!(code, "        if (self.dirty & {bit}u64) != 0 {{");
+                if *boxed {
+                    let _ = writeln!(
+                        code,
+                        "            return self.heap.as_deref().and_then(|h| h.f_{stem}.as_deref().cloned());"
+                    );
+                } else {
+                    let _ = writeln!(
+                        code,
+                        "            return self.heap.as_deref().and_then(|h| h.f_{stem}.clone());"
+                    );
+                }
+                let _ = writeln!(code, "        }}");
+                let _ = writeln!(
+                    code,
+                    "        let cow = ::omnibuf::wire::read_sub_msg(&self.raw, {fnum})?;"
+                );
+                let _ = writeln!(
+                    code,
+                    "        <{rust_type} as ::omnibuf::Message>::from_omnibuf(&cow).ok()"
+                );
+                let _ = writeln!(code, "    }}");
+            }
 
             let _ = writeln!(code, "    #[inline]");
             let _ = writeln!(code, "    pub fn set_{stem}(&mut self, v: {set_ty}) {{");
@@ -1349,7 +2148,7 @@ fn emit_opaque_field_methods(code: &mut String, gf: &GenField) {
                 code,
                 "            if e != {ewt} {{ return ::std::vec::Vec::new(); }}"
             );
-            let _ = writeln!(code, "            out.reserve(count);");
+            let _ = writeln!(code, "            out.reserve(count.min(4096));");
             let _ = writeln!(code, "            let b = body;");
             let _ = writeln!(code, "            for _ in 0..count {{");
             let _ = writeln!(
@@ -1376,8 +2175,10 @@ fn emit_opaque_field_methods(code: &mut String, gf: &GenField) {
             let _ = writeln!(code, "        self.dirty |= {bit}u64;");
             let _ = writeln!(code, "    }}\n");
         }
-        GenFieldKind::SubMsgArr { rust_type } => {
-            let sub_opaque = format!("Opaque{rust_type}");
+        GenFieldKind::SubMsgArr {
+            rust_type,
+            opaque_type,
+        } => {
             let _ = writeln!(code, "    #[inline]");
             let _ = writeln!(code, "    pub fn {stem}_len(&self) -> usize {{");
             let _ = writeln!(code, "        if (self.dirty & {bit}u64) != 0 {{");
@@ -1392,36 +2193,58 @@ fn emit_opaque_field_methods(code: &mut String, gf: &GenField) {
             );
             let _ = writeln!(code, "    }}");
 
-            let _ = writeln!(
-                code,
-                "    pub fn get_{stem}(&self, idx: usize) -> {sub_opaque}<'_> {{"
-            );
-            let _ = writeln!(code, "        if (self.dirty & {bit}u64) != 0 {{");
-            let _ = writeln!(
-                code,
-                "            if let ::core::option::Option::Some(elem) = self.heap.as_deref().and_then(|h| h.f_{stem}.get(idx)) {{"
-            );
-            let _ = writeln!(
-                code,
-                "                return {sub_opaque}::from_owned(elem.marshal_omnibuf());"
-            );
-            let _ = writeln!(code, "            }}");
-            let _ = writeln!(code, "            return {sub_opaque}::new(&[]);");
-            let _ = writeln!(code, "        }}");
-            let _ = writeln!(
-                code,
-                "        match ::omnibuf::wire::read_sub_msg_arr_elem(&self.raw, {fnum}, idx) {{"
-            );
-            let _ = writeln!(
-                code,
-                "            ::core::option::Option::Some(slice) => {sub_opaque}::new(slice),"
-            );
-            let _ = writeln!(
-                code,
-                "            ::core::option::Option::None => {sub_opaque}::new(&[]),"
-            );
-            let _ = writeln!(code, "        }}");
-            let _ = writeln!(code, "    }}");
+            if let Some(sub_opaque) = opaque_type {
+                let _ = writeln!(
+                    code,
+                    "    pub fn get_{stem}(&self, idx: usize) -> {sub_opaque}<'_> {{"
+                );
+                let _ = writeln!(code, "        if (self.dirty & {bit}u64) != 0 {{");
+                let _ = writeln!(
+                    code,
+                    "            if let ::core::option::Option::Some(elem) = self.heap.as_deref().and_then(|h| h.f_{stem}.get(idx)) {{"
+                );
+                let _ = writeln!(
+                    code,
+                    "                return {sub_opaque}::from_owned(elem.marshal_omnibuf());"
+                );
+                let _ = writeln!(code, "            }}");
+                let _ = writeln!(code, "            return {sub_opaque}::new(&[]);");
+                let _ = writeln!(code, "        }}");
+                let _ = writeln!(
+                    code,
+                    "        match ::omnibuf::wire::read_sub_msg_arr_elem(&self.raw, {fnum}, idx) {{"
+                );
+                let _ = writeln!(
+                    code,
+                    "            ::core::option::Option::Some(slice) => {sub_opaque}::new(slice),"
+                );
+                let _ = writeln!(
+                    code,
+                    "            ::core::option::Option::None => {sub_opaque}::new(&[]),"
+                );
+                let _ = writeln!(code, "        }}");
+                let _ = writeln!(code, "    }}");
+            } else {
+                let _ = writeln!(
+                    code,
+                    "    pub fn get_{stem}(&self, idx: usize) -> ::core::option::Option<{rust_type}> {{"
+                );
+                let _ = writeln!(code, "        if (self.dirty & {bit}u64) != 0 {{");
+                let _ = writeln!(
+                    code,
+                    "            return self.heap.as_deref().and_then(|h| h.f_{stem}.get(idx).cloned());"
+                );
+                let _ = writeln!(code, "        }}");
+                let _ = writeln!(
+                    code,
+                    "        let slice = ::omnibuf::wire::read_sub_msg_arr_elem(&self.raw, {fnum}, idx)?;"
+                );
+                let _ = writeln!(
+                    code,
+                    "        <{rust_type} as ::omnibuf::Message>::from_omnibuf(slice).ok()"
+                );
+                let _ = writeln!(code, "    }}");
+            }
 
             let _ = writeln!(code, "    #[inline]");
             let _ = writeln!(
@@ -1505,27 +2328,7 @@ fn emit_opaque_dirty_field(code: &mut String, gf: &GenField) {
         proto_name: gf.proto_name.clone(),
         rust_ident: format!("f_{}", gf.method_stem),
         method_stem: gf.method_stem.clone(),
-        kind: match &gf.kind {
-            GenFieldKind::Scalar(s) => GenFieldKind::Scalar(*s),
-            GenFieldKind::OptScalar(s) => GenFieldKind::OptScalar(*s),
-            GenFieldKind::SubMsg { rust_type, boxed } => GenFieldKind::SubMsg {
-                rust_type: rust_type.clone(),
-                boxed: *boxed,
-            },
-            GenFieldKind::ScalarArr(s) => GenFieldKind::ScalarArr(*s),
-            GenFieldKind::SubMsgArr { rust_type } => GenFieldKind::SubMsgArr {
-                rust_type: rust_type.clone(),
-            },
-            GenFieldKind::Map { key, val } => GenFieldKind::Map {
-                key: *key,
-                val: match val {
-                    MapValKind::Scalar(vs) => MapValKind::Scalar(*vs),
-                    MapValKind::SubMsg { rust_type } => MapValKind::SubMsg {
-                        rust_type: rust_type.clone(),
-                    },
-                },
-            },
-        },
+        kind: gf.kind.clone(),
     };
     emit_encode_stmt(code, &temp, prefix, false);
 }

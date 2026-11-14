@@ -13,10 +13,13 @@ name = "conformance-rs"
 path = "src/main.rs"
 
 [dependencies]
+buffa.workspace = true
+buffa-descriptor.workspace = true
 omnibuf.workspace = true
 prost.workspace = true
 prost-reflect.workspace = true
 
 [build-dependencies]
+buffa-build.workspace = true
 prost-build.workspace = true
 prost-reflect-build.workspace = true

@@ -7,7 +7,8 @@ use std::process;
 
 use omnibuf::wire::{WIRE_UINT, append_varint};
 use omnibuf::{
-    EncodeOptions, Message, OmniBuf, decode_blind, opaque, prost_codec, stringify_blind_json,
+    EncodeOptions, Error, Message, OmniBuf, buffa_codec, decode_blind, decode_blind_json, opaque,
+    prost_codec,
 };
 
 pub mod proto_types {
@@ -30,6 +31,23 @@ pub mod proto_types {
             include!(concat!(env!("OUT_DIR"), "/omnibuf.conformance.rs"));
         }
     }
+}
+
+pub mod buffa_types {
+    use std::sync::{Arc, LazyLock};
+
+    use buffa_descriptor::DescriptorPool;
+
+    pub static DESCRIPTOR_POOL: LazyLock<Arc<DescriptorPool>> = LazyLock::new(|| {
+        Arc::new(
+            DescriptorPool::decode(
+                include_bytes!(concat!(env!("OUT_DIR"), "/file_descriptor_set.bin")).as_ref(),
+            )
+            .expect("valid embedded buffa FileDescriptorSet"),
+        )
+    });
+
+    include!(concat!(env!("OUT_DIR"), "/_buffa.rs"));
 }
 
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -399,12 +417,15 @@ fn handle_request(req: &ConformanceRequest) -> ConformanceResponse {
 // ============================================================================
 
 fn handle_blind_tier(req: &ConformanceRequest) -> ConformanceResponse {
-    let map = match decode_blind(&req.omnibuf_payload) {
-        Ok(m) => m,
-        Err(err) => return ConformanceResponse::parse_err(err.to_string()),
-    };
     if req.requested_output_format == WIRE_FORMAT_JSON {
-        return ConformanceResponse::json(stringify_blind_json(&map, None, true));
+        return match decode_blind_json(&req.omnibuf_payload) {
+            Ok(js) => ConformanceResponse::json(js),
+            Err(Error::Serialize(_)) => ConformanceResponse::json("{}".to_owned()),
+            Err(err) => ConformanceResponse::parse_err(err.to_string()),
+        };
+    }
+    if let Err(err) = decode_blind(&req.omnibuf_payload) {
+        return ConformanceResponse::parse_err(err.to_string());
     }
     ConformanceResponse::default()
 }
@@ -417,14 +438,15 @@ fn handle_plugin_tier(req: &ConformanceRequest) -> ConformanceResponse {
     use generated::conformance_omnibuf::{AllTypesSubMsg, OpaqueTestAllTypes, TestAllTypes};
     use generated::peer_omnibuf::{Location, Neighbor, OpaquePeerUpdate, PeerUpdate};
 
-    if req.test_opaque_splice || req.test_opaque_splice_shrink {
-        if let Err(err) = check_splice_aliased_prefix(&req.omnibuf_payload) {
-            return ConformanceResponse::runtime_err(err);
-        }
-    }
-
     match req.message_type.as_str() {
         "omnibuf.bench.PeerUpdate" => {
+            if req.test_opaque_splice || req.test_opaque_splice_shrink {
+                let mut probe = OpaquePeerUpdate::new(&req.omnibuf_payload);
+                probe.set_sequence(probe.get_sequence().wrapping_add(1));
+                if let Err(err) = probe.try_marshal() {
+                    return ConformanceResponse::parse_err(err.to_string());
+                }
+            }
             let mut msg = PeerUpdate {
                 asn: 999_999,
                 router_id: "stale-router".to_owned(),
@@ -452,6 +474,11 @@ fn handle_plugin_tier(req: &ConformanceRequest) -> ConformanceResponse {
             };
             if let Err(err) = msg.unmarshal_omnibuf(&req.omnibuf_payload) {
                 return ConformanceResponse::parse_err(err.to_string());
+            }
+            if (req.test_opaque_splice || req.test_opaque_splice_shrink)
+                && let Err(err) = check_splice_aliased_prefix(&req.omnibuf_payload)
+            {
+                return ConformanceResponse::runtime_err(err);
             }
 
             let mut op = OpaquePeerUpdate::new(&req.omnibuf_payload);
@@ -497,7 +524,10 @@ fn handle_plugin_tier(req: &ConformanceRequest) -> ConformanceResponse {
                     longitude: 13.405,
                 }));
                 op.set_sequence(next_seq);
-                return ConformanceResponse::wire(op.marshal());
+                return match op.try_marshal() {
+                    Ok(out) => ConformanceResponse::wire(out),
+                    Err(err) => ConformanceResponse::serialize_err(err.to_string()),
+                };
             }
 
             if req.test_opaque_splice_shrink {
@@ -518,7 +548,10 @@ fn handle_plugin_tier(req: &ConformanceRequest) -> ConformanceResponse {
                     longitude: 2.0,
                 }));
                 op.set_sequence(2);
-                return ConformanceResponse::wire(op.marshal());
+                return match op.try_marshal() {
+                    Ok(out) => ConformanceResponse::wire(out),
+                    Err(err) => ConformanceResponse::serialize_err(err.to_string()),
+                };
             }
 
             if req.self_describing {
@@ -531,6 +564,13 @@ fn handle_plugin_tier(req: &ConformanceRequest) -> ConformanceResponse {
         }
 
         "omnibuf.conformance.TestAllTypes" => {
+            if req.test_opaque_splice || req.test_opaque_splice_shrink {
+                let mut probe = OpaqueTestAllTypes::new(&req.omnibuf_payload);
+                probe.set_f1_uint32(probe.get_f1_uint32().wrapping_add(1));
+                if let Err(err) = probe.try_marshal() {
+                    return ConformanceResponse::parse_err(err.to_string());
+                }
+            }
             let mut msg = TestAllTypes {
                 f1_uint32: 999_999,
                 f5_bool: true,
@@ -550,13 +590,18 @@ fn handle_plugin_tier(req: &ConformanceRequest) -> ConformanceResponse {
                     flag: false,
                     score: 0,
                 }],
-                f12_map_str_uint: HashMap::from([("stale".to_owned(), 999)]),
+                f12_map_str_uint: [("stale".to_owned(), 999)].into_iter().collect(),
                 f20_overflow_str: "stale-overflow".to_owned(),
                 ..TestAllTypes::default()
             };
 
             if let Err(err) = msg.unmarshal_omnibuf(&req.omnibuf_payload) {
                 return ConformanceResponse::parse_err(err.to_string());
+            }
+            if (req.test_opaque_splice || req.test_opaque_splice_shrink)
+                && let Err(err) = check_splice_aliased_prefix(&req.omnibuf_payload)
+            {
+                return ConformanceResponse::runtime_err(err);
             }
 
             let mut op = OpaqueTestAllTypes::new(&req.omnibuf_payload);
@@ -636,7 +681,10 @@ fn handle_plugin_tier(req: &ConformanceRequest) -> ConformanceResponse {
                 op.set_f15_fixed32(0xdead_beef);
                 op.set_f16_fixed64(0xcafe_babe_dead_beef);
                 op.set_f20_overflow_str("overflow20-".repeat(20));
-                return ConformanceResponse::wire(op.marshal());
+                return match op.try_marshal() {
+                    Ok(out) => ConformanceResponse::wire(out),
+                    Err(err) => ConformanceResponse::serialize_err(err.to_string()),
+                };
             }
 
             if req.test_opaque_splice_shrink {
@@ -667,7 +715,10 @@ fn handle_plugin_tier(req: &ConformanceRequest) -> ConformanceResponse {
                 op.set_f15_fixed32(7);
                 op.set_f16_fixed64(9);
                 op.set_f20_overflow_str("z");
-                return ConformanceResponse::wire(op.marshal());
+                return match op.try_marshal() {
+                    Ok(out) => ConformanceResponse::wire(out),
+                    Err(err) => ConformanceResponse::serialize_err(err.to_string()),
+                };
             }
 
             ConformanceResponse::wire(msg.marshal_omnibuf())
@@ -727,10 +778,12 @@ fn float64_canonical_bits(f: f64) -> u64 {
 }
 
 // ============================================================================
-// Tier 2: Standard `prost` Protobuf Types
+// Tier 2: Standard `prost` and `buffa` Protobuf Types
 // ============================================================================
 
 fn handle_protobuf_types_tier(req: &ConformanceRequest) -> ConformanceResponse {
+    use buffa_types::omnibuf::bench as buffa_bench;
+    use buffa_types::omnibuf::conformance as buffa_conf;
     use proto_types::omnibuf::bench::{Location, Neighbor, PeerUpdate};
     use proto_types::omnibuf::conformance::{AllTypesSubMsg, TestAllTypes};
 
@@ -766,17 +819,77 @@ fn handle_protobuf_types_tier(req: &ConformanceRequest) -> ConformanceResponse {
                 }],
                 sequence: 999,
             };
+            let mut buffa_msg = buffa_bench::PeerUpdate {
+                asn: 999_999,
+                router_id: "stale-router".to_owned(),
+                active: true,
+                uptime_sec: 55,
+                rssi_dbm: -12,
+                cpu_load: 42.0,
+                tags: vec!["stale".to_owned()],
+                prefixes: vec![999],
+                location: buffa::MessageField::some(buffa_bench::Location {
+                    region: "stale".to_owned(),
+                    datacenter: "stale".to_owned(),
+                    city: "stale".to_owned(),
+                    rack: 999,
+                    latitude: 1.0,
+                    longitude: 2.0,
+                    ..Default::default()
+                }),
+                neighbors: vec![buffa_bench::Neighbor {
+                    peer_asn: 999,
+                    router: "stale".to_owned(),
+                    latency_us: 1,
+                    established: true,
+                    ..Default::default()
+                }],
+                sequence: 999,
+                ..Default::default()
+            };
+            let mut buffa_derived = buffa_msg.clone();
+
             let mut reflected = msg.clone();
             if let Err(err) = prost_codec::decode_prost(&req.omnibuf_payload, &mut reflected) {
+                return ConformanceResponse::parse_err(err.to_string());
+            }
+            if let Err(err) = buffa_codec::decode_buffa_into(
+                &req.omnibuf_payload,
+                &buffa_types::DESCRIPTOR_POOL,
+                &mut buffa_msg,
+            ) {
+                return ConformanceResponse::parse_err(err.to_string());
+            }
+            if let Err(err) = buffa_derived.decode_omnibuf(&req.omnibuf_payload) {
                 return ConformanceResponse::parse_err(err.to_string());
             }
             if let Err(err) = msg.decode_omnibuf(&req.omnibuf_payload) {
                 return ConformanceResponse::parse_err(err.to_string());
             }
-            match msg.encode_omnibuf_with_options(opts) {
-                Ok(out) => ConformanceResponse::wire(out),
-                Err(err) => ConformanceResponse::serialize_err(err.to_string()),
+
+            let out = match msg.encode_omnibuf_with_options(opts) {
+                Ok(b) => b,
+                Err(err) => return ConformanceResponse::serialize_err(err.to_string()),
+            };
+            let buffa_refl_out = match buffa_codec::encode_buffa_reflect(&buffa_msg, opts) {
+                Ok(b) => b,
+                Err(err) => return ConformanceResponse::serialize_err(err.to_string()),
+            };
+            let buffa_pool_out =
+                match buffa_codec::encode_buffa(&buffa_msg, &buffa_types::DESCRIPTOR_POOL, opts) {
+                    Ok(b) => b,
+                    Err(err) => return ConformanceResponse::serialize_err(err.to_string()),
+                };
+            let buffa_derive_out = match buffa_derived.encode_omnibuf_with_options(opts) {
+                Ok(b) => b,
+                Err(err) => return ConformanceResponse::serialize_err(err.to_string()),
+            };
+            if buffa_refl_out != out || buffa_pool_out != out || buffa_derive_out != out {
+                return ConformanceResponse::runtime_err(
+                    "buffa PeerUpdate OmniBuf output diverged from prost output",
+                );
             }
+            ConformanceResponse::wire(out)
         }
 
         "omnibuf.conformance.TestAllTypes" => {
@@ -799,21 +912,78 @@ fn handle_protobuf_types_tier(req: &ConformanceRequest) -> ConformanceResponse {
                     flag: false,
                     score: 0,
                 }],
-                f12_map_str_uint: HashMap::from([("stale".to_owned(), 999)]),
+                f12_map_str_uint: [("stale".to_owned(), 999)].into_iter().collect(),
                 f20_overflow_str: "stale".to_owned(),
                 ..TestAllTypes::default()
             };
+            let mut buffa_msg = buffa_conf::TestAllTypes {
+                f1_uint32: 999_999,
+                f5_bool: true,
+                f6_string: "stale".to_owned(),
+                f7_bytes: vec![0xaa],
+                f8_sub_msg: buffa::MessageField::some(buffa_conf::AllTypesSubMsg {
+                    id: 999,
+                    label: "stale".to_owned(),
+                    flag: true,
+                    score: -999,
+                    ..Default::default()
+                }),
+                f9_string_arr: vec!["stale".to_owned()],
+                f10_uint32_arr: vec![999],
+                f11_sub_msg_arr: vec![buffa_conf::AllTypesSubMsg {
+                    id: 999,
+                    label: "stale".to_owned(),
+                    flag: false,
+                    score: 0,
+                    ..Default::default()
+                }],
+                f12_map_str_uint: [("stale".to_owned(), 999)].into_iter().collect(),
+                f20_overflow_str: "stale".to_owned(),
+                ..Default::default()
+            };
+            let mut buffa_derived = buffa_msg.clone();
+
             let mut reflected = msg.clone();
             if let Err(err) = prost_codec::decode_prost(&req.omnibuf_payload, &mut reflected) {
+                return ConformanceResponse::parse_err(err.to_string());
+            }
+            if let Err(err) = buffa_codec::decode_buffa_into(
+                &req.omnibuf_payload,
+                &buffa_types::DESCRIPTOR_POOL,
+                &mut buffa_msg,
+            ) {
+                return ConformanceResponse::parse_err(err.to_string());
+            }
+            if let Err(err) = buffa_derived.decode_omnibuf(&req.omnibuf_payload) {
                 return ConformanceResponse::parse_err(err.to_string());
             }
             if let Err(err) = msg.decode_omnibuf(&req.omnibuf_payload) {
                 return ConformanceResponse::parse_err(err.to_string());
             }
-            match msg.encode_omnibuf_with_options(opts) {
-                Ok(out) => ConformanceResponse::wire(out),
-                Err(err) => ConformanceResponse::serialize_err(err.to_string()),
+
+            let out = match msg.encode_omnibuf_with_options(opts) {
+                Ok(b) => b,
+                Err(err) => return ConformanceResponse::serialize_err(err.to_string()),
+            };
+            let buffa_refl_out = match buffa_codec::encode_buffa_reflect(&buffa_msg, opts) {
+                Ok(b) => b,
+                Err(err) => return ConformanceResponse::serialize_err(err.to_string()),
+            };
+            let buffa_pool_out =
+                match buffa_codec::encode_buffa(&buffa_msg, &buffa_types::DESCRIPTOR_POOL, opts) {
+                    Ok(b) => b,
+                    Err(err) => return ConformanceResponse::serialize_err(err.to_string()),
+                };
+            let buffa_derive_out = match buffa_derived.encode_omnibuf_with_options(opts) {
+                Ok(b) => b,
+                Err(err) => return ConformanceResponse::serialize_err(err.to_string()),
+            };
+            if buffa_refl_out != out || buffa_pool_out != out || buffa_derive_out != out {
+                return ConformanceResponse::runtime_err(
+                    "buffa TestAllTypes OmniBuf output diverged from prost output",
+                );
             }
+            ConformanceResponse::wire(out)
         }
 
         _ => ConformanceResponse::skipped_reason(
@@ -928,7 +1098,7 @@ fn handle_annotated_struct_tier(req: &ConformanceRequest) -> ConformanceResponse
                     flag: false,
                     score: 0,
                 }],
-                f12_map_str_uint: HashMap::from([("stale".to_owned(), 999)]),
+                f12_map_str_uint: [("stale".to_owned(), 999)].into_iter().collect(),
                 f20_overflow_str: "stale-overflow".to_owned(),
                 ..AnnotatedTestAllTypes::default()
             };
@@ -948,5 +1118,150 @@ fn round_trip_annotated<M: Message>(
     match msg.encode_omnibuf_with_options(opts) {
         Ok(out) => ConformanceResponse::wire(out),
         Err(err) => ConformanceResponse::serialize_err(err.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod buffa_integration_tests {
+    use super::*;
+    use buffa::MessageView as _;
+    use omnibuf::{DecodeOptions, decode_blind_json, from_slice, to_vec_with_options};
+
+    mod buffa_extra {
+        include!(concat!(env!("OUT_DIR"), "/buffa_extra/mod.rs"));
+    }
+
+    #[test]
+    fn buffa_tree_node_and_nested_cluster_roundtrip_and_self_describing_schema() {
+        use buffa_extra::omnibuf::extra::{
+            NestedCluster, NestedNIC, NestedRack, NestedServer, NodeRole, RouteEvent, TreeNode,
+            TreeNodeView, route_event,
+        };
+
+        let pool = buffa_extra::omnibuf::extra::__buffa::reflect::descriptor_pool();
+
+        // 1. Recursive TreeNode (tests boxed recursive MessageField<TreeNode, Box<TreeNode>>,
+        //    children/branches Vec<TreeNode>, map<string, uint64>, and 1-level cycle leaf in Field #0)
+        let tree = TreeNode {
+            id: 1,
+            name: "root-spine".to_owned(),
+            weight: -500,
+            primary: buffa::MessageField::some(TreeNode {
+                id: 2,
+                name: "primary-leaf".to_owned(),
+                weight: 42,
+                primary: buffa::MessageField::some(TreeNode {
+                    id: 3,
+                    name: "grandchild-leaf".to_owned(),
+                    weight: -7,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            children: vec![TreeNode {
+                id: 4,
+                name: "child-a".to_owned(),
+                weight: 100,
+                ..Default::default()
+            }],
+            branches: vec![TreeNode {
+                id: 5,
+                name: "branch-b".to_owned(),
+                weight: -99,
+                ..Default::default()
+            }],
+            labels: [("tier".to_owned(), 1), ("asn".to_owned(), 64_512)]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+
+        let opts = EncodeOptions {
+            deterministic: true,
+            self_describing: true,
+        };
+        let wire_refl = buffa_codec::encode_buffa_reflect(&tree, opts).unwrap();
+        let wire_pool = buffa_codec::encode_buffa(&tree, pool, opts).unwrap();
+        let wire_derive = to_vec_with_options(&tree, opts).unwrap();
+        assert_eq!(wire_refl, wire_pool);
+        assert_eq!(wire_refl, wire_derive);
+
+        let decoded_buffa: TreeNode = buffa_codec::decode_buffa(&wire_refl, pool).unwrap();
+        assert_eq!(decoded_buffa, tree);
+        let decoded_derive: TreeNode = from_slice(&wire_derive).unwrap();
+        assert_eq!(decoded_derive, tree);
+
+        // Verify Field #0 1-level cycle leaf preserves child field names in decode_blind_json!
+        let blind_json = decode_blind_json(&wire_refl).unwrap();
+        assert!(blind_json.contains("\"root-spine\""));
+        assert!(blind_json.contains("\"primary-leaf\""));
+        assert!(blind_json.contains("\"child-a\""));
+        assert!(blind_json.contains("\"weight\":100"));
+
+        // Also verify zero-copy buffa TreeNodeView works on native Protobuf bytes
+        let pb_bytes = buffa::Message::encode_to_vec(&tree);
+        let view = TreeNodeView::decode_view(&pb_bytes).unwrap();
+        assert_eq!(view.name, "root-spine");
+        assert_eq!(view.primary.name, "primary-leaf");
+
+        // 2. 4-level NestedCluster round-trip across buffa_codec + #[derive(OmniBuf)]
+        let cluster = NestedCluster {
+            cluster_name: "fra-core-01".to_owned(),
+            racks: vec![NestedRack {
+                rack_id: 12,
+                zone: "eu-central-1a".to_owned(),
+                servers: vec![NestedServer {
+                    server_id: 101,
+                    hostname: "srv-fra-101".to_owned(),
+                    nics: vec![NestedNIC {
+                        if_index: 2,
+                        mac: "00:1a:2b:3c:4d:5e".to_owned(),
+                        ips: vec![0x0a00_0001, 0x0a00_0002],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            epoch: 1_700_000_000,
+            ..Default::default()
+        };
+
+        let cluster_wire = buffa_codec::encode_buffa_reflect(&cluster, opts).unwrap();
+        assert_eq!(cluster_wire, to_vec_with_options(&cluster, opts).unwrap());
+        let cluster_rt: NestedCluster = buffa_codec::decode_buffa(&cluster_wire, pool).unwrap();
+        assert_eq!(cluster_rt, cluster);
+
+        // 3. RouteEvent with EnumValue<NodeRole> + Vec<EnumValue<NodeRole>> + oneof payload
+        let ev_nic = RouteEvent {
+            role: buffa::EnumValue::from(NodeRole::NODE_ROLE_SPINE),
+            history: vec![
+                buffa::EnumValue::from(NodeRole::NODE_ROLE_LEAF),
+                buffa::EnumValue::Unknown(77),
+            ],
+            payload: Some(route_event::Payload::Nic(Box::new(NestedNIC {
+                if_index: 9,
+                mac: "aa:bb:cc:dd:ee:ff".to_owned(),
+                ips: vec![127_000_001],
+                ..Default::default()
+            }))),
+            ..Default::default()
+        };
+        let ev_wire = buffa_codec::encode_buffa_reflect(&ev_nic, opts).unwrap();
+        assert_eq!(ev_wire, to_vec_with_options(&ev_nic, opts).unwrap());
+        let ev_rt: RouteEvent = buffa_codec::decode_buffa(&ev_wire, pool).unwrap();
+        assert_eq!(ev_rt, ev_nic);
+        let ev_derive_rt: RouteEvent = from_slice(&ev_wire).unwrap();
+        assert_eq!(ev_derive_rt, ev_nic);
+
+        // Enforce DecodeOptions limits on buffa_codec::decode_buffa_with_options
+        let tight = DecodeOptions {
+            max_message_bytes: 4,
+            ..DecodeOptions::default()
+        };
+        assert!(
+            buffa_codec::decode_buffa_with_options::<NestedCluster>(&cluster_wire, pool, tight)
+                .is_err()
+        );
     }
 }

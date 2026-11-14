@@ -15,7 +15,7 @@ pub struct Location {
 impl Location {
     #[inline]
     pub fn marshal_omnibuf(&self) -> ::std::vec::Vec<u8> {
-        let mut dst = ::std::vec::Vec::with_capacity(512);
+        let mut dst = ::std::vec::Vec::with_capacity(128);
         self.marshal_omnibuf_append(&mut dst);
         dst
     }
@@ -32,6 +32,7 @@ impl Location {
 }
 
 impl ::omnibuf::Message for Location {
+    #[inline]
     fn encode_omnibuf_append(
         &self,
         dst: &mut ::std::vec::Vec<u8>,
@@ -47,6 +48,7 @@ impl ::omnibuf::Message for Location {
         ::core::result::Result::Ok(())
     }
 
+    #[inline]
     fn decode_omnibuf_at_depth(
         &mut self,
         data: &[u8],
@@ -54,59 +56,39 @@ impl ::omnibuf::Message for Location {
         merge: bool,
     ) -> ::omnibuf::Result<()> {
         let mut dec = ::omnibuf::Decoder::with_depth(data, depth)?;
-        let mut seen = [false; 6];
+        if !merge {
+            self.clear_omnibuf();
+        }
         while let ::core::option::Option::Some((fnum, wt)) = dec.next_tag()? {
             match fnum {
                 1 if wt == 10 => {
-                    seen[0] = true;
-                    self.region = dec.read_str()?.to_owned();
+                    let s = dec.read_str()?;
+                    ::omnibuf::codec::assign_str(&mut self.region, s);
                 }
                 2 if wt == 10 => {
-                    seen[1] = true;
-                    self.datacenter = dec.read_str()?.to_owned();
+                    let s = dec.read_str()?;
+                    ::omnibuf::codec::assign_str(&mut self.datacenter, s);
                 }
                 3 if wt == 10 => {
-                    seen[2] = true;
-                    self.city = dec.read_str()?.to_owned();
+                    let s = dec.read_str()?;
+                    ::omnibuf::codec::assign_str(&mut self.city, s);
                 }
                 4 if wt == 0 => {
-                    seen[3] = true;
                     self.rack = dec.read_uint()? as u32;
                 }
                 5 if wt == 8 => {
-                    seen[4] = true;
                     self.latitude = dec.read_float32()?;
                 }
                 6 if wt == 8 => {
-                    seen[5] = true;
                     self.longitude = dec.read_float32()?;
                 }
                 _ => dec.skip_unknown(fnum, wt)?,
             }
         }
-        if !merge {
-            if !seen[0] {
-                self.region.clear();
-            }
-            if !seen[1] {
-                self.datacenter.clear();
-            }
-            if !seen[2] {
-                self.city.clear();
-            }
-            if !seen[3] {
-                self.rack = ::core::default::Default::default();
-            }
-            if !seen[4] {
-                self.latitude = ::core::default::Default::default();
-            }
-            if !seen[5] {
-                self.longitude = ::core::default::Default::default();
-            }
-        }
         ::core::result::Result::Ok(())
     }
 
+    #[inline]
     fn clear_omnibuf(&mut self) {
         self.region.clear();
         self.datacenter.clear();
@@ -117,14 +99,13 @@ impl ::omnibuf::Message for Location {
     }
 
     fn build_schema_meta(
-        active: &mut ::std::collections::HashSet<&'static str>,
+        active: &mut ::std::collections::HashSet<::core::any::TypeId>,
         depth: usize,
     ) -> ::core::option::Option<::omnibuf::SchemaMeta> {
-        let type_key = ::core::any::type_name::<Self>();
-        if depth > ::omnibuf::MAX_NESTING_DEPTH || active.contains(type_key) {
+        if depth >= ::omnibuf::MAX_NESTING_DEPTH {
             return ::core::option::Option::None;
         }
-        active.insert(type_key);
+        let type_id = ::core::any::TypeId::of::<Self>();
         let mut meta = ::omnibuf::SchemaMeta {
             type_name: ::std::string::String::from("Location"),
             fields: ::std::collections::BTreeMap::new(),
@@ -139,7 +120,49 @@ impl ::omnibuf::Message for Location {
             .insert(5, ::std::string::String::from("latitude"));
         meta.fields
             .insert(6, ::std::string::String::from("longitude"));
-        active.remove(type_key);
+        if !active.insert(type_id) {
+            return ::core::option::Option::Some(meta);
+        }
+        active.remove(&type_id);
+        ::core::option::Option::Some(meta)
+    }
+
+    fn is_schema_cyclic(
+        active: &mut ::std::collections::HashSet<::core::any::TypeId>,
+        depth: usize,
+    ) -> bool {
+        if depth >= ::omnibuf::MAX_NESTING_DEPTH {
+            return false;
+        }
+        let type_id = ::core::any::TypeId::of::<Self>();
+        if !active.insert(type_id) {
+            return true;
+        }
+        active.remove(&type_id);
+        false
+    }
+
+    fn build_value_schema_meta(
+        &self,
+        depth: usize,
+    ) -> ::core::option::Option<::omnibuf::SchemaMeta> {
+        if depth >= ::omnibuf::MAX_NESTING_DEPTH {
+            return ::core::option::Option::None;
+        }
+        let mut meta = ::omnibuf::SchemaMeta {
+            type_name: ::std::string::String::from("Location"),
+            fields: ::std::collections::BTreeMap::new(),
+            children: ::std::collections::BTreeMap::new(),
+        };
+        meta.fields.insert(1, ::std::string::String::from("region"));
+        meta.fields
+            .insert(2, ::std::string::String::from("datacenter"));
+        meta.fields.insert(3, ::std::string::String::from("city"));
+        meta.fields.insert(4, ::std::string::String::from("rack"));
+        meta.fields
+            .insert(5, ::std::string::String::from("latitude"));
+        meta.fields
+            .insert(6, ::std::string::String::from("longitude"));
         ::core::option::Option::Some(meta)
     }
 }
@@ -155,7 +178,7 @@ struct OpaqueLocationHeap {
 #[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
 pub struct OpaqueLocation<'a> {
-    raw: ::std::borrow::Cow<'a, [u8]>,
+    pub(crate) raw: ::std::borrow::Cow<'a, [u8]>,
     dirty: u64,
     heap: ::core::option::Option<::std::boxed::Box<OpaqueLocationHeap>>,
     f_rack: u32,
@@ -174,6 +197,12 @@ impl<'a> OpaqueLocation<'a> {
     }
 
     #[inline]
+    pub fn try_new(raw: &'a [u8]) -> ::omnibuf::Result<Self> {
+        ::omnibuf::wire::validate_message(raw, 0)?;
+        ::core::result::Result::Ok(Self::new(raw))
+    }
+
+    #[inline]
     pub fn from_owned(raw: ::std::vec::Vec<u8>) -> OpaqueLocation<'static> {
         OpaqueLocation {
             raw: ::std::borrow::Cow::Owned(raw),
@@ -182,9 +211,27 @@ impl<'a> OpaqueLocation<'a> {
     }
 
     #[inline]
+    pub fn try_from_owned(raw: ::std::vec::Vec<u8>) -> ::omnibuf::Result<OpaqueLocation<'static>> {
+        ::omnibuf::wire::validate_message(&raw, 0)?;
+        ::core::result::Result::Ok(Self::from_owned(raw))
+    }
+
+    #[inline]
+    pub fn validate(&self) -> ::omnibuf::Result<()> {
+        ::omnibuf::wire::validate_message(&self.raw, 0)
+    }
+
+    #[inline]
     pub fn unmarshal(&mut self, raw: &'a [u8]) {
         self.raw = ::std::borrow::Cow::Borrowed(raw);
         self.dirty = 0;
+    }
+
+    #[inline]
+    pub fn try_unmarshal(&mut self, raw: &'a [u8]) -> ::omnibuf::Result<()> {
+        ::omnibuf::wire::validate_message(raw, 0)?;
+        self.unmarshal(raw);
+        ::core::result::Result::Ok(())
     }
 
     #[inline]
@@ -327,6 +374,57 @@ impl<'a> OpaqueLocation<'a> {
             }
         });
     }
+
+    #[inline]
+    pub fn try_marshal(&self) -> ::omnibuf::Result<::std::vec::Vec<u8>> {
+        let mut dst = ::std::vec::Vec::with_capacity(self.raw.len() + 32);
+        self.try_marshal_append(&mut dst)?;
+        ::core::result::Result::Ok(dst)
+    }
+
+    pub fn try_marshal_append(&self, dst: &mut ::std::vec::Vec<u8>) -> ::omnibuf::Result<()> {
+        if self.dirty == 0 {
+            return ::omnibuf::opaque::try_copy_packet(dst, &self.raw);
+        }
+        dst.clear();
+        ::omnibuf::opaque::try_splice_fields(dst, &self.raw, self.dirty, 6, |dst, fnum| {
+            let deterministic = true;
+            let _ = deterministic;
+            match fnum {
+                1 => {
+                    ::omnibuf::codec::write_string_field(
+                        dst,
+                        1,
+                        self.heap.as_deref().unwrap().f_region.as_str(),
+                    );
+                }
+                2 => {
+                    ::omnibuf::codec::write_string_field(
+                        dst,
+                        2,
+                        self.heap.as_deref().unwrap().f_datacenter.as_str(),
+                    );
+                }
+                3 => {
+                    ::omnibuf::codec::write_string_field(
+                        dst,
+                        3,
+                        self.heap.as_deref().unwrap().f_city.as_str(),
+                    );
+                }
+                4 => {
+                    ::omnibuf::codec::write_uint_field(dst, 4, u64::from(self.f_rack));
+                }
+                5 => {
+                    ::omnibuf::codec::write_float32_field(dst, 5, self.f_latitude);
+                }
+                6 => {
+                    ::omnibuf::codec::write_float32_field(dst, 6, self.f_longitude);
+                }
+                _ => {}
+            }
+        })
+    }
 }
 
 #[allow(dead_code)]
@@ -342,7 +440,7 @@ pub struct Neighbor {
 impl Neighbor {
     #[inline]
     pub fn marshal_omnibuf(&self) -> ::std::vec::Vec<u8> {
-        let mut dst = ::std::vec::Vec::with_capacity(512);
+        let mut dst = ::std::vec::Vec::with_capacity(128);
         self.marshal_omnibuf_append(&mut dst);
         dst
     }
@@ -359,6 +457,7 @@ impl Neighbor {
 }
 
 impl ::omnibuf::Message for Neighbor {
+    #[inline]
     fn encode_omnibuf_append(
         &self,
         dst: &mut ::std::vec::Vec<u8>,
@@ -372,6 +471,7 @@ impl ::omnibuf::Message for Neighbor {
         ::core::result::Result::Ok(())
     }
 
+    #[inline]
     fn decode_omnibuf_at_depth(
         &mut self,
         data: &[u8],
@@ -379,47 +479,33 @@ impl ::omnibuf::Message for Neighbor {
         merge: bool,
     ) -> ::omnibuf::Result<()> {
         let mut dec = ::omnibuf::Decoder::with_depth(data, depth)?;
-        let mut seen = [false; 4];
+        if !merge {
+            self.clear_omnibuf();
+        }
         while let ::core::option::Option::Some((fnum, wt)) = dec.next_tag()? {
             match fnum {
                 1 if wt == 0 => {
-                    seen[0] = true;
                     self.peer_asn = dec.read_uint()? as u32;
                 }
                 2 if wt == 10 => {
-                    seen[1] = true;
-                    self.router = dec.read_str()?.to_owned();
+                    let s = dec.read_str()?;
+                    ::omnibuf::codec::assign_str(&mut self.router, s);
                 }
                 3 if wt == 0 => {
-                    seen[2] = true;
                     self.latency_us = dec.read_uint()? as u32;
                 }
                 4 if wt == ::omnibuf::wire::WIRE_BOOL_FALSE
                     || wt == ::omnibuf::wire::WIRE_BOOL_TRUE =>
                 {
-                    seen[3] = true;
                     self.established = wt == ::omnibuf::wire::WIRE_BOOL_TRUE;
                 }
                 _ => dec.skip_unknown(fnum, wt)?,
             }
         }
-        if !merge {
-            if !seen[0] {
-                self.peer_asn = ::core::default::Default::default();
-            }
-            if !seen[1] {
-                self.router.clear();
-            }
-            if !seen[2] {
-                self.latency_us = ::core::default::Default::default();
-            }
-            if !seen[3] {
-                self.established = ::core::default::Default::default();
-            }
-        }
         ::core::result::Result::Ok(())
     }
 
+    #[inline]
     fn clear_omnibuf(&mut self) {
         self.peer_asn = ::core::default::Default::default();
         self.router.clear();
@@ -428,14 +514,13 @@ impl ::omnibuf::Message for Neighbor {
     }
 
     fn build_schema_meta(
-        active: &mut ::std::collections::HashSet<&'static str>,
+        active: &mut ::std::collections::HashSet<::core::any::TypeId>,
         depth: usize,
     ) -> ::core::option::Option<::omnibuf::SchemaMeta> {
-        let type_key = ::core::any::type_name::<Self>();
-        if depth > ::omnibuf::MAX_NESTING_DEPTH || active.contains(type_key) {
+        if depth >= ::omnibuf::MAX_NESTING_DEPTH {
             return ::core::option::Option::None;
         }
-        active.insert(type_key);
+        let type_id = ::core::any::TypeId::of::<Self>();
         let mut meta = ::omnibuf::SchemaMeta {
             type_name: ::std::string::String::from("Neighbor"),
             fields: ::std::collections::BTreeMap::new(),
@@ -448,7 +533,47 @@ impl ::omnibuf::Message for Neighbor {
             .insert(3, ::std::string::String::from("latency_us"));
         meta.fields
             .insert(4, ::std::string::String::from("established"));
-        active.remove(type_key);
+        if !active.insert(type_id) {
+            return ::core::option::Option::Some(meta);
+        }
+        active.remove(&type_id);
+        ::core::option::Option::Some(meta)
+    }
+
+    fn is_schema_cyclic(
+        active: &mut ::std::collections::HashSet<::core::any::TypeId>,
+        depth: usize,
+    ) -> bool {
+        if depth >= ::omnibuf::MAX_NESTING_DEPTH {
+            return false;
+        }
+        let type_id = ::core::any::TypeId::of::<Self>();
+        if !active.insert(type_id) {
+            return true;
+        }
+        active.remove(&type_id);
+        false
+    }
+
+    fn build_value_schema_meta(
+        &self,
+        depth: usize,
+    ) -> ::core::option::Option<::omnibuf::SchemaMeta> {
+        if depth >= ::omnibuf::MAX_NESTING_DEPTH {
+            return ::core::option::Option::None;
+        }
+        let mut meta = ::omnibuf::SchemaMeta {
+            type_name: ::std::string::String::from("Neighbor"),
+            fields: ::std::collections::BTreeMap::new(),
+            children: ::std::collections::BTreeMap::new(),
+        };
+        meta.fields
+            .insert(1, ::std::string::String::from("peer_asn"));
+        meta.fields.insert(2, ::std::string::String::from("router"));
+        meta.fields
+            .insert(3, ::std::string::String::from("latency_us"));
+        meta.fields
+            .insert(4, ::std::string::String::from("established"));
         ::core::option::Option::Some(meta)
     }
 }
@@ -462,7 +587,7 @@ struct OpaqueNeighborHeap {
 #[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
 pub struct OpaqueNeighbor<'a> {
-    raw: ::std::borrow::Cow<'a, [u8]>,
+    pub(crate) raw: ::std::borrow::Cow<'a, [u8]>,
     dirty: u64,
     heap: ::core::option::Option<::std::boxed::Box<OpaqueNeighborHeap>>,
     f_peer_asn: u32,
@@ -481,6 +606,12 @@ impl<'a> OpaqueNeighbor<'a> {
     }
 
     #[inline]
+    pub fn try_new(raw: &'a [u8]) -> ::omnibuf::Result<Self> {
+        ::omnibuf::wire::validate_message(raw, 0)?;
+        ::core::result::Result::Ok(Self::new(raw))
+    }
+
+    #[inline]
     pub fn from_owned(raw: ::std::vec::Vec<u8>) -> OpaqueNeighbor<'static> {
         OpaqueNeighbor {
             raw: ::std::borrow::Cow::Owned(raw),
@@ -489,9 +620,27 @@ impl<'a> OpaqueNeighbor<'a> {
     }
 
     #[inline]
+    pub fn try_from_owned(raw: ::std::vec::Vec<u8>) -> ::omnibuf::Result<OpaqueNeighbor<'static>> {
+        ::omnibuf::wire::validate_message(&raw, 0)?;
+        ::core::result::Result::Ok(Self::from_owned(raw))
+    }
+
+    #[inline]
+    pub fn validate(&self) -> ::omnibuf::Result<()> {
+        ::omnibuf::wire::validate_message(&self.raw, 0)
+    }
+
+    #[inline]
     pub fn unmarshal(&mut self, raw: &'a [u8]) {
         self.raw = ::std::borrow::Cow::Borrowed(raw);
         self.dirty = 0;
+    }
+
+    #[inline]
+    pub fn try_unmarshal(&mut self, raw: &'a [u8]) -> ::omnibuf::Result<()> {
+        ::omnibuf::wire::validate_message(raw, 0)?;
+        self.unmarshal(raw);
+        ::core::result::Result::Ok(())
     }
 
     #[inline]
@@ -594,6 +743,43 @@ impl<'a> OpaqueNeighbor<'a> {
             }
         });
     }
+
+    #[inline]
+    pub fn try_marshal(&self) -> ::omnibuf::Result<::std::vec::Vec<u8>> {
+        let mut dst = ::std::vec::Vec::with_capacity(self.raw.len() + 32);
+        self.try_marshal_append(&mut dst)?;
+        ::core::result::Result::Ok(dst)
+    }
+
+    pub fn try_marshal_append(&self, dst: &mut ::std::vec::Vec<u8>) -> ::omnibuf::Result<()> {
+        if self.dirty == 0 {
+            return ::omnibuf::opaque::try_copy_packet(dst, &self.raw);
+        }
+        dst.clear();
+        ::omnibuf::opaque::try_splice_fields(dst, &self.raw, self.dirty, 4, |dst, fnum| {
+            let deterministic = true;
+            let _ = deterministic;
+            match fnum {
+                1 => {
+                    ::omnibuf::codec::write_uint_field(dst, 1, u64::from(self.f_peer_asn));
+                }
+                2 => {
+                    ::omnibuf::codec::write_string_field(
+                        dst,
+                        2,
+                        self.heap.as_deref().unwrap().f_router.as_str(),
+                    );
+                }
+                3 => {
+                    ::omnibuf::codec::write_uint_field(dst, 3, u64::from(self.f_latency_us));
+                }
+                4 => {
+                    ::omnibuf::codec::write_bool_field(dst, 4, self.f_established);
+                }
+                _ => {}
+            }
+        })
+    }
 }
 
 #[allow(dead_code)]
@@ -616,7 +802,7 @@ pub struct PeerUpdate {
 impl PeerUpdate {
     #[inline]
     pub fn marshal_omnibuf(&self) -> ::std::vec::Vec<u8> {
-        let mut dst = ::std::vec::Vec::with_capacity(512);
+        let mut dst = ::std::vec::Vec::with_capacity(128);
         self.marshal_omnibuf_append(&mut dst);
         dst
     }
@@ -633,6 +819,7 @@ impl PeerUpdate {
 }
 
 impl ::omnibuf::Message for PeerUpdate {
+    #[inline]
     fn encode_omnibuf_append(
         &self,
         dst: &mut ::std::vec::Vec<u8>,
@@ -646,13 +833,11 @@ impl ::omnibuf::Message for PeerUpdate {
         ::omnibuf::codec::write_sint_field(dst, 5, i64::from(self.rssi_dbm));
         ::omnibuf::codec::write_float64_field(dst, 6, self.cpu_load);
         ::omnibuf::codec::write_scalar_vec_field(dst, 7, 10, &self.tags, |dst, item| {
-            ::omnibuf::wire::append_varint(dst, (item).len() as u64);
-            dst.extend_from_slice((item).as_bytes());
+            ::omnibuf::wire::append_bytes_elem(dst, (item).as_bytes());
             ::core::result::Result::Ok(())
         })?;
-        ::omnibuf::codec::write_scalar_vec_field(dst, 8, 0, &self.prefixes, |dst, item| {
-            ::omnibuf::wire::append_varint(dst, u64::from(*item));
-            ::core::result::Result::Ok(())
+        ::omnibuf::codec::write_varint_vec_field(dst, 8, 0, &self.prefixes, |item| {
+            u64::from(*item)
         })?;
         if let ::core::option::Option::Some(ref sub) = self.location {
             ::omnibuf::codec::write_sub_msg_field(dst, 9, sub, deterministic)?;
@@ -662,6 +847,7 @@ impl ::omnibuf::Message for PeerUpdate {
         ::core::result::Result::Ok(())
     }
 
+    #[inline]
     fn decode_omnibuf_at_depth(
         &mut self,
         data: &[u8],
@@ -669,38 +855,33 @@ impl ::omnibuf::Message for PeerUpdate {
         merge: bool,
     ) -> ::omnibuf::Result<()> {
         let mut dec = ::omnibuf::Decoder::with_depth(data, depth)?;
-        let mut seen = [false; 11];
+        if !merge {
+            self.clear_omnibuf();
+        }
         while let ::core::option::Option::Some((fnum, wt)) = dec.next_tag()? {
             match fnum {
                 1 if wt == 0 => {
-                    seen[0] = true;
                     self.asn = dec.read_uint()? as u32;
                 }
                 2 if wt == 10 => {
-                    seen[1] = true;
-                    self.router_id = dec.read_str()?.to_owned();
+                    let s = dec.read_str()?;
+                    ::omnibuf::codec::assign_str(&mut self.router_id, s);
                 }
                 3 if wt == ::omnibuf::wire::WIRE_BOOL_FALSE
                     || wt == ::omnibuf::wire::WIRE_BOOL_TRUE =>
                 {
-                    seen[2] = true;
                     self.active = wt == ::omnibuf::wire::WIRE_BOOL_TRUE;
                 }
                 4 if wt == 0 => {
-                    seen[3] = true;
                     self.uptime_sec = dec.read_uint()?;
                 }
                 5 if wt == 1 => {
-                    seen[4] = true;
                     self.rssi_dbm = dec.read_sint()? as i32;
                 }
                 6 if wt == 9 => {
-                    seen[5] = true;
                     self.cpu_load = dec.read_float64()?;
                 }
                 7 if wt == 13 => {
-                    let reset = !merge && !seen[6];
-                    seen[6] = true;
                     let pos = dec.position();
                     let next_pos = ::omnibuf::codec::read_scalar_vec_field(
                         &mut self.tags,
@@ -708,14 +889,12 @@ impl ::omnibuf::Message for PeerUpdate {
                         pos,
                         depth,
                         10,
-                        reset,
+                        false,
                         ::omnibuf::codec::read_elem_string,
                     )?;
                     dec.set_position(next_pos);
                 }
                 8 if wt == 13 => {
-                    let reset = !merge && !seen[7];
-                    seen[7] = true;
                     let pos = dec.position();
                     let next_pos = ::omnibuf::codec::read_scalar_vec_field(
                         &mut self.prefixes,
@@ -723,82 +902,43 @@ impl ::omnibuf::Message for PeerUpdate {
                         pos,
                         depth,
                         0,
-                        reset,
+                        false,
                         |b, p| ::omnibuf::codec::read_elem_uint(b, p).map(|(v, np)| (v as u32, np)),
                     )?;
                     dec.set_position(next_pos);
                 }
                 9 if wt == 12 => {
-                    let sub_merge = merge || seen[8];
-                    seen[8] = true;
                     let pos = dec.position();
                     let next_pos = ::omnibuf::codec::read_opt_sub_msg_field(
                         &mut self.location,
                         dec.data(),
                         pos,
                         depth,
-                        sub_merge,
+                        true,
                     )?;
                     dec.set_position(next_pos);
                 }
                 10 if wt == 13 => {
-                    let reset = !merge && !seen[9];
-                    seen[9] = true;
                     let pos = dec.position();
                     let next_pos = ::omnibuf::codec::read_sub_msg_vec_field(
                         &mut self.neighbors,
                         dec.data(),
                         pos,
                         depth,
-                        reset,
+                        false,
                     )?;
                     dec.set_position(next_pos);
                 }
                 11 if wt == 0 => {
-                    seen[10] = true;
                     self.sequence = dec.read_uint()?;
                 }
                 _ => dec.skip_unknown(fnum, wt)?,
             }
         }
-        if !merge {
-            if !seen[0] {
-                self.asn = ::core::default::Default::default();
-            }
-            if !seen[1] {
-                self.router_id.clear();
-            }
-            if !seen[2] {
-                self.active = ::core::default::Default::default();
-            }
-            if !seen[3] {
-                self.uptime_sec = ::core::default::Default::default();
-            }
-            if !seen[4] {
-                self.rssi_dbm = ::core::default::Default::default();
-            }
-            if !seen[5] {
-                self.cpu_load = ::core::default::Default::default();
-            }
-            if !seen[6] {
-                self.tags.clear();
-            }
-            if !seen[7] {
-                self.prefixes.clear();
-            }
-            if !seen[8] {
-                self.location = ::core::option::Option::None;
-            }
-            if !seen[9] {
-                self.neighbors.clear();
-            }
-            if !seen[10] {
-                self.sequence = ::core::default::Default::default();
-            }
-        }
         ::core::result::Result::Ok(())
     }
 
+    #[inline]
     fn clear_omnibuf(&mut self) {
         self.asn = ::core::default::Default::default();
         self.router_id.clear();
@@ -806,22 +946,29 @@ impl ::omnibuf::Message for PeerUpdate {
         self.uptime_sec = ::core::default::Default::default();
         self.rssi_dbm = ::core::default::Default::default();
         self.cpu_load = ::core::default::Default::default();
-        self.tags.clear();
-        self.prefixes.clear();
-        self.location = ::core::option::Option::None;
-        self.neighbors.clear();
+        if !self.tags.is_empty() {
+            self.tags.clear();
+        }
+        if !self.prefixes.is_empty() {
+            self.prefixes.clear();
+        }
+        if self.location.is_some() {
+            self.location = ::core::option::Option::None;
+        }
+        if !self.neighbors.is_empty() {
+            self.neighbors.clear();
+        }
         self.sequence = ::core::default::Default::default();
     }
 
     fn build_schema_meta(
-        active: &mut ::std::collections::HashSet<&'static str>,
+        active: &mut ::std::collections::HashSet<::core::any::TypeId>,
         depth: usize,
     ) -> ::core::option::Option<::omnibuf::SchemaMeta> {
-        let type_key = ::core::any::type_name::<Self>();
-        if depth > ::omnibuf::MAX_NESTING_DEPTH || active.contains(type_key) {
+        if depth >= ::omnibuf::MAX_NESTING_DEPTH {
             return ::core::option::Option::None;
         }
-        active.insert(type_key);
+        let type_id = ::core::any::TypeId::of::<Self>();
         let mut meta = ::omnibuf::SchemaMeta {
             type_name: ::std::string::String::from("PeerUpdate"),
             fields: ::std::collections::BTreeMap::new(),
@@ -842,21 +989,103 @@ impl ::omnibuf::Message for PeerUpdate {
             .insert(8, ::std::string::String::from("prefixes"));
         meta.fields
             .insert(9, ::std::string::String::from("location"));
+        meta.fields
+            .insert(10, ::std::string::String::from("neighbors"));
+        meta.fields
+            .insert(11, ::std::string::String::from("sequence"));
+        if !active.insert(type_id) {
+            return ::core::option::Option::Some(meta);
+        }
         if let ::core::option::Option::Some(c) =
-            <Location as ::omnibuf::Message>::build_schema_meta(active, depth + 1)
+            <Location as ::omnibuf::Message>::build_schema_meta(active, depth + 2)
         {
             meta.children.insert(9, c);
         }
-        meta.fields
-            .insert(10, ::std::string::String::from("neighbors"));
         if let ::core::option::Option::Some(c) =
             <Neighbor as ::omnibuf::Message>::build_schema_meta(active, depth + 2)
         {
             meta.children.insert(10, c);
         }
+        active.remove(&type_id);
+        ::core::option::Option::Some(meta)
+    }
+
+    fn is_schema_cyclic(
+        active: &mut ::std::collections::HashSet<::core::any::TypeId>,
+        depth: usize,
+    ) -> bool {
+        if depth >= ::omnibuf::MAX_NESTING_DEPTH {
+            return false;
+        }
+        let type_id = ::core::any::TypeId::of::<Self>();
+        if !active.insert(type_id) {
+            return true;
+        }
+        if <Location as ::omnibuf::Message>::is_schema_cyclic(active, depth + 2) {
+            active.remove(&type_id);
+            return true;
+        }
+        if <Neighbor as ::omnibuf::Message>::is_schema_cyclic(active, depth + 2) {
+            active.remove(&type_id);
+            return true;
+        }
+        active.remove(&type_id);
+        false
+    }
+
+    fn build_value_schema_meta(
+        &self,
+        depth: usize,
+    ) -> ::core::option::Option<::omnibuf::SchemaMeta> {
+        if depth >= ::omnibuf::MAX_NESTING_DEPTH {
+            return ::core::option::Option::None;
+        }
+        let mut meta = ::omnibuf::SchemaMeta {
+            type_name: ::std::string::String::from("PeerUpdate"),
+            fields: ::std::collections::BTreeMap::new(),
+            children: ::std::collections::BTreeMap::new(),
+        };
+        meta.fields.insert(1, ::std::string::String::from("asn"));
+        meta.fields
+            .insert(2, ::std::string::String::from("router_id"));
+        meta.fields.insert(3, ::std::string::String::from("active"));
+        meta.fields
+            .insert(4, ::std::string::String::from("uptime_sec"));
+        meta.fields
+            .insert(5, ::std::string::String::from("rssi_dbm"));
+        meta.fields
+            .insert(6, ::std::string::String::from("cpu_load"));
+        meta.fields.insert(7, ::std::string::String::from("tags"));
+        meta.fields
+            .insert(8, ::std::string::String::from("prefixes"));
+        meta.fields
+            .insert(9, ::std::string::String::from("location"));
+        meta.fields
+            .insert(10, ::std::string::String::from("neighbors"));
         meta.fields
             .insert(11, ::std::string::String::from("sequence"));
-        active.remove(type_key);
+        if depth + 2 < ::omnibuf::MAX_NESTING_DEPTH {
+            if let ::core::option::Option::Some(ref __sub) = self.location
+                && let ::core::option::Option::Some(__c) =
+                    <Location as ::omnibuf::Message>::build_value_schema_meta(__sub, depth + 2)
+            {
+                meta.children.insert(9, __c);
+            }
+            if !self.neighbors.is_empty() {
+                let mut __ch = ::core::option::Option::None;
+                for __el in &self.neighbors {
+                    if let ::core::option::Option::Some(__cm) =
+                        <Neighbor as ::omnibuf::Message>::build_value_schema_meta(__el, depth + 2)
+                    {
+                        __ch =
+                            ::core::option::Option::Some(::omnibuf::merge_schema_meta(__ch, __cm));
+                    }
+                }
+                if let ::core::option::Option::Some(__c) = __ch {
+                    meta.children.insert(10, __c);
+                }
+            }
+        }
         ::core::option::Option::Some(meta)
     }
 }
@@ -874,7 +1103,7 @@ struct OpaquePeerUpdateHeap {
 #[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
 pub struct OpaquePeerUpdate<'a> {
-    raw: ::std::borrow::Cow<'a, [u8]>,
+    pub(crate) raw: ::std::borrow::Cow<'a, [u8]>,
     dirty: u64,
     heap: ::core::option::Option<::std::boxed::Box<OpaquePeerUpdateHeap>>,
     f_asn: u32,
@@ -896,6 +1125,12 @@ impl<'a> OpaquePeerUpdate<'a> {
     }
 
     #[inline]
+    pub fn try_new(raw: &'a [u8]) -> ::omnibuf::Result<Self> {
+        ::omnibuf::wire::validate_message(raw, 0)?;
+        ::core::result::Result::Ok(Self::new(raw))
+    }
+
+    #[inline]
     pub fn from_owned(raw: ::std::vec::Vec<u8>) -> OpaquePeerUpdate<'static> {
         OpaquePeerUpdate {
             raw: ::std::borrow::Cow::Owned(raw),
@@ -904,9 +1139,29 @@ impl<'a> OpaquePeerUpdate<'a> {
     }
 
     #[inline]
+    pub fn try_from_owned(
+        raw: ::std::vec::Vec<u8>,
+    ) -> ::omnibuf::Result<OpaquePeerUpdate<'static>> {
+        ::omnibuf::wire::validate_message(&raw, 0)?;
+        ::core::result::Result::Ok(Self::from_owned(raw))
+    }
+
+    #[inline]
+    pub fn validate(&self) -> ::omnibuf::Result<()> {
+        ::omnibuf::wire::validate_message(&self.raw, 0)
+    }
+
+    #[inline]
     pub fn unmarshal(&mut self, raw: &'a [u8]) {
         self.raw = ::std::borrow::Cow::Borrowed(raw);
         self.dirty = 0;
+    }
+
+    #[inline]
+    pub fn try_unmarshal(&mut self, raw: &'a [u8]) -> ::omnibuf::Result<()> {
+        ::omnibuf::wire::validate_message(raw, 0)?;
+        self.unmarshal(raw);
+        ::core::result::Result::Ok(())
     }
 
     #[inline]
@@ -1031,7 +1286,7 @@ impl<'a> OpaquePeerUpdate<'a> {
             if e != 10 {
                 return ::std::vec::Vec::new();
             }
-            out.reserve(count);
+            out.reserve(count.min(4096));
             let b = body;
             for _ in 0..count {
                 let ::core::result::Result::Ok((val, np)) =
@@ -1087,7 +1342,7 @@ impl<'a> OpaquePeerUpdate<'a> {
             if e != 0 {
                 return ::std::vec::Vec::new();
             }
-            out.reserve(count);
+            out.reserve(count.min(4096));
             let b = body;
             for _ in 0..count {
                 let ::core::result::Result::Ok((val, np)) =
@@ -1120,10 +1375,12 @@ impl<'a> OpaquePeerUpdate<'a> {
             return OpaqueLocation::new(&[]);
         }
         match ::omnibuf::wire::read_sub_msg(&self.raw, 9) {
-            ::core::option::Option::Some(cow) => OpaqueLocation {
-                raw: cow,
-                ..OpaqueLocation::default()
-            },
+            ::core::option::Option::Some(::std::borrow::Cow::Borrowed(slice)) => {
+                OpaqueLocation::new(slice)
+            }
+            ::core::option::Option::Some(::std::borrow::Cow::Owned(vec)) => {
+                OpaqueLocation::from_owned(vec)
+            }
             ::core::option::Option::None => OpaqueLocation::new(&[]),
         }
     }
@@ -1219,23 +1476,19 @@ impl<'a> OpaquePeerUpdate<'a> {
                         10,
                         &self.heap.as_deref().unwrap().f_tags,
                         |dst, item| {
-                            ::omnibuf::wire::append_varint(dst, (item).len() as u64);
-                            dst.extend_from_slice((item).as_bytes());
+                            ::omnibuf::wire::append_bytes_elem(dst, (item).as_bytes());
                             ::core::result::Result::Ok(())
                         },
                     )
                     .unwrap();
                 }
                 8 => {
-                    ::omnibuf::codec::write_scalar_vec_field(
+                    ::omnibuf::codec::write_varint_vec_field(
                         dst,
                         8,
                         0,
                         &self.heap.as_deref().unwrap().f_prefixes,
-                        |dst, item| {
-                            ::omnibuf::wire::append_varint(dst, u64::from(*item));
-                            ::core::result::Result::Ok(())
-                        },
+                        |item| u64::from(*item),
                     )
                     .unwrap();
                 }
@@ -1261,5 +1514,90 @@ impl<'a> OpaquePeerUpdate<'a> {
                 _ => {}
             }
         });
+    }
+
+    #[inline]
+    pub fn try_marshal(&self) -> ::omnibuf::Result<::std::vec::Vec<u8>> {
+        let mut dst = ::std::vec::Vec::with_capacity(self.raw.len() + 32);
+        self.try_marshal_append(&mut dst)?;
+        ::core::result::Result::Ok(dst)
+    }
+
+    pub fn try_marshal_append(&self, dst: &mut ::std::vec::Vec<u8>) -> ::omnibuf::Result<()> {
+        if self.dirty == 0 {
+            return ::omnibuf::opaque::try_copy_packet(dst, &self.raw);
+        }
+        dst.clear();
+        ::omnibuf::opaque::try_splice_fields(dst, &self.raw, self.dirty, 11, |dst, fnum| {
+            let deterministic = true;
+            let _ = deterministic;
+            match fnum {
+                1 => {
+                    ::omnibuf::codec::write_uint_field(dst, 1, u64::from(self.f_asn));
+                }
+                2 => {
+                    ::omnibuf::codec::write_string_field(
+                        dst,
+                        2,
+                        self.heap.as_deref().unwrap().f_router_id.as_str(),
+                    );
+                }
+                3 => {
+                    ::omnibuf::codec::write_bool_field(dst, 3, self.f_active);
+                }
+                4 => {
+                    ::omnibuf::codec::write_uint_field(dst, 4, self.f_uptime_sec);
+                }
+                5 => {
+                    ::omnibuf::codec::write_sint_field(dst, 5, i64::from(self.f_rssi_dbm));
+                }
+                6 => {
+                    ::omnibuf::codec::write_float64_field(dst, 6, self.f_cpu_load);
+                }
+                7 => {
+                    ::omnibuf::codec::write_scalar_vec_field(
+                        dst,
+                        7,
+                        10,
+                        &self.heap.as_deref().unwrap().f_tags,
+                        |dst, item| {
+                            ::omnibuf::wire::append_bytes_elem(dst, (item).as_bytes());
+                            ::core::result::Result::Ok(())
+                        },
+                    )
+                    .unwrap();
+                }
+                8 => {
+                    ::omnibuf::codec::write_varint_vec_field(
+                        dst,
+                        8,
+                        0,
+                        &self.heap.as_deref().unwrap().f_prefixes,
+                        |item| u64::from(*item),
+                    )
+                    .unwrap();
+                }
+                9 => {
+                    if let ::core::option::Option::Some(ref sub) =
+                        self.heap.as_deref().unwrap().f_location
+                    {
+                        ::omnibuf::codec::write_sub_msg_field(dst, 9, sub, deterministic).unwrap();
+                    }
+                }
+                10 => {
+                    ::omnibuf::codec::write_sub_msg_vec_field(
+                        dst,
+                        10,
+                        &self.heap.as_deref().unwrap().f_neighbors,
+                        deterministic,
+                    )
+                    .unwrap();
+                }
+                11 => {
+                    ::omnibuf::codec::write_uint_field(dst, 11, self.f_sequence);
+                }
+                _ => {}
+            }
+        })
     }
 }

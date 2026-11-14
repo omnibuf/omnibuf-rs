@@ -57,37 +57,133 @@ pub const fn decode_zigzag(u: u64) -> i64 {
     ((u >> 1) as i64) ^ -((u & 1) as i64)
 }
 
-/// Appends a Prefix-Varint to `dst`.
-#[inline]
-pub fn append_varint(dst: &mut Vec<u8>, v: u64) {
-    if v <= 127 {
-        dst.push(((v as u8) << 1) | 1);
-    } else {
-        append_varint_multi(dst, v);
+/// Encodes `v` as a Prefix-Varint directly at `ptr`, returning the byte width (1, 2, 4, or 9).
+///
+/// # Safety
+/// `ptr` must be valid for writes of at least 9 bytes.
+#[inline(always)]
+pub(crate) unsafe fn put_varint_raw(ptr: *mut u8, v: u64) -> usize {
+    unsafe {
+        if v <= 127 {
+            *ptr = ((v as u8) << 1) | 1;
+            1
+        } else if v <= 16_383 {
+            let u = ((v as u16) << 2) | 2;
+            core::ptr::copy_nonoverlapping(u.to_le_bytes().as_ptr(), ptr, 2);
+            2
+        } else if v <= 536_870_911 {
+            let u = ((v as u32) << 3) | 4;
+            core::ptr::copy_nonoverlapping(u.to_le_bytes().as_ptr(), ptr, 4);
+            4
+        } else {
+            *ptr = 0x00;
+            core::ptr::copy_nonoverlapping(v.to_le_bytes().as_ptr(), ptr.add(1), 8);
+            9
+        }
     }
 }
 
-#[cold]
-#[inline(never)]
-fn append_varint_multi(dst: &mut Vec<u8>, v: u64) {
-    if v <= 16_383 {
-        let u = ((v as u16) << 2) | 2;
-        dst.extend_from_slice(&u.to_le_bytes());
-    } else if v <= 536_870_911 {
-        let u = ((v as u32) << 3) | 4;
-        dst.extend_from_slice(&u.to_le_bytes());
-    } else {
-        dst.reserve(9);
-        dst.push(0x00);
-        dst.extend_from_slice(&v.to_le_bytes());
+/// Appends a Prefix-Varint to `dst`.
+#[inline(always)]
+pub fn append_varint(dst: &mut Vec<u8>, v: u64) {
+    dst.reserve(9);
+    unsafe {
+        let len = dst.len();
+        let vn = put_varint_raw(dst.as_mut_ptr().add(len), v);
+        dst.set_len(len + vn);
     }
 }
 
 /// Appends a field tag `(field_num << 4) | wire_type` as a Prefix-Varint.
-#[inline]
+#[inline(always)]
 pub fn append_tag(dst: &mut Vec<u8>, field_num: u32, wire_type: u8) {
     let tag = (u64::from(field_num) << 4) | u64::from(wire_type & 0x0F);
     append_varint(dst, tag);
+}
+
+/// Appends a pre-encoded tag followed by a Prefix-Varint payload in a single capacity check.
+#[inline(always)]
+pub fn write_varint_tagged<const N: usize>(dst: &mut Vec<u8>, tag: [u8; N], v: u64) {
+    const {
+        assert!(N <= 16);
+    }
+    dst.reserve(N + 9);
+    unsafe {
+        let len = dst.len();
+        let ptr = dst.as_mut_ptr().add(len);
+        core::ptr::copy_nonoverlapping(tag.as_ptr(), ptr, N);
+        let vn = put_varint_raw(ptr.add(N), v);
+        dst.set_len(len + N + vn);
+    }
+}
+
+/// Appends a pre-encoded boolean tag (`tag_false` or `tag_true`).
+#[inline(always)]
+pub fn write_bool_tagged<const N: usize>(
+    dst: &mut Vec<u8>,
+    tag_false: [u8; N],
+    tag_true: [u8; N],
+    v: bool,
+) {
+    const {
+        assert!(N <= 16);
+    }
+    let tag = if v { tag_true } else { tag_false };
+    dst.extend_from_slice(&tag);
+}
+
+/// Appends a pre-encoded tag followed by a fixed-width little-endian payload in a single capacity check.
+#[inline(always)]
+pub fn write_fixed_tagged<const N: usize, const W: usize>(
+    dst: &mut Vec<u8>,
+    tag: [u8; N],
+    val: [u8; W],
+) {
+    const {
+        assert!(N <= 16 && W <= 16);
+    }
+    dst.reserve(N + W);
+    unsafe {
+        let len = dst.len();
+        let ptr = dst.as_mut_ptr().add(len);
+        core::ptr::copy_nonoverlapping(tag.as_ptr(), ptr, N);
+        core::ptr::copy_nonoverlapping(val.as_ptr(), ptr.add(N), W);
+        dst.set_len(len + N + W);
+    }
+}
+
+/// Appends a pre-encoded tag followed by a length-prefixed byte or UTF-8 slice in a single capacity check.
+#[inline(always)]
+pub fn write_bytes_tagged<const N: usize>(dst: &mut Vec<u8>, tag: [u8; N], b: &[u8]) {
+    const {
+        assert!(N <= 16);
+    }
+    let blen = b.len();
+    let needed = blen.checked_add(N + 9).expect("capacity overflow");
+    dst.reserve(needed);
+    unsafe {
+        let len = dst.len();
+        let ptr = dst.as_mut_ptr().add(len);
+        core::ptr::copy_nonoverlapping(tag.as_ptr(), ptr, N);
+        let vn = put_varint_raw(ptr.add(N), blen as u64);
+        core::ptr::copy_nonoverlapping(b.as_ptr(), ptr.add(N + vn), blen);
+        dst.set_len(len + N + vn + blen);
+    }
+}
+
+/// Appends an untagged length-prefixed byte or UTF-8 slice in a single capacity check.
+#[inline(always)]
+pub fn append_bytes_elem(dst: &mut Vec<u8>, b: &[u8]) {
+    let blen = b.len();
+    let needed = blen.checked_add(9).expect("capacity overflow");
+    dst.reserve(needed);
+    unsafe {
+        let len = dst.len();
+        let ptr = dst.as_mut_ptr().add(len);
+        let vn = put_varint_raw(ptr, blen as u64);
+        core::ptr::copy_nonoverlapping(b.as_ptr(), ptr.add(vn), blen);
+        dst.set_len(len + vn + blen);
+    }
 }
 
 /// Decodes a Prefix-Varint from `b` using `u8::trailing_zeros()` (`TZCNT` / `CTZ`).
@@ -118,6 +214,10 @@ pub fn decode_varint(b: &[u8]) -> Option<(u64, usize)> {
 /// Encodes `v` (`0..=16383`) as an explicit 2-byte Prefix-Varint at `dst[..2]`.
 #[inline]
 pub fn put_overlong_2b_varint(dst: &mut [u8], v: u16) {
+    assert!(
+        dst.len() >= 2 && v <= 16_383,
+        "put_overlong_2b_varint requires dst.len() >= 2 and v <= 16383"
+    );
     let encoded = (v << 2) | 2;
     dst[..2].copy_from_slice(&encoded.to_le_bytes());
 }
@@ -126,12 +226,17 @@ pub fn put_overlong_2b_varint(dst: &mut [u8], v: u16) {
 ///
 /// Payloads up to `16_383` bytes patch in place; larger payloads expand the length
 /// header to 4 or 9 bytes by shifting the container body forward.
-#[inline]
+#[inline(always)]
 pub fn backpatch_container_len(dst: &mut Vec<u8>, len_pos: usize) {
-    let sub_len = dst.len() - (len_pos + 2);
+    let Some(header_end) = len_pos.checked_add(2) else {
+        return;
+    };
+    let Some(sub_len) = dst.len().checked_sub(header_end) else {
+        return;
+    };
     if sub_len <= 16_383 {
         let u = ((sub_len as u16) << 2) | 2;
-        dst[len_pos..len_pos + 2].copy_from_slice(&u.to_le_bytes());
+        dst[len_pos..header_end].copy_from_slice(&u.to_le_bytes());
     } else {
         backpatch_large_container_len(dst, len_pos, sub_len);
     }
@@ -158,6 +263,7 @@ fn backpatch_large_container_len(dst: &mut Vec<u8>, len_pos: usize, sub_len: usi
 /// Fills a 1-byte reserved varint slot at `dst[pos]` and expands it if `value > 127`.
 #[inline]
 pub fn patch_reserved_varint(dst: &mut Vec<u8>, pos: usize, value: u64) {
+    assert!(pos < dst.len(), "patch_reserved_varint pos out of bounds");
     if value <= 127 {
         dst[pos] = ((value as u8) << 1) | 1;
         return;
@@ -199,41 +305,67 @@ pub fn grow_capacity(current: usize, required: usize) -> usize {
     required
 }
 
-/// Checks whether `b` is valid UTF-8 with a fast word-scan path for short ASCII strings.
-#[inline]
+/// Checks whether `b` is valid UTF-8 with a branch-light word-scan path for short ASCII strings.
+#[inline(always)]
 pub fn validate_utf8(b: &[u8]) -> Result<&str> {
     let n = b.len();
-    if (8..=64).contains(&n) {
-        let mut bits = 0u64;
-        let mut i = 0;
-        while i + 8 < n {
-            let word = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-            bits |= word;
-            i += 8;
+    if n == 0 {
+        return Ok("");
+    }
+    if n <= 16 {
+        if n >= 8 {
+            let lo = u64::from_le_bytes(b[..8].try_into().unwrap());
+            let hi = u64::from_le_bytes(b[n - 8..n].try_into().unwrap());
+            if ((lo | hi) & 0x8080_8080_8080_8080) == 0 {
+                // SAFETY: Every byte has its high bit clear (0x00..=0x7F), which is valid ASCII/UTF-8.
+                return Ok(unsafe { core::str::from_utf8_unchecked(b) });
+            }
+        } else if n >= 4 {
+            let lo = u32::from_le_bytes(b[..4].try_into().unwrap());
+            let hi = u32::from_le_bytes(b[n - 4..n].try_into().unwrap());
+            if ((lo | hi) & 0x8080_8080) == 0 {
+                // SAFETY: Every byte has its high bit clear (0x00..=0x7F).
+                return Ok(unsafe { core::str::from_utf8_unchecked(b) });
+            }
+        } else {
+            let bits = b[0] | b[n >> 1] | b[n - 1];
+            if bits < 0x80 {
+                // SAFETY: Every byte is ASCII (< 0x80).
+                return Ok(unsafe { core::str::from_utf8_unchecked(b) });
+            }
         }
-        let tail = u64::from_le_bytes(b[n - 8..n].try_into().unwrap());
-        bits |= tail;
+    } else if n <= 32 {
+        let w0 = u64::from_le_bytes(b[..8].try_into().unwrap());
+        let w1 = u64::from_le_bytes(b[8..16].try_into().unwrap());
+        let w2 = u64::from_le_bytes(b[n - 16..n - 8].try_into().unwrap());
+        let w3 = u64::from_le_bytes(b[n - 8..n].try_into().unwrap());
+        if ((w0 | w1 | w2 | w3) & 0x8080_8080_8080_8080) == 0 {
+            // SAFETY: Every byte in 0..n has its high bit clear (0x00..=0x7F).
+            return Ok(unsafe { core::str::from_utf8_unchecked(b) });
+        }
+    } else if n <= 64 {
+        let w0 = u64::from_le_bytes(b[..8].try_into().unwrap());
+        let w1 = u64::from_le_bytes(b[8..16].try_into().unwrap());
+        let w2 = u64::from_le_bytes(b[16..24].try_into().unwrap());
+        let w3 = u64::from_le_bytes(b[24..32].try_into().unwrap());
+        let mut bits = w0 | w1 | w2 | w3;
+        if n > 48 {
+            bits |= u64::from_le_bytes(b[32..40].try_into().unwrap())
+                | u64::from_le_bytes(b[40..48].try_into().unwrap());
+        }
+        bits |= u64::from_le_bytes(b[n - 16..n - 8].try_into().unwrap())
+            | u64::from_le_bytes(b[n - 8..n].try_into().unwrap());
         if (bits & 0x8080_8080_8080_8080) == 0 {
-            // SAFETY: Every byte has its high bit clear (0x00..=0x7F), which is valid ASCII/UTF-8.
-            return Ok(unsafe { core::str::from_utf8_unchecked(b) });
-        }
-    } else if (4..8).contains(&n) {
-        let lo = u32::from_le_bytes(b[..4].try_into().unwrap());
-        let hi = u32::from_le_bytes(b[n - 4..n].try_into().unwrap());
-        if ((lo | hi) & 0x8080_8080) == 0 {
-            // SAFETY: Every byte has its high bit clear (0x00..=0x7F).
-            return Ok(unsafe { core::str::from_utf8_unchecked(b) });
-        }
-    } else if n < 4 {
-        let mut bits = 0u8;
-        for &byte in b {
-            bits |= byte;
-        }
-        if bits < 0x80 {
-            // SAFETY: Every byte is ASCII (< 0x80).
+            // SAFETY: Every byte in 0..n has its high bit clear (0x00..=0x7F).
             return Ok(unsafe { core::str::from_utf8_unchecked(b) });
         }
     }
+    validate_utf8_slow(b)
+}
+
+#[cold]
+#[inline(never)]
+fn validate_utf8_slow(b: &[u8]) -> Result<&str> {
     core::str::from_utf8(b).map_err(|_| Error::InvalidUtf8)
 }
 
@@ -271,7 +403,12 @@ pub fn parse_array_header(body: &[u8]) -> Option<(u8, usize, usize)> {
     if elem > WIRE_EXTENDED || elem == WIRE_BOOL_TRUE {
         return None;
     }
-    let (count_u64, n) = decode_varint(&body[1..])?;
+    let b1 = body[1];
+    let (count_u64, n) = if (b1 & 1) != 0 {
+        (u64::from(b1 >> 1), 1)
+    } else {
+        decode_varint(&body[1..])?
+    };
     let pos = 1 + n;
     let remaining = body.len().checked_sub(pos)?;
     let count = usize::try_from(count_u64).ok()?;
@@ -302,7 +439,12 @@ pub fn parse_map_header(body: &[u8]) -> Option<(u8, u8, usize, usize)> {
     if !is_valid_map_key_wire_type(key_wt) || !is_valid_map_val_wire_type(val_wt) {
         return None;
     }
-    let (count_u64, n) = decode_varint(&body[2..])?;
+    let b2 = body[2];
+    let (count_u64, n) = if (b2 & 1) != 0 {
+        (u64::from(b2 >> 1), 1)
+    } else {
+        decode_varint(&body[2..])?
+    };
     let pos = 2 + n;
     let remaining = body.len().checked_sub(pos)?;
     let count = usize::try_from(count_u64).ok()?;
@@ -314,13 +456,78 @@ pub fn parse_map_header(body: &[u8]) -> Option<(u8, u8, usize, usize)> {
 
 #[cold]
 #[inline(never)]
-fn cold_parse_err(msg: &'static str) -> Error {
+pub(crate) fn cold_parse_err(msg: &'static str) -> Error {
     Error::parse(msg)
 }
 
+/// Decodes a Prefix-Varint starting at `data[pos]`, returning `(value, next_pos)`.
+#[inline(always)]
+pub fn read_varint_at(data: &[u8], pos: usize) -> Result<(u64, usize)> {
+    let n = data.len();
+    if pos >= n {
+        return Err(cold_parse_err("truncated varint"));
+    }
+    let b0 = data[pos];
+    if (b0 & 1) != 0 {
+        return Ok((u64::from(b0 >> 1), pos + 1));
+    }
+    if (b0 & 2) != 0 {
+        if pos + 2 <= n {
+            let raw: [u8; 2] = data[pos..pos + 2].try_into().unwrap();
+            return Ok((u64::from(u16::from_le_bytes(raw) >> 2), pos + 2));
+        }
+        return Err(cold_parse_err("truncated 2-byte varint"));
+    }
+    if (b0 & 4) != 0 {
+        if pos + 4 <= n {
+            let raw: [u8; 4] = data[pos..pos + 4].try_into().unwrap();
+            return Ok((u64::from(u32::from_le_bytes(raw) >> 3), pos + 4));
+        }
+        return Err(cold_parse_err("truncated 4-byte varint"));
+    }
+    if b0 == 0 {
+        if pos + 9 <= n {
+            let raw: [u8; 8] = data[pos + 1..pos + 9].try_into().unwrap();
+            return Ok((u64::from_le_bytes(raw), pos + 9));
+        }
+        return Err(cold_parse_err("truncated 9-byte varint"));
+    }
+    Err(cold_parse_err("invalid varint marker"))
+}
+
 /// Reads a length-prefixed sub-slice starting at `data[pos]` with `byte_len >= min_len`.
-#[inline]
+#[inline(always)]
 pub fn read_len_slice(data: &[u8], pos: usize, min_len: usize) -> Result<(&[u8], usize)> {
+    let n = data.len();
+    if pos >= n {
+        return Err(cold_parse_err("position out of bounds"));
+    }
+    let b0 = data[pos];
+    if (b0 & 1) != 0 {
+        let len = usize::from(b0 >> 1);
+        let start = pos + 1;
+        if len >= min_len && len <= n - start {
+            let end = start + len;
+            return Ok((&data[start..end], end));
+        }
+        return Err(cold_parse_err("invalid container byteLen"));
+    }
+    if (b0 & 2) != 0 && pos + 2 <= n {
+        let raw: [u8; 2] = data[pos..pos + 2].try_into().unwrap();
+        let len = usize::from(u16::from_le_bytes(raw) >> 2);
+        let start = pos + 2;
+        if len >= min_len && len <= n - start {
+            let end = start + len;
+            return Ok((&data[start..end], end));
+        }
+        return Err(cold_parse_err("invalid container byteLen"));
+    }
+    read_len_slice_slow(data, pos, min_len)
+}
+
+#[cold]
+#[inline(never)]
+fn read_len_slice_slow(data: &[u8], pos: usize, min_len: usize) -> Result<(&[u8], usize)> {
     let rem = data
         .get(pos..)
         .ok_or_else(|| cold_parse_err("position out of bounds"))?;
@@ -336,7 +543,7 @@ pub fn read_len_slice(data: &[u8], pos: usize, min_len: usize) -> Result<(&[u8],
 }
 
 /// Reads a `WireString` length-prefixed UTF-8 slice starting at `data[pos]`.
-#[inline]
+#[inline(always)]
 pub fn read_str_slice(data: &[u8], pos: usize) -> Result<(&str, usize)> {
     let (bytes, next_pos) = read_len_slice(data, pos, 0)?;
     let s = validate_utf8(bytes)?;
@@ -398,33 +605,31 @@ fn skip_large_container(packet: &[u8], pos: usize) -> Option<usize> {
     (end <= packet.len()).then_some(end)
 }
 
-/// Advances `pos` past a single field value, validating top-level container headers in O(1) time.
-pub fn skip_value(b: &[u8], pos: usize, wire_type: u8) -> Result<usize> {
-    if pos > b.len() {
-        return Err(Error::parse(format!("position {pos} out of bounds")));
-    }
+/// Zero-allocation O(1) field skipper that also validates `WireArray` / `WireMap` / `WireExtended` headers.
+#[inline]
+pub fn skip_value_opt(b: &[u8], pos: usize, wire_type: u8) -> Option<usize> {
     if matches!(wire_type, WIRE_ARRAY | WIRE_MAP | WIRE_EXTENDED) {
-        let (body, end) = read_len_slice(b, pos, 1)?;
+        let (body, end) = read_len_slice(b, pos, 1).ok()?;
         match wire_type {
             WIRE_ARRAY => {
-                if parse_array_header(body).is_none() {
-                    return Err(Error::parse("invalid array header"));
-                }
+                parse_array_header(body)?;
             }
             WIRE_MAP => {
-                if parse_map_header(body).is_none() {
-                    return Err(Error::parse("invalid map header"));
-                }
+                parse_map_header(body)?;
             }
             _ => {}
         }
-        return Ok(end);
+        return Some(end);
     }
-    fast_skip_value(b, pos, wire_type).ok_or_else(|| {
-        Error::parse(format!(
-            "truncated or invalid wireType {wire_type} at {pos}"
-        ))
-    })
+    fast_skip_value(b, pos, wire_type)
+}
+
+/// Advances `pos` past a single field value, validating top-level container headers in O(1) time.
+pub fn skip_value(b: &[u8], pos: usize, wire_type: u8) -> Result<usize> {
+    if pos > b.len() {
+        return Err(cold_parse_err("position out of bounds"));
+    }
+    skip_value_opt(b, pos, wire_type).ok_or_else(|| cold_parse_err("truncated or invalid wireType"))
 }
 
 /// Validates a field value recursively up to `MAX_NESTING_DEPTH`, including unknown containers and UTF-8 strings.
@@ -603,16 +808,21 @@ pub fn locate_field_mask(packet: &[u8], target_field: u16, exp_mask: u16) -> Opt
     while pos < n {
         let (fnum, wt, next_pos) = read_tag_at(packet, pos)?;
         pos = next_pos;
-        if fnum == 0 && wt != WIRE_SUB_MSG {
-            return None;
+        if fnum == 0 {
+            if wt != WIRE_SUB_MSG {
+                return None;
+            }
+            let end = validate_field0(packet, pos, 0).ok()?;
+            if target_field == 0 && (exp_mask & (1u16 << wt)) != 0 {
+                found = Some((&packet[pos..], wt));
+            }
+            pos = end;
+            continue;
         }
         if fnum == u32::from(target_field) && (exp_mask & (1u16 << wt)) != 0 {
             found = Some((&packet[pos..], wt));
         }
-        pos = match wt {
-            WIRE_ARRAY | WIRE_MAP | WIRE_EXTENDED => skip_value(packet, pos, wt).ok()?,
-            _ => fast_skip_value(packet, pos, wt)?,
-        };
+        pos = skip_value_opt(packet, pos, wt)?;
     }
     found
 }
@@ -636,8 +846,25 @@ pub fn next_container_field(
             return (None, false);
         };
         pos = after_tag;
-        if fnum == 0 && wt != WIRE_SUB_MSG {
-            return (None, false);
+        if fnum == 0 {
+            if wt != WIRE_SUB_MSG {
+                return (None, false);
+            }
+            let Ok(end) = validate_field0(packet, pos, 0) else {
+                return (None, false);
+            };
+            if target_field == 0 {
+                if exp_wt == WIRE_SUB_MSG {
+                    let Ok((body, _)) = read_len_slice(packet, pos, min_len) else {
+                        return (None, false);
+                    };
+                    return (Some((body, end)), true);
+                } else if strict_target_wt {
+                    return (None, false);
+                }
+            }
+            pos = end;
+            continue;
         }
         if fnum == u32::from(target_field) {
             if wt == exp_wt {
@@ -649,12 +876,7 @@ pub fn next_container_field(
                 return (None, false);
             }
         }
-        let next = if matches!(wt, WIRE_ARRAY | WIRE_MAP | WIRE_EXTENDED) {
-            skip_value(packet, pos, wt).ok()
-        } else {
-            fast_skip_value(packet, pos, wt)
-        };
-        let Some(next_pos) = next else {
+        let Some(next_pos) = skip_value_opt(packet, pos, wt) else {
             return (None, false);
         };
         pos = next_pos;
@@ -756,32 +978,45 @@ pub fn read_bytes(packet: &[u8], field_num: u16) -> Option<&[u8]> {
 }
 
 /// Reads a nested `WireSubMsg` field, borrowing zero-copy when present once or concatenating merged segments.
+#[inline]
 pub fn read_sub_msg(packet: &[u8], field_num: u16) -> Option<Cow<'_, [u8]>> {
-    let mut pos = 0;
-    let mut first: Option<&[u8]> = None;
-    let mut merged: Vec<u8> = Vec::new();
+    let (matched, valid) = next_container_field(packet, 0, field_num, WIRE_SUB_MSG, 0, false);
+    if !valid {
+        return None;
+    }
+    let (first, pos) = matched?;
+    let (second, valid2) = next_container_field(packet, pos, field_num, WIRE_SUB_MSG, 0, false);
+    if !valid2 {
+        return None;
+    }
+    match second {
+        None => Some(Cow::Borrowed(first)),
+        Some((body2, pos2)) => read_sub_msg_merged(packet, field_num, first, body2, pos2),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn read_sub_msg_merged<'a>(
+    packet: &'a [u8],
+    field_num: u16,
+    first: &'a [u8],
+    second: &'a [u8],
+    mut pos: usize,
+) -> Option<Cow<'a, [u8]>> {
+    let mut merged = Vec::with_capacity(first.len() + second.len());
+    merged.extend_from_slice(first);
+    merged.extend_from_slice(second);
     loop {
         let (matched, valid) = next_container_field(packet, pos, field_num, WIRE_SUB_MSG, 0, false);
         if !valid {
             return None;
         }
         let Some((body, next_pos)) = matched else {
-            break;
+            return Some(Cow::Owned(merged));
         };
         pos = next_pos;
-        if let Some(prev) = first {
-            if merged.is_empty() {
-                merged.extend_from_slice(prev);
-            }
-            merged.extend_from_slice(body);
-        } else {
-            first = Some(body);
-        }
-    }
-    if !merged.is_empty() {
-        Some(Cow::Owned(merged))
-    } else {
-        first.map(Cow::Borrowed)
+        merged.extend_from_slice(body);
     }
 }
 
@@ -976,7 +1211,8 @@ pub fn read_string_arr(packet: &[u8], field_num: u16) -> Option<Vec<&str>> {
         if elem != WIRE_STRING {
             return None;
         }
-        let total = out.len() + count;
+        let cap_add = count.min(4096);
+        let total = out.len().saturating_add(cap_add);
         if out.capacity() < total {
             out.reserve(grow_capacity(out.capacity(), total) - out.len());
         }
@@ -1010,7 +1246,8 @@ pub fn read_uint32_arr(packet: &[u8], field_num: u16) -> Option<Vec<u32>> {
         if elem != WIRE_UINT {
             return None;
         }
-        let total = out.len() + count;
+        let cap_add = count.min(4096);
+        let total = out.len().saturating_add(cap_add);
         if out.capacity() < total {
             out.reserve(grow_capacity(out.capacity(), total) - out.len());
         }
@@ -1151,6 +1388,8 @@ pub struct Encoder {
     count_overflow: Vec<usize>,
 }
 
+const FRAME_CONTAINER: usize = usize::MAX;
+
 impl Default for Encoder {
     fn default() -> Self {
         Self::new(256)
@@ -1218,15 +1457,8 @@ impl Encoder {
     /// Appends a field tag `(field_num << 4) | wire_type`.
     #[inline]
     pub fn write_tag(&mut self, field_num: u32, wire_type: u8) {
-        let tag = (field_num << 4) | u32::from(wire_type & 0x0F);
-        if tag <= 127 {
-            self.buf.push(((tag as u8) << 1) | 1);
-        } else if tag <= 16_383 {
-            let u = ((tag as u16) << 2) | 2;
-            self.buf.extend_from_slice(&u.to_le_bytes());
-        } else {
-            append_varint_multi(&mut self.buf, u64::from(tag));
-        }
+        let tag = (u64::from(field_num) << 4) | u64::from(wire_type & 0x0F);
+        append_varint(&mut self.buf, tag);
     }
 
     #[cold]
@@ -1268,14 +1500,22 @@ impl Encoder {
     #[inline]
     pub fn begin_container(&mut self) {
         let pos = self.buf.len();
-        self.push_frame(pos, 0);
+        self.push_frame(pos, FRAME_CONTAINER);
         self.buf.extend_from_slice(&[0, 0]);
     }
 
     /// Finishes the current open container and backpatches its byte length.
     #[inline]
     pub fn end_container(&mut self) {
-        let (len_pos, _) = self.pop_frame();
+        assert!(
+            self.depth > 0,
+            "end_container called with no open container"
+        );
+        let (len_pos, kind) = self.pop_frame();
+        assert!(
+            kind == FRAME_CONTAINER,
+            "end_container cannot close a begin_sub_msg_arr frame"
+        );
         backpatch_container_len(&mut self.buf, len_pos);
     }
 
@@ -1304,11 +1544,30 @@ impl Encoder {
     /// Begins the next sub-message element inside an open `begin_sub_msg_arr` container.
     #[inline]
     pub fn begin_sub_msg_elem(&mut self) {
+        assert!(
+            self.depth > 0,
+            "begin_sub_msg_elem requires an open begin_sub_msg_arr frame"
+        );
         let parent = self.depth - 1;
         if parent < INLINE_STACK_SLOTS {
-            self.count_stack[parent] += 1;
+            let cur = self.count_stack[parent];
+            assert!(
+                cur != FRAME_CONTAINER,
+                "begin_sub_msg_elem requires an open begin_sub_msg_arr frame"
+            );
+            let next = cur.checked_add(1).expect("sub_msg_arr count overflow");
+            assert!(next != FRAME_CONTAINER, "sub_msg_arr count overflow");
+            self.count_stack[parent] = next;
         } else {
-            self.count_overflow[parent - INLINE_STACK_SLOTS] += 1;
+            let idx = parent - INLINE_STACK_SLOTS;
+            let cur = self.count_overflow[idx];
+            assert!(
+                cur != FRAME_CONTAINER,
+                "begin_sub_msg_elem requires an open begin_sub_msg_arr frame"
+            );
+            let next = cur.checked_add(1).expect("sub_msg_arr count overflow");
+            assert!(next != FRAME_CONTAINER, "sub_msg_arr count overflow");
+            self.count_overflow[idx] = next;
         }
         self.begin_container();
     }
@@ -1322,7 +1581,15 @@ impl Encoder {
     /// Finishes the open `begin_sub_msg_arr` container, patching both element count and total byte length.
     #[inline]
     pub fn end_sub_msg_arr(&mut self) {
+        assert!(
+            self.depth > 0,
+            "end_sub_msg_arr called with no open begin_sub_msg_arr frame"
+        );
         let (len_pos, count) = self.pop_frame();
+        assert!(
+            count != FRAME_CONTAINER,
+            "end_sub_msg_arr requires an open begin_sub_msg_arr frame"
+        );
         patch_reserved_varint(&mut self.buf, len_pos + 3, count as u64);
         backpatch_container_len(&mut self.buf, len_pos);
     }
@@ -1526,6 +1793,12 @@ impl<'a> Decoder<'a> {
             self.pos += 2;
             return Ok(Some(u64::from(u16::from_le_bytes(raw) >> 2)));
         }
+        self.next_raw_tag_slow()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn next_raw_tag_slow(&mut self) -> Result<Option<u64>> {
         let (tag, tn) = decode_varint(&self.data[self.pos..])
             .ok_or_else(|| cold_parse_err("invalid or truncated tag"))?;
         if (tag >> 4) > MAX_FIELD_NUMBER {
@@ -1536,30 +1809,34 @@ impl<'a> Decoder<'a> {
     }
 
     /// Reads the next `(field_num, wire_type)` pair, or `Ok(None)` at clean EOF.
-    #[inline]
+    #[inline(always)]
     pub fn next_tag(&mut self) -> Result<Option<(u32, u8)>> {
-        let Some(tag) = self.next_raw_tag()? else {
+        let n = self.data.len();
+        if self.pos >= n {
+            return Ok(None);
+        }
+        let b0 = self.data[self.pos];
+        if (b0 & 1) != 0 {
+            self.pos += 1;
+            return Ok(Some((u32::from(b0 >> 5), (b0 >> 1) & 0x0F)));
+        }
+        if (b0 & 2) != 0 && self.pos + 2 <= n {
+            let raw: [u8; 2] = self.data[self.pos..self.pos + 2].try_into().unwrap();
+            self.pos += 2;
+            let u = u16::from_le_bytes(raw) >> 2;
+            return Ok(Some((u32::from(u >> 4), (u & 0x0F) as u8)));
+        }
+        let Some(tag) = self.next_raw_tag_slow()? else {
             return Ok(None);
         };
         Ok(Some(((tag >> 4) as u32, (tag & 0x0F) as u8)))
     }
 
     /// Reads an unsigned `Prefix-Varint` payload.
-    #[inline]
+    #[inline(always)]
     pub fn read_uint(&mut self) -> Result<u64> {
-        if let Some(&b0) = self.data.get(self.pos)
-            && (b0 & 1) != 0
-        {
-            self.pos += 1;
-            return Ok(u64::from(b0 >> 1));
-        }
-        let (v, vn) = decode_varint(
-            self.data
-                .get(self.pos..)
-                .ok_or_else(|| cold_parse_err("truncated uint varint"))?,
-        )
-        .ok_or_else(|| cold_parse_err("truncated uint varint"))?;
-        self.pos += vn;
+        let (v, next_pos) = read_varint_at(self.data, self.pos)?;
+        self.pos = next_pos;
         Ok(v)
     }
 

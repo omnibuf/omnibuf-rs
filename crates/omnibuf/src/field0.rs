@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use crate::error::{Error, Result};
 use crate::wire::{
     MAX_FIELD_NUMBER, MAX_NESTING_DEPTH, WIRE_MAP, WIRE_STRING, WIRE_SUB_MSG, WIRE_UINT,
-    append_varint, backpatch_container_len, decode_varint, next_container_field, parse_map_header,
-    read_len_slice, read_str_slice, validate_value,
+    append_varint, backpatch_container_len, decode_varint, parse_map_header, read_len_slice,
+    read_str_slice, read_tag_at, skip_value_opt, validate_value,
 };
 
 /// Optional inline schema header encoded as `Field #0` (`Tag = 0x19`, `WireSubMsg = 12`)
@@ -103,7 +103,16 @@ pub fn merge_schema_meta(base: Option<SchemaMeta>, next: SchemaMeta) -> SchemaMe
 
 /// Decodes a `SchemaMeta` payload body at the given recursion `depth`.
 pub fn decode_schema_meta(data: &[u8], depth: usize) -> Result<SchemaMeta> {
-    if depth > MAX_NESTING_DEPTH {
+    decode_schema_meta_with_max_depth(data, depth, MAX_NESTING_DEPTH)
+}
+
+/// Decodes a `SchemaMeta` payload body enforcing `max_depth`.
+pub(crate) fn decode_schema_meta_with_max_depth(
+    data: &[u8],
+    depth: usize,
+    max_depth: usize,
+) -> Result<SchemaMeta> {
+    if depth > max_depth {
         return Err(Error::DepthLimitExceeded(depth));
     }
     let mut meta = SchemaMeta::default();
@@ -140,7 +149,7 @@ pub fn decode_schema_meta(data: &[u8], depth: usize) -> Result<SchemaMeta> {
                         "SchemaMeta field #2 (fields) must be WireMap, got {wt}"
                     )));
                 }
-                if depth + 1 > MAX_NESTING_DEPTH {
+                if depth + 1 > max_depth {
                     return Err(Error::DepthLimitExceeded(depth + 1));
                 }
                 let (body, next_pos) = read_len_slice(data, pos, 3)?;
@@ -174,7 +183,7 @@ pub fn decode_schema_meta(data: &[u8], depth: usize) -> Result<SchemaMeta> {
                         "SchemaMeta field #3 (children) must be WireMap, got {wt}"
                     )));
                 }
-                if depth + 1 > MAX_NESTING_DEPTH {
+                if depth + 1 > max_depth {
                     return Err(Error::DepthLimitExceeded(depth + 1));
                 }
                 let (body, next_pos) = read_len_slice(data, pos, 3)?;
@@ -186,6 +195,9 @@ pub fn decode_schema_meta(data: &[u8], depth: usize) -> Result<SchemaMeta> {
                         "invalid SchemaMeta children map key/val types",
                     ));
                 }
+                // Within a single WireMap container, duplicate keys replace outright (Spec §6.6).
+                // Separate field #3 occurrences or separate Field #0 blocks merge recursively (Spec §8.2).
+                let mut map_children: BTreeMap<u32, SchemaMeta> = BTreeMap::new();
                 for _ in 0..count {
                     let (k64, kn) = decode_varint(&body[p..]).ok_or_else(|| {
                         Error::parse(format!("truncated SchemaMeta child key at {p}"))
@@ -197,17 +209,20 @@ pub fn decode_schema_meta(data: &[u8], depth: usize) -> Result<SchemaMeta> {
                     }
                     p += kn;
                     let (child_bytes, next_p) = read_len_slice(body, p, 0)?;
-                    let child_meta = decode_schema_meta(child_bytes, depth + 1)?;
-                    let key = k64 as u32;
+                    let child_meta =
+                        decode_schema_meta_with_max_depth(child_bytes, depth + 2, max_depth)?;
+                    map_children.insert(k64 as u32, child_meta);
+                    p = next_p;
+                }
+                if p != body.len() {
+                    return Err(Error::parse("SchemaMeta children map trailing bytes"));
+                }
+                for (key, child_meta) in map_children {
                     if let Some(existing) = meta.children.get_mut(&key) {
                         existing.merge_from(child_meta);
                     } else {
                         meta.children.insert(key, child_meta);
                     }
-                    p = next_p;
-                }
-                if p != body.len() {
-                    return Err(Error::parse("SchemaMeta children map trailing bytes"));
                 }
             }
             0 => {
@@ -224,25 +239,123 @@ pub fn decode_schema_meta(data: &[u8], depth: usize) -> Result<SchemaMeta> {
 /// Validates a `Field #0` (`WireSubMsg`) payload starting at `data[pos]` in place.
 #[inline]
 pub fn validate_field0(data: &[u8], pos: usize, depth: usize) -> Result<usize> {
+    validate_field0_with_max_depth(data, pos, depth, MAX_NESTING_DEPTH)
+}
+
+/// Validates a `Field #0` (`WireSubMsg`) payload starting at `data[pos]` with custom `max_depth`.
+#[inline]
+pub(crate) fn validate_field0_with_max_depth(
+    data: &[u8],
+    pos: usize,
+    depth: usize,
+    max_depth: usize,
+) -> Result<usize> {
     let (body, next_pos) = read_len_slice(data, pos, 0)?;
-    decode_schema_meta(body, depth + 1)?;
+    decode_schema_meta_with_max_depth(body, depth + 1, max_depth)?;
     Ok(next_pos)
 }
 
 /// Decodes and merges all `Field #0` (`Tag = 0x19`, `WireSubMsg = 12`) blocks in `packet`.
 pub fn read_field0_schema_meta(packet: &[u8]) -> Option<SchemaMeta> {
+    read_field0_schema_meta_at_depth(packet, 0, MAX_NESTING_DEPTH)
+        .ok()
+        .flatten()
+}
+
+/// Decodes and merges all `Field #0` blocks in `packet` starting from `base_depth`.
+pub(crate) fn read_field0_schema_meta_at_depth(
+    packet: &[u8],
+    base_depth: usize,
+    max_depth: usize,
+) -> Result<Option<SchemaMeta>> {
     let mut merged: Option<SchemaMeta> = None;
     let mut pos = 0usize;
-    loop {
-        let (matched, valid) = next_container_field(packet, pos, 0, WIRE_SUB_MSG, 0, true);
-        if !valid {
-            return None;
+    let n = packet.len();
+    while pos < n {
+        let (fnum, wt, after_tag) =
+            read_tag_at(packet, pos).ok_or_else(|| Error::parse("invalid tag"))?;
+        pos = after_tag;
+        if fnum == 0 {
+            if wt != WIRE_SUB_MSG {
+                return Err(Error::parse(format!("invalid Field #0 wire type {wt}")));
+            }
+            let (body, end) = read_len_slice(packet, pos, 0)?;
+            let meta = decode_schema_meta_with_max_depth(body, base_depth + 1, max_depth)?;
+            merged = Some(merge_schema_meta(merged, meta));
+            pos = end;
+        } else {
+            pos = skip_value_opt(packet, pos, wt)
+                .ok_or_else(|| Error::parse("truncated field value"))?;
         }
-        let Some((body, next_pos)) = matched else {
-            return merged;
+    }
+    Ok(merged)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_children_keys_within_single_wire_map_replace_while_separate_maps_merge() {
+        let mut child_a = SchemaMeta {
+            type_name: "OldChild".to_owned(),
+            ..Default::default()
         };
-        pos = next_pos;
-        let meta = decode_schema_meta(body, 0).ok()?;
-        merged = Some(merge_schema_meta(merged, meta));
+        child_a.fields.insert(1, "old_only".to_owned());
+        child_a.fields.insert(2, "shared".to_owned());
+
+        let mut child_b = SchemaMeta {
+            type_name: "NewChild".to_owned(),
+            ..Default::default()
+        };
+        child_b.fields.insert(2, "updated".to_owned());
+
+        // Hand-craft a single Field #3 WireMap containing duplicate key `5` -> child_a then `5` -> child_b.
+        let mut child_a_body = Vec::new();
+        child_a.append_body(&mut child_a_body);
+        let mut child_b_body = Vec::new();
+        child_b.append_body(&mut child_b_body);
+
+        let mut schema_body = Vec::new();
+        schema_body.push((((3 << 4) | WIRE_MAP) << 1) | 1);
+        let map_pos = schema_body.len();
+        schema_body.extend_from_slice(&[0, 0, WIRE_UINT, WIRE_SUB_MSG]);
+        append_varint(&mut schema_body, 2); // 2 entries with same key 5
+        append_varint(&mut schema_body, 5);
+        append_varint(&mut schema_body, child_a_body.len() as u64);
+        schema_body.extend_from_slice(&child_a_body);
+        append_varint(&mut schema_body, 5);
+        append_varint(&mut schema_body, child_b_body.len() as u64);
+        schema_body.extend_from_slice(&child_b_body);
+        backpatch_container_len(&mut schema_body, map_pos);
+
+        let mut pkt = Vec::new();
+        pkt.push((WIRE_SUB_MSG << 1) | 1);
+        append_varint(&mut pkt, schema_body.len() as u64);
+        pkt.extend_from_slice(&schema_body);
+
+        let decoded = read_field0_schema_meta(&pkt).expect("valid Field #0");
+        let child5 = decoded.children.get(&5).expect("child 5");
+        assert_eq!(child5.type_name, "NewChild");
+        // `old_only` must NOT survive because duplicate key 5 in the same WireMap replaces outright.
+        assert!(!child5.fields.contains_key(&1));
+        assert_eq!(child5.fields.get(&2).map(String::as_str), Some("updated"));
+
+        // Now append a SEPARATE Field #0 block adding field 3 on child 5 -> must merge recursively.
+        let mut ext_child = SchemaMeta::default();
+        ext_child.fields.insert(3, "merged_extra".to_owned());
+        let mut ext_root = SchemaMeta::default();
+        ext_root.children.insert(5, ext_child);
+        ext_root.append_field0(&mut pkt);
+
+        let merged = read_field0_schema_meta(&pkt).expect("valid merged Field #0");
+        let merged5 = merged.children.get(&5).expect("child 5");
+        assert_eq!(merged5.type_name, "NewChild");
+        assert!(!merged5.fields.contains_key(&1));
+        assert_eq!(merged5.fields.get(&2).map(String::as_str), Some("updated"));
+        assert_eq!(
+            merged5.fields.get(&3).map(String::as_str),
+            Some("merged_extra")
+        );
     }
 }
