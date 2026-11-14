@@ -24,6 +24,9 @@ jobs:
         with:
           install: true
 
+      - name: Install rustfmt and clippy components
+        run: rustup component add rustfmt clippy
+
       - name: Install conformance-runner
         run: |
           mise use -g go@1.27
