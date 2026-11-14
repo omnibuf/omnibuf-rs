@@ -67,7 +67,7 @@ publish-check:
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --exclude conformance-rs --exclude omnibuf-bench --all-features
     cargo package -p omnibuf-derive
     cargo package -p protoc-gen-omnibuf-rs
-    cargo package -p omnibuf --no-verify
+    cargo package -p omnibuf
 
 # Publish omnibuf-derive, omnibuf, and protoc-gen-omnibuf-rs to crates.io in dependency order
 publish:
