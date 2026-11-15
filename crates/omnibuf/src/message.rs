@@ -586,7 +586,7 @@ pub mod codec {
 
     #[inline(always)]
     fn begin_tagged_container(dst: &mut Vec<u8>, field_num: u32, wire_type: u8) -> usize {
-        let tag = (field_num << 4) | u32::from(wire_type & 0x0F);
+        let tag = (u64::from(field_num) << 4) | u64::from(wire_type & 0x0F);
         if tag <= 127 {
             let b0 = ((tag as u8) << 1) | 1;
             dst.reserve(3);
@@ -664,7 +664,7 @@ pub mod codec {
 
     #[inline(always)]
     pub fn write_uint_field(dst: &mut Vec<u8>, field_num: u32, v: u64) {
-        let tag = (field_num << 4) | u32::from(WIRE_UINT);
+        let tag = (u64::from(field_num) << 4) | u64::from(WIRE_UINT);
         if tag <= 127 {
             write_varint_tagged(dst, [((tag as u8) << 1) | 1], v);
         } else if tag <= 16_383 {
@@ -679,7 +679,7 @@ pub mod codec {
     #[inline(always)]
     pub fn write_sint_field(dst: &mut Vec<u8>, field_num: u32, v: i64) {
         let z = encode_zigzag(v);
-        let tag = (field_num << 4) | u32::from(WIRE_SINT);
+        let tag = (u64::from(field_num) << 4) | u64::from(WIRE_SINT);
         if tag <= 127 {
             write_varint_tagged(dst, [((tag as u8) << 1) | 1], z);
         } else if tag <= 16_383 {
@@ -693,8 +693,8 @@ pub mod codec {
 
     #[inline(always)]
     pub fn write_bool_field(dst: &mut Vec<u8>, field_num: u32, v: bool) {
-        let tf = (field_num << 4) | u32::from(WIRE_BOOL_FALSE);
-        let tt = (field_num << 4) | u32::from(WIRE_BOOL_TRUE);
+        let tf = (u64::from(field_num) << 4) | u64::from(WIRE_BOOL_FALSE);
+        let tt = (u64::from(field_num) << 4) | u64::from(WIRE_BOOL_TRUE);
         if tt <= 127 {
             write_bool_tagged(dst, [((tf as u8) << 1) | 1], [((tt as u8) << 1) | 1], v);
         } else if tt <= 16_383 {
@@ -715,7 +715,7 @@ pub mod codec {
 
     #[inline(always)]
     pub fn write_fixed32_field(dst: &mut Vec<u8>, field_num: u32, v: u32) {
-        let tag = (field_num << 4) | u32::from(WIRE_FIXED32);
+        let tag = (u64::from(field_num) << 4) | u64::from(WIRE_FIXED32);
         let bytes = v.to_le_bytes();
         if tag <= 127 {
             write_fixed_tagged(dst, [((tag as u8) << 1) | 1], bytes);
@@ -729,7 +729,7 @@ pub mod codec {
 
     #[inline(always)]
     pub fn write_fixed64_field(dst: &mut Vec<u8>, field_num: u32, v: u64) {
-        let tag = (field_num << 4) | u32::from(WIRE_FIXED64);
+        let tag = (u64::from(field_num) << 4) | u64::from(WIRE_FIXED64);
         let bytes = v.to_le_bytes();
         if tag <= 127 {
             write_fixed_tagged(dst, [((tag as u8) << 1) | 1], bytes);
@@ -743,7 +743,7 @@ pub mod codec {
 
     #[inline(always)]
     pub fn write_sfixed32_field(dst: &mut Vec<u8>, field_num: u32, v: i32) {
-        let tag = (field_num << 4) | u32::from(WIRE_SFIXED32);
+        let tag = (u64::from(field_num) << 4) | u64::from(WIRE_SFIXED32);
         let bytes = v.to_le_bytes();
         if tag <= 127 {
             write_fixed_tagged(dst, [((tag as u8) << 1) | 1], bytes);
@@ -757,7 +757,7 @@ pub mod codec {
 
     #[inline(always)]
     pub fn write_sfixed64_field(dst: &mut Vec<u8>, field_num: u32, v: i64) {
-        let tag = (field_num << 4) | u32::from(WIRE_SFIXED64);
+        let tag = (u64::from(field_num) << 4) | u64::from(WIRE_SFIXED64);
         let bytes = v.to_le_bytes();
         if tag <= 127 {
             write_fixed_tagged(dst, [((tag as u8) << 1) | 1], bytes);
@@ -771,7 +771,7 @@ pub mod codec {
 
     #[inline(always)]
     pub fn write_float32_field(dst: &mut Vec<u8>, field_num: u32, v: f32) {
-        let tag = (field_num << 4) | u32::from(WIRE_FLOAT32);
+        let tag = (u64::from(field_num) << 4) | u64::from(WIRE_FLOAT32);
         let bytes = v.to_bits().to_le_bytes();
         if tag <= 127 {
             write_fixed_tagged(dst, [((tag as u8) << 1) | 1], bytes);
@@ -785,7 +785,7 @@ pub mod codec {
 
     #[inline(always)]
     pub fn write_float64_field(dst: &mut Vec<u8>, field_num: u32, v: f64) {
-        let tag = (field_num << 4) | u32::from(WIRE_FLOAT64);
+        let tag = (u64::from(field_num) << 4) | u64::from(WIRE_FLOAT64);
         let bytes = v.to_bits().to_le_bytes();
         if tag <= 127 {
             write_fixed_tagged(dst, [((tag as u8) << 1) | 1], bytes);
@@ -799,7 +799,7 @@ pub mod codec {
 
     #[inline(always)]
     pub fn write_string_field(dst: &mut Vec<u8>, field_num: u32, s: &str) {
-        let tag = (field_num << 4) | u32::from(WIRE_STRING);
+        let tag = (u64::from(field_num) << 4) | u64::from(WIRE_STRING);
         let bytes = s.as_bytes();
         if tag <= 127 {
             write_bytes_tagged(dst, [((tag as u8) << 1) | 1], bytes);
@@ -813,7 +813,7 @@ pub mod codec {
 
     #[inline(always)]
     pub fn write_bytes_field(dst: &mut Vec<u8>, field_num: u32, b: &[u8]) {
-        let tag = (field_num << 4) | u32::from(WIRE_BYTES);
+        let tag = (u64::from(field_num) << 4) | u64::from(WIRE_BYTES);
         if tag <= 127 {
             write_bytes_tagged(dst, [((tag as u8) << 1) | 1], b);
         } else if tag <= 16_383 {

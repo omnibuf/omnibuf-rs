@@ -948,3 +948,36 @@ fn buffa_derive_and_dynamic_codec_roundtrip_neg_zero_and_group_rejection() {
     let mut grp_dec = DynamicMessage::new(pool, grp_idx);
     assert!(decode_buffa_dynamic(&grp_wire, &mut grp_dec).is_err());
 }
+
+#[test]
+fn high_field_numbers_preserve_tags() {
+    use omnibuf::message::codec;
+    use omnibuf::wire::{MAX_FIELD_NUMBER, decode_varint};
+    for field in [
+        33_554_432,
+        268_435_456,
+        268_435_457,
+        MAX_FIELD_NUMBER as u32,
+    ] {
+        let writers: &[fn(&mut Vec<u8>, u32)] = &[
+            |b, f| codec::write_uint_field(b, f, 42),
+            |b, f| codec::write_sint_field(b, f, -42),
+            |b, f| codec::write_bool_field(b, f, true),
+            |b, f| codec::write_fixed32_field(b, f, 42),
+            |b, f| codec::write_fixed64_field(b, f, 42),
+            |b, f| codec::write_sfixed32_field(b, f, -42),
+            |b, f| codec::write_sfixed64_field(b, f, -42),
+            |b, f| codec::write_float32_field(b, f, 1.5),
+            |b, f| codec::write_float64_field(b, f, 1.5),
+            |b, f| codec::write_string_field(b, f, "hello"),
+            |b, f| codec::write_bytes_field(b, f, b"hello"),
+            |b, f| codec::write_sub_msg_field(b, f, &Point2D::default(), false).unwrap(),
+        ];
+        for writer in writers {
+            let mut bytes = Vec::new();
+            writer(&mut bytes, field);
+            let (tag, _) = decode_varint(&bytes).unwrap();
+            assert_eq!(tag >> 4, u64::from(field));
+        }
+    }
+}
