@@ -138,7 +138,7 @@
 //! # Ok::<(), omnibuf::Error>(())
 //! ```
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use buffa::editions::FieldPresence;
@@ -913,7 +913,9 @@ fn decode_buffa_dynamic_at_depth(
 
     let n = data.len();
     let mut pos = 0usize;
-    let mut seen: HashSet<u32> = HashSet::new();
+    type PendingMapEntry<'a> = (&'a FieldDescriptor, Vec<(MapKey, Value)>);
+    let mut pending_maps: BTreeMap<u32, PendingMapEntry<'_>> = BTreeMap::new();
+    let mut pending_lists: BTreeMap<u32, (&FieldDescriptor, Vec<Value>)> = BTreeMap::new();
 
     while pos < n {
         let (tag, tn) = decode_varint(&data[pos..])
@@ -953,8 +955,6 @@ fn decode_buffa_dynamic_at_depth(
                 if depth + 1 > MAX_NESTING_DEPTH {
                     return Err(Error::DepthLimitExceeded(depth + 1));
                 }
-                let already_seen = seen.contains(&fnum) || merge;
-                seen.insert(fnum);
 
                 let exp_key_wt = scalar_wire_type(key);
                 let exp_val_wt = singular_wire_type(value);
@@ -965,18 +965,23 @@ fn decode_buffa_dynamic_at_depth(
                     return Err(Error::parse("WireMap key/value wire type mismatch"));
                 }
 
-                let mut entries: Vec<(MapKey, Value)> = if already_seen {
-                    match msg.get(fd) {
-                        ValueRef::Map(existing) => {
-                            let mut prev = Vec::with_capacity(existing.len() + count.min(4096));
-                            existing.for_each(&mut |k, v| prev.push((k.to_owned(), v.to_owned())));
-                            prev
+                let (_, entries) = pending_maps.entry(fnum).or_insert_with(|| {
+                    let seeded = if merge {
+                        match msg.get(fd) {
+                            ValueRef::Map(existing) => {
+                                let mut prev = Vec::with_capacity(existing.len() + count.min(4096));
+                                existing
+                                    .for_each(&mut |k, v| prev.push((k.to_owned(), v.to_owned())));
+                                prev
+                            }
+                            _ => Vec::with_capacity(count.min(4096)),
                         }
-                        _ => Vec::with_capacity(count.min(4096)),
-                    }
-                } else {
-                    Vec::with_capacity(count.min(4096))
-                };
+                    } else {
+                        Vec::with_capacity(count.min(4096))
+                    };
+                    (fd, seeded)
+                });
+                entries.reserve(count.min(4096));
 
                 for _ in 0..count {
                     let (kv, after_k) =
@@ -996,7 +1001,6 @@ fn decode_buffa_dynamic_at_depth(
                 if p != body.len() {
                     return Err(Error::parse("WireMap trailing bytes"));
                 }
-                msg.set(fd, Value::Map(MapValue::from_entries(entries)));
                 pos = next_pos;
             }
             FieldKind::List(elem_sk) => {
@@ -1007,8 +1011,6 @@ fn decode_buffa_dynamic_at_depth(
                 if depth + 1 > MAX_NESTING_DEPTH {
                     return Err(Error::DepthLimitExceeded(depth + 1));
                 }
-                let already_seen = seen.contains(&fnum) || merge;
-                seen.insert(fnum);
 
                 let exp_elem_wt = singular_wire_type(elem_sk);
                 let (body, next_pos) = read_len_slice(data, pos, 2)?;
@@ -1018,18 +1020,22 @@ fn decode_buffa_dynamic_at_depth(
                     return Err(Error::parse("WireArray element wire type mismatch"));
                 }
 
-                let mut items: Vec<Value> = if already_seen {
-                    match msg.get(fd) {
-                        ValueRef::List(existing) => {
-                            let mut prev = Vec::with_capacity(existing.len() + count.min(4096));
-                            existing.for_each(&mut |v| prev.push(v.to_owned()));
-                            prev
+                let (_, items) = pending_lists.entry(fnum).or_insert_with(|| {
+                    let seeded = if merge {
+                        match msg.get(fd) {
+                            ValueRef::List(existing) => {
+                                let mut prev = Vec::with_capacity(existing.len() + count.min(4096));
+                                existing.for_each(&mut |v| prev.push(v.to_owned()));
+                                prev
+                            }
+                            _ => Vec::with_capacity(count.min(4096)),
                         }
-                        _ => Vec::with_capacity(count.min(4096)),
-                    }
-                } else {
-                    Vec::with_capacity(count.min(4096))
-                };
+                    } else {
+                        Vec::with_capacity(count.min(4096))
+                    };
+                    (fd, seeded)
+                });
+                items.reserve(count.min(4096));
 
                 for _ in 0..count {
                     if let SingularKind::Message(sub_idx) = elem_sk {
@@ -1047,7 +1053,6 @@ fn decode_buffa_dynamic_at_depth(
                 if p != body.len() {
                     return Err(Error::parse("WireArray trailing bytes"));
                 }
-                msg.set(fd, Value::List(items));
                 pos = next_pos;
             }
             FieldKind::Singular(sk) => {
@@ -1056,7 +1061,6 @@ fn decode_buffa_dynamic_at_depth(
                         pos = validate_value(data, pos, wt, depth)?;
                         continue;
                     }
-                    seen.insert(fnum);
                     msg.set(fd, Value::Bool(wt == WIRE_BOOL_TRUE));
                     continue;
                 }
@@ -1067,12 +1071,9 @@ fn decode_buffa_dynamic_at_depth(
                     continue;
                 }
 
-                let already_seen = seen.contains(&fnum) || merge;
-                seen.insert(fnum);
-
                 if let SingularKind::Message(sub_idx) = sk {
                     let (sub_bytes, next_pos) = read_len_slice(data, pos, 0)?;
-                    if already_seen && msg.has(fd) {
+                    if msg.has(fd) {
                         let mut sub_msg = match msg.get(fd) {
                             ValueRef::Message(cow) => cow.to_dynamic(),
                             _ => DynamicMessage::new(Arc::clone(&pool), sub_idx),
@@ -1092,6 +1093,13 @@ fn decode_buffa_dynamic_at_depth(
                 }
             }
         }
+    }
+
+    for (_, (fd, entries)) in pending_maps {
+        msg.set(fd, Value::Map(MapValue::from_entries(entries)));
+    }
+    for (_, (fd, items)) in pending_lists {
+        msg.set(fd, Value::List(items));
     }
 
     Ok(())

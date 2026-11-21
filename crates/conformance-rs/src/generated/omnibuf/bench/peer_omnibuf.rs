@@ -15,7 +15,8 @@ pub struct Location {
 impl Location {
     #[inline]
     pub fn marshal_omnibuf(&self) -> ::std::vec::Vec<u8> {
-        let mut dst = ::std::vec::Vec::with_capacity(128);
+        let cap = <Self as ::omnibuf::Message>::encoded_size_hint(self).max(128);
+        let mut dst = ::std::vec::Vec::with_capacity(cap);
         self.marshal_omnibuf_append(&mut dst);
         dst
     }
@@ -98,6 +99,28 @@ impl ::omnibuf::Message for Location {
         self.longitude = ::core::default::Default::default();
     }
 
+    #[inline]
+    fn min_wire_size_bounded(&self, depth_rem: usize) -> usize {
+        let _ = depth_rem;
+        let mut __sz = 0usize;
+        __sz += {
+            let __l = (self.region).len();
+            1usize + ::omnibuf::wire::varint_len(__l as u64) + __l
+        };
+        __sz += {
+            let __l = (self.datacenter).len();
+            1usize + ::omnibuf::wire::varint_len(__l as u64) + __l
+        };
+        __sz += {
+            let __l = (self.city).len();
+            1usize + ::omnibuf::wire::varint_len(__l as u64) + __l
+        };
+        __sz += 2usize;
+        __sz += 5usize;
+        __sz += 5usize;
+        __sz
+    }
+
     fn build_schema_meta(
         active: &mut ::std::collections::HashSet<::core::any::TypeId>,
         depth: usize,
@@ -168,11 +191,88 @@ impl ::omnibuf::Message for Location {
 }
 
 #[allow(dead_code)]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LocationBorrowed<'a> {
+    pub region: &'a str,
+    pub datacenter: &'a str,
+    pub city: &'a str,
+    pub rack: u32,
+    pub latitude: f32,
+    pub longitude: f32,
+    _marker: ::core::marker::PhantomData<&'a [u8]>,
+}
+
+#[allow(dead_code)]
+impl<'a> LocationBorrowed<'a> {
+    #[inline]
+    pub fn from_omnibuf(data: &'a [u8]) -> ::omnibuf::Result<Self> {
+        <Self as ::omnibuf::DecodeBorrowed<'a>>::from_omnibuf_borrowed(data)
+    }
+
+    #[inline]
+    pub fn unmarshal_omnibuf(&mut self, data: &'a [u8]) -> ::omnibuf::Result<()> {
+        <Self as ::omnibuf::DecodeBorrowed<'a>>::decode_omnibuf_borrowed(self, data)
+    }
+}
+
+impl<'a> ::omnibuf::DecodeBorrowed<'a> for LocationBorrowed<'a> {
+    #[inline]
+    fn decode_omnibuf_borrowed_at_depth(
+        &mut self,
+        data: &'a [u8],
+        depth: usize,
+        merge: bool,
+    ) -> ::omnibuf::Result<()> {
+        let mut dec = ::omnibuf::Decoder::with_depth(data, depth)?;
+        if !merge {
+            self.clear_omnibuf_borrowed();
+        }
+        while let ::core::option::Option::Some((fnum, wt)) = dec.next_tag()? {
+            match fnum {
+                1 if wt == 10 => {
+                    self.region = dec.read_str()?;
+                }
+                2 if wt == 10 => {
+                    self.datacenter = dec.read_str()?;
+                }
+                3 if wt == 10 => {
+                    self.city = dec.read_str()?;
+                }
+                4 if wt == 0 => {
+                    self.rack = dec.read_uint()? as u32;
+                }
+                5 if wt == 8 => {
+                    self.latitude = dec.read_float32()?;
+                }
+                6 if wt == 8 => {
+                    self.longitude = dec.read_float32()?;
+                }
+                _ => dec.skip_unknown(fnum, wt)?,
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+
+    #[inline]
+    fn clear_omnibuf_borrowed(&mut self) {
+        self.region = "";
+        self.datacenter = "";
+        self.city = "";
+        self.rack = ::core::default::Default::default();
+        self.latitude = ::core::default::Default::default();
+        self.longitude = ::core::default::Default::default();
+    }
+}
+
+#[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
-struct OpaqueLocationHeap {
+struct OpaqueLocationDirty {
     f_region: ::std::string::String,
     f_datacenter: ::std::string::String,
     f_city: ::std::string::String,
+    f_rack: u32,
+    f_latitude: f32,
+    f_longitude: f32,
 }
 
 #[allow(dead_code)]
@@ -180,10 +280,8 @@ struct OpaqueLocationHeap {
 pub struct OpaqueLocation<'a> {
     pub(crate) raw: ::std::borrow::Cow<'a, [u8]>,
     dirty: u64,
-    heap: ::core::option::Option<::std::boxed::Box<OpaqueLocationHeap>>,
-    f_rack: u32,
-    f_latitude: f32,
-    f_longitude: f32,
+    dir: ::omnibuf::opaque::LazyFieldDir,
+    dirty_state: ::core::option::Option<::std::boxed::Box<OpaqueLocationDirty>>,
 }
 
 #[allow(dead_code, clippy::too_many_arguments)]
@@ -225,6 +323,7 @@ impl<'a> OpaqueLocation<'a> {
     pub fn unmarshal(&mut self, raw: &'a [u8]) {
         self.raw = ::std::borrow::Cow::Borrowed(raw);
         self.dirty = 0;
+        self.dir.reset();
     }
 
     #[inline]
@@ -240,86 +339,104 @@ impl<'a> OpaqueLocation<'a> {
     }
 
     #[inline]
-    fn heap_mut(&mut self) -> &mut OpaqueLocationHeap {
-        self.heap
+    fn dirty_mut(&mut self) -> &mut OpaqueLocationDirty {
+        self.dirty_state
             .get_or_insert_with(::core::default::Default::default)
     }
 
     #[inline]
     pub fn get_region(&self) -> &str {
         if (self.dirty & 2u64) != 0 {
-            return self.heap.as_deref().map_or("", |h| h.f_region.as_str());
+            return self
+                .dirty_state
+                .as_deref()
+                .map_or("", |d| d.f_region.as_str());
         }
-        ::omnibuf::wire::read_str(&self.raw, 1).unwrap_or("")
+        self.dir.read_str(&self.raw, 1).unwrap_or("")
     }
     #[inline]
     pub fn set_region(&mut self, v: impl ::std::convert::Into<::std::string::String>) {
-        self.heap_mut().f_region = v.into();
+        self.dirty_mut().f_region = v.into();
         self.dirty |= 2u64;
     }
 
     #[inline]
     pub fn get_datacenter(&self) -> &str {
         if (self.dirty & 4u64) != 0 {
-            return self.heap.as_deref().map_or("", |h| h.f_datacenter.as_str());
+            return self
+                .dirty_state
+                .as_deref()
+                .map_or("", |d| d.f_datacenter.as_str());
         }
-        ::omnibuf::wire::read_str(&self.raw, 2).unwrap_or("")
+        self.dir.read_str(&self.raw, 2).unwrap_or("")
     }
     #[inline]
     pub fn set_datacenter(&mut self, v: impl ::std::convert::Into<::std::string::String>) {
-        self.heap_mut().f_datacenter = v.into();
+        self.dirty_mut().f_datacenter = v.into();
         self.dirty |= 4u64;
     }
 
     #[inline]
     pub fn get_city(&self) -> &str {
         if (self.dirty & 8u64) != 0 {
-            return self.heap.as_deref().map_or("", |h| h.f_city.as_str());
+            return self
+                .dirty_state
+                .as_deref()
+                .map_or("", |d| d.f_city.as_str());
         }
-        ::omnibuf::wire::read_str(&self.raw, 3).unwrap_or("")
+        self.dir.read_str(&self.raw, 3).unwrap_or("")
     }
     #[inline]
     pub fn set_city(&mut self, v: impl ::std::convert::Into<::std::string::String>) {
-        self.heap_mut().f_city = v.into();
+        self.dirty_mut().f_city = v.into();
         self.dirty |= 8u64;
     }
 
     #[inline]
     pub fn get_rack(&self) -> u32 {
         if (self.dirty & 16u64) != 0 {
-            return self.f_rack;
+            return self
+                .dirty_state
+                .as_deref()
+                .map_or_else(::core::default::Default::default, |d| d.f_rack);
         }
-        ::omnibuf::wire::read_uint(&self.raw, 4).unwrap_or(0) as u32
+        self.dir.read_uint(&self.raw, 4).unwrap_or(0) as u32
     }
     #[inline]
     pub fn set_rack(&mut self, v: u32) {
-        self.f_rack = v;
+        self.dirty_mut().f_rack = v;
         self.dirty |= 16u64;
     }
 
     #[inline]
     pub fn get_latitude(&self) -> f32 {
         if (self.dirty & 32u64) != 0 {
-            return self.f_latitude;
+            return self
+                .dirty_state
+                .as_deref()
+                .map_or_else(::core::default::Default::default, |d| d.f_latitude);
         }
-        ::omnibuf::wire::read_float32(&self.raw, 5).unwrap_or(0.0)
+        self.dir.read_float32(&self.raw, 5).unwrap_or(0.0)
     }
     #[inline]
     pub fn set_latitude(&mut self, v: f32) {
-        self.f_latitude = v;
+        self.dirty_mut().f_latitude = v;
         self.dirty |= 32u64;
     }
 
     #[inline]
     pub fn get_longitude(&self) -> f32 {
         if (self.dirty & 64u64) != 0 {
-            return self.f_longitude;
+            return self
+                .dirty_state
+                .as_deref()
+                .map_or_else(::core::default::Default::default, |d| d.f_longitude);
         }
-        ::omnibuf::wire::read_float32(&self.raw, 6).unwrap_or(0.0)
+        self.dir.read_float32(&self.raw, 6).unwrap_or(0.0)
     }
     #[inline]
     pub fn set_longitude(&mut self, v: f32) {
-        self.f_longitude = v;
+        self.dirty_mut().f_longitude = v;
         self.dirty |= 64u64;
     }
 
@@ -332,10 +449,9 @@ impl<'a> OpaqueLocation<'a> {
 
     pub fn marshal_append(&self, dst: &mut ::std::vec::Vec<u8>) {
         if self.dirty == 0 {
-            ::omnibuf::opaque::copy_packet(dst, &self.raw);
+            ::omnibuf::opaque::append_packet(dst, &self.raw);
             return;
         }
-        dst.clear();
         ::omnibuf::opaque::splice_fields(dst, &self.raw, self.dirty, 6, |dst, fnum| {
             let deterministic = true;
             let _ = deterministic;
@@ -344,31 +460,43 @@ impl<'a> OpaqueLocation<'a> {
                     ::omnibuf::codec::write_string_field(
                         dst,
                         1,
-                        self.heap.as_deref().unwrap().f_region.as_str(),
+                        self.dirty_state.as_deref().unwrap().f_region.as_str(),
                     );
                 }
                 2 => {
                     ::omnibuf::codec::write_string_field(
                         dst,
                         2,
-                        self.heap.as_deref().unwrap().f_datacenter.as_str(),
+                        self.dirty_state.as_deref().unwrap().f_datacenter.as_str(),
                     );
                 }
                 3 => {
                     ::omnibuf::codec::write_string_field(
                         dst,
                         3,
-                        self.heap.as_deref().unwrap().f_city.as_str(),
+                        self.dirty_state.as_deref().unwrap().f_city.as_str(),
                     );
                 }
                 4 => {
-                    ::omnibuf::codec::write_uint_field(dst, 4, u64::from(self.f_rack));
+                    ::omnibuf::codec::write_uint_field(
+                        dst,
+                        4,
+                        u64::from(self.dirty_state.as_deref().unwrap().f_rack),
+                    );
                 }
                 5 => {
-                    ::omnibuf::codec::write_float32_field(dst, 5, self.f_latitude);
+                    ::omnibuf::codec::write_float32_field(
+                        dst,
+                        5,
+                        self.dirty_state.as_deref().unwrap().f_latitude,
+                    );
                 }
                 6 => {
-                    ::omnibuf::codec::write_float32_field(dst, 6, self.f_longitude);
+                    ::omnibuf::codec::write_float32_field(
+                        dst,
+                        6,
+                        self.dirty_state.as_deref().unwrap().f_longitude,
+                    );
                 }
                 _ => {}
             }
@@ -384,9 +512,8 @@ impl<'a> OpaqueLocation<'a> {
 
     pub fn try_marshal_append(&self, dst: &mut ::std::vec::Vec<u8>) -> ::omnibuf::Result<()> {
         if self.dirty == 0 {
-            return ::omnibuf::opaque::try_copy_packet(dst, &self.raw);
+            return ::omnibuf::opaque::try_append_packet(dst, &self.raw);
         }
-        dst.clear();
         ::omnibuf::opaque::try_splice_fields(dst, &self.raw, self.dirty, 6, |dst, fnum| {
             let deterministic = true;
             let _ = deterministic;
@@ -395,35 +522,57 @@ impl<'a> OpaqueLocation<'a> {
                     ::omnibuf::codec::write_string_field(
                         dst,
                         1,
-                        self.heap.as_deref().unwrap().f_region.as_str(),
+                        self.dirty_state.as_deref().unwrap().f_region.as_str(),
                     );
                 }
                 2 => {
                     ::omnibuf::codec::write_string_field(
                         dst,
                         2,
-                        self.heap.as_deref().unwrap().f_datacenter.as_str(),
+                        self.dirty_state.as_deref().unwrap().f_datacenter.as_str(),
                     );
                 }
                 3 => {
                     ::omnibuf::codec::write_string_field(
                         dst,
                         3,
-                        self.heap.as_deref().unwrap().f_city.as_str(),
+                        self.dirty_state.as_deref().unwrap().f_city.as_str(),
                     );
                 }
                 4 => {
-                    ::omnibuf::codec::write_uint_field(dst, 4, u64::from(self.f_rack));
+                    ::omnibuf::codec::write_uint_field(
+                        dst,
+                        4,
+                        u64::from(self.dirty_state.as_deref().unwrap().f_rack),
+                    );
                 }
                 5 => {
-                    ::omnibuf::codec::write_float32_field(dst, 5, self.f_latitude);
+                    ::omnibuf::codec::write_float32_field(
+                        dst,
+                        5,
+                        self.dirty_state.as_deref().unwrap().f_latitude,
+                    );
                 }
                 6 => {
-                    ::omnibuf::codec::write_float32_field(dst, 6, self.f_longitude);
+                    ::omnibuf::codec::write_float32_field(
+                        dst,
+                        6,
+                        self.dirty_state.as_deref().unwrap().f_longitude,
+                    );
                 }
                 _ => {}
             }
         })
+    }
+
+    #[inline]
+    pub fn marshal_validated(&self) -> ::omnibuf::Result<::std::vec::Vec<u8>> {
+        self.try_marshal()
+    }
+
+    #[inline]
+    pub fn marshal_validated_append(&self, dst: &mut ::std::vec::Vec<u8>) -> ::omnibuf::Result<()> {
+        self.try_marshal_append(dst)
     }
 }
 
@@ -440,7 +589,8 @@ pub struct Neighbor {
 impl Neighbor {
     #[inline]
     pub fn marshal_omnibuf(&self) -> ::std::vec::Vec<u8> {
-        let mut dst = ::std::vec::Vec::with_capacity(128);
+        let cap = <Self as ::omnibuf::Message>::encoded_size_hint(self).max(128);
+        let mut dst = ::std::vec::Vec::with_capacity(cap);
         self.marshal_omnibuf_append(&mut dst);
         dst
     }
@@ -513,6 +663,20 @@ impl ::omnibuf::Message for Neighbor {
         self.established = ::core::default::Default::default();
     }
 
+    #[inline]
+    fn min_wire_size_bounded(&self, depth_rem: usize) -> usize {
+        let _ = depth_rem;
+        let mut __sz = 0usize;
+        __sz += 2usize;
+        __sz += {
+            let __l = (self.router).len();
+            1usize + ::omnibuf::wire::varint_len(__l as u64) + __l
+        };
+        __sz += 2usize;
+        __sz += 1usize;
+        __sz
+    }
+
     fn build_schema_meta(
         active: &mut ::std::collections::HashSet<::core::any::TypeId>,
         depth: usize,
@@ -579,9 +743,78 @@ impl ::omnibuf::Message for Neighbor {
 }
 
 #[allow(dead_code)]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NeighborBorrowed<'a> {
+    pub peer_asn: u32,
+    pub router: &'a str,
+    pub latency_us: u32,
+    pub established: bool,
+    _marker: ::core::marker::PhantomData<&'a [u8]>,
+}
+
+#[allow(dead_code)]
+impl<'a> NeighborBorrowed<'a> {
+    #[inline]
+    pub fn from_omnibuf(data: &'a [u8]) -> ::omnibuf::Result<Self> {
+        <Self as ::omnibuf::DecodeBorrowed<'a>>::from_omnibuf_borrowed(data)
+    }
+
+    #[inline]
+    pub fn unmarshal_omnibuf(&mut self, data: &'a [u8]) -> ::omnibuf::Result<()> {
+        <Self as ::omnibuf::DecodeBorrowed<'a>>::decode_omnibuf_borrowed(self, data)
+    }
+}
+
+impl<'a> ::omnibuf::DecodeBorrowed<'a> for NeighborBorrowed<'a> {
+    #[inline]
+    fn decode_omnibuf_borrowed_at_depth(
+        &mut self,
+        data: &'a [u8],
+        depth: usize,
+        merge: bool,
+    ) -> ::omnibuf::Result<()> {
+        let mut dec = ::omnibuf::Decoder::with_depth(data, depth)?;
+        if !merge {
+            self.clear_omnibuf_borrowed();
+        }
+        while let ::core::option::Option::Some((fnum, wt)) = dec.next_tag()? {
+            match fnum {
+                1 if wt == 0 => {
+                    self.peer_asn = dec.read_uint()? as u32;
+                }
+                2 if wt == 10 => {
+                    self.router = dec.read_str()?;
+                }
+                3 if wt == 0 => {
+                    self.latency_us = dec.read_uint()? as u32;
+                }
+                4 if wt == ::omnibuf::wire::WIRE_BOOL_FALSE
+                    || wt == ::omnibuf::wire::WIRE_BOOL_TRUE =>
+                {
+                    self.established = wt == ::omnibuf::wire::WIRE_BOOL_TRUE;
+                }
+                _ => dec.skip_unknown(fnum, wt)?,
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+
+    #[inline]
+    fn clear_omnibuf_borrowed(&mut self) {
+        self.peer_asn = ::core::default::Default::default();
+        self.router = "";
+        self.latency_us = ::core::default::Default::default();
+        self.established = ::core::default::Default::default();
+    }
+}
+
+#[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
-struct OpaqueNeighborHeap {
+struct OpaqueNeighborDirty {
+    f_peer_asn: u32,
     f_router: ::std::string::String,
+    f_latency_us: u32,
+    f_established: bool,
 }
 
 #[allow(dead_code)]
@@ -589,10 +822,8 @@ struct OpaqueNeighborHeap {
 pub struct OpaqueNeighbor<'a> {
     pub(crate) raw: ::std::borrow::Cow<'a, [u8]>,
     dirty: u64,
-    heap: ::core::option::Option<::std::boxed::Box<OpaqueNeighborHeap>>,
-    f_peer_asn: u32,
-    f_latency_us: u32,
-    f_established: bool,
+    dir: ::omnibuf::opaque::LazyFieldDir,
+    dirty_state: ::core::option::Option<::std::boxed::Box<OpaqueNeighborDirty>>,
 }
 
 #[allow(dead_code, clippy::too_many_arguments)]
@@ -634,6 +865,7 @@ impl<'a> OpaqueNeighbor<'a> {
     pub fn unmarshal(&mut self, raw: &'a [u8]) {
         self.raw = ::std::borrow::Cow::Borrowed(raw);
         self.dirty = 0;
+        self.dir.reset();
     }
 
     #[inline]
@@ -649,60 +881,72 @@ impl<'a> OpaqueNeighbor<'a> {
     }
 
     #[inline]
-    fn heap_mut(&mut self) -> &mut OpaqueNeighborHeap {
-        self.heap
+    fn dirty_mut(&mut self) -> &mut OpaqueNeighborDirty {
+        self.dirty_state
             .get_or_insert_with(::core::default::Default::default)
     }
 
     #[inline]
     pub fn get_peer_asn(&self) -> u32 {
         if (self.dirty & 2u64) != 0 {
-            return self.f_peer_asn;
+            return self
+                .dirty_state
+                .as_deref()
+                .map_or_else(::core::default::Default::default, |d| d.f_peer_asn);
         }
-        ::omnibuf::wire::read_uint(&self.raw, 1).unwrap_or(0) as u32
+        self.dir.read_uint(&self.raw, 1).unwrap_or(0) as u32
     }
     #[inline]
     pub fn set_peer_asn(&mut self, v: u32) {
-        self.f_peer_asn = v;
+        self.dirty_mut().f_peer_asn = v;
         self.dirty |= 2u64;
     }
 
     #[inline]
     pub fn get_router(&self) -> &str {
         if (self.dirty & 4u64) != 0 {
-            return self.heap.as_deref().map_or("", |h| h.f_router.as_str());
+            return self
+                .dirty_state
+                .as_deref()
+                .map_or("", |d| d.f_router.as_str());
         }
-        ::omnibuf::wire::read_str(&self.raw, 2).unwrap_or("")
+        self.dir.read_str(&self.raw, 2).unwrap_or("")
     }
     #[inline]
     pub fn set_router(&mut self, v: impl ::std::convert::Into<::std::string::String>) {
-        self.heap_mut().f_router = v.into();
+        self.dirty_mut().f_router = v.into();
         self.dirty |= 4u64;
     }
 
     #[inline]
     pub fn get_latency_us(&self) -> u32 {
         if (self.dirty & 8u64) != 0 {
-            return self.f_latency_us;
+            return self
+                .dirty_state
+                .as_deref()
+                .map_or_else(::core::default::Default::default, |d| d.f_latency_us);
         }
-        ::omnibuf::wire::read_uint(&self.raw, 3).unwrap_or(0) as u32
+        self.dir.read_uint(&self.raw, 3).unwrap_or(0) as u32
     }
     #[inline]
     pub fn set_latency_us(&mut self, v: u32) {
-        self.f_latency_us = v;
+        self.dirty_mut().f_latency_us = v;
         self.dirty |= 8u64;
     }
 
     #[inline]
     pub fn get_established(&self) -> bool {
         if (self.dirty & 16u64) != 0 {
-            return self.f_established;
+            return self
+                .dirty_state
+                .as_deref()
+                .map_or_else(::core::default::Default::default, |d| d.f_established);
         }
-        ::omnibuf::wire::read_bool(&self.raw, 4).unwrap_or(false)
+        self.dir.read_bool(&self.raw, 4).unwrap_or(false)
     }
     #[inline]
     pub fn set_established(&mut self, v: bool) {
-        self.f_established = v;
+        self.dirty_mut().f_established = v;
         self.dirty |= 16u64;
     }
 
@@ -715,29 +959,40 @@ impl<'a> OpaqueNeighbor<'a> {
 
     pub fn marshal_append(&self, dst: &mut ::std::vec::Vec<u8>) {
         if self.dirty == 0 {
-            ::omnibuf::opaque::copy_packet(dst, &self.raw);
+            ::omnibuf::opaque::append_packet(dst, &self.raw);
             return;
         }
-        dst.clear();
         ::omnibuf::opaque::splice_fields(dst, &self.raw, self.dirty, 4, |dst, fnum| {
             let deterministic = true;
             let _ = deterministic;
             match fnum {
                 1 => {
-                    ::omnibuf::codec::write_uint_field(dst, 1, u64::from(self.f_peer_asn));
+                    ::omnibuf::codec::write_uint_field(
+                        dst,
+                        1,
+                        u64::from(self.dirty_state.as_deref().unwrap().f_peer_asn),
+                    );
                 }
                 2 => {
                     ::omnibuf::codec::write_string_field(
                         dst,
                         2,
-                        self.heap.as_deref().unwrap().f_router.as_str(),
+                        self.dirty_state.as_deref().unwrap().f_router.as_str(),
                     );
                 }
                 3 => {
-                    ::omnibuf::codec::write_uint_field(dst, 3, u64::from(self.f_latency_us));
+                    ::omnibuf::codec::write_uint_field(
+                        dst,
+                        3,
+                        u64::from(self.dirty_state.as_deref().unwrap().f_latency_us),
+                    );
                 }
                 4 => {
-                    ::omnibuf::codec::write_bool_field(dst, 4, self.f_established);
+                    ::omnibuf::codec::write_bool_field(
+                        dst,
+                        4,
+                        self.dirty_state.as_deref().unwrap().f_established,
+                    );
                 }
                 _ => {}
             }
@@ -753,32 +1008,53 @@ impl<'a> OpaqueNeighbor<'a> {
 
     pub fn try_marshal_append(&self, dst: &mut ::std::vec::Vec<u8>) -> ::omnibuf::Result<()> {
         if self.dirty == 0 {
-            return ::omnibuf::opaque::try_copy_packet(dst, &self.raw);
+            return ::omnibuf::opaque::try_append_packet(dst, &self.raw);
         }
-        dst.clear();
         ::omnibuf::opaque::try_splice_fields(dst, &self.raw, self.dirty, 4, |dst, fnum| {
             let deterministic = true;
             let _ = deterministic;
             match fnum {
                 1 => {
-                    ::omnibuf::codec::write_uint_field(dst, 1, u64::from(self.f_peer_asn));
+                    ::omnibuf::codec::write_uint_field(
+                        dst,
+                        1,
+                        u64::from(self.dirty_state.as_deref().unwrap().f_peer_asn),
+                    );
                 }
                 2 => {
                     ::omnibuf::codec::write_string_field(
                         dst,
                         2,
-                        self.heap.as_deref().unwrap().f_router.as_str(),
+                        self.dirty_state.as_deref().unwrap().f_router.as_str(),
                     );
                 }
                 3 => {
-                    ::omnibuf::codec::write_uint_field(dst, 3, u64::from(self.f_latency_us));
+                    ::omnibuf::codec::write_uint_field(
+                        dst,
+                        3,
+                        u64::from(self.dirty_state.as_deref().unwrap().f_latency_us),
+                    );
                 }
                 4 => {
-                    ::omnibuf::codec::write_bool_field(dst, 4, self.f_established);
+                    ::omnibuf::codec::write_bool_field(
+                        dst,
+                        4,
+                        self.dirty_state.as_deref().unwrap().f_established,
+                    );
                 }
                 _ => {}
             }
         })
+    }
+
+    #[inline]
+    pub fn marshal_validated(&self) -> ::omnibuf::Result<::std::vec::Vec<u8>> {
+        self.try_marshal()
+    }
+
+    #[inline]
+    pub fn marshal_validated_append(&self, dst: &mut ::std::vec::Vec<u8>) -> ::omnibuf::Result<()> {
+        self.try_marshal_append(dst)
     }
 }
 
@@ -802,7 +1078,8 @@ pub struct PeerUpdate {
 impl PeerUpdate {
     #[inline]
     pub fn marshal_omnibuf(&self) -> ::std::vec::Vec<u8> {
-        let mut dst = ::std::vec::Vec::with_capacity(128);
+        let cap = <Self as ::omnibuf::Message>::encoded_size_hint(self).max(128);
+        let mut dst = ::std::vec::Vec::with_capacity(cap);
         self.marshal_omnibuf_append(&mut dst);
         dst
     }
@@ -961,6 +1238,67 @@ impl ::omnibuf::Message for PeerUpdate {
         self.sequence = ::core::default::Default::default();
     }
 
+    #[inline]
+    fn min_wire_size_bounded(&self, depth_rem: usize) -> usize {
+        let _ = depth_rem;
+        let mut __sz = 0usize;
+        __sz += 2usize;
+        __sz += {
+            let __l = (self.router_id).len();
+            1usize + ::omnibuf::wire::varint_len(__l as u64) + __l
+        };
+        __sz += 1usize;
+        __sz += 2usize;
+        __sz += 2usize;
+        __sz += 9usize;
+        if !self.tags.is_empty() {
+            let __c = self.tags.len();
+            let __b = 1usize
+                + ::omnibuf::wire::varint_len(__c as u64)
+                + (self
+                    .tags
+                    .iter()
+                    .map(|__x| {
+                        let __l = __x.len();
+                        ::omnibuf::wire::varint_len(__l as u64) + __l
+                    })
+                    .sum::<usize>());
+            __sz += 1usize + ::omnibuf::wire::container_len_width(__b) + __b;
+        }
+        if !self.prefixes.is_empty() {
+            let __c = self.prefixes.len();
+            let __b = 1usize + ::omnibuf::wire::varint_len(__c as u64) + (__c);
+            __sz += 2usize + ::omnibuf::wire::container_len_width(__b) + __b;
+        }
+        if let ::core::option::Option::Some(ref __s) = self.location {
+            let __sub = if depth_rem > 0 {
+                <Location as ::omnibuf::Message>::min_wire_size_bounded(__s, depth_rem - 1)
+            } else {
+                0usize
+            };
+            __sz += 2usize + ::omnibuf::wire::container_len_width(__sub) + __sub;
+        }
+        if !self.neighbors.is_empty() {
+            let __c = self.neighbors.len();
+            let mut __elems = 0usize;
+            if depth_rem > 0 {
+                for __el in &self.neighbors {
+                    let __s = <Neighbor as ::omnibuf::Message>::min_wire_size_bounded(
+                        __el,
+                        depth_rem - 1,
+                    );
+                    __elems += ::omnibuf::wire::container_len_width(__s) + __s;
+                }
+            } else {
+                __elems = __c;
+            }
+            let __b = 1usize + ::omnibuf::wire::varint_len(__c as u64) + __elems;
+            __sz += 2usize + ::omnibuf::wire::container_len_width(__b) + __b;
+        }
+        __sz += 3usize;
+        __sz
+    }
+
     fn build_schema_meta(
         active: &mut ::std::collections::HashSet<::core::any::TypeId>,
         depth: usize,
@@ -1091,13 +1429,164 @@ impl ::omnibuf::Message for PeerUpdate {
 }
 
 #[allow(dead_code)]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PeerUpdateBorrowed<'a> {
+    pub asn: u32,
+    pub router_id: &'a str,
+    pub active: bool,
+    pub uptime_sec: u64,
+    pub rssi_dbm: i32,
+    pub cpu_load: f64,
+    pub tags: ::std::vec::Vec<&'a str>,
+    pub prefixes: ::std::vec::Vec<u32>,
+    pub location: ::core::option::Option<LocationBorrowed<'a>>,
+    pub neighbors: ::std::vec::Vec<NeighborBorrowed<'a>>,
+    pub sequence: u64,
+    _marker: ::core::marker::PhantomData<&'a [u8]>,
+}
+
+#[allow(dead_code)]
+impl<'a> PeerUpdateBorrowed<'a> {
+    #[inline]
+    pub fn from_omnibuf(data: &'a [u8]) -> ::omnibuf::Result<Self> {
+        <Self as ::omnibuf::DecodeBorrowed<'a>>::from_omnibuf_borrowed(data)
+    }
+
+    #[inline]
+    pub fn unmarshal_omnibuf(&mut self, data: &'a [u8]) -> ::omnibuf::Result<()> {
+        <Self as ::omnibuf::DecodeBorrowed<'a>>::decode_omnibuf_borrowed(self, data)
+    }
+}
+
+impl<'a> ::omnibuf::DecodeBorrowed<'a> for PeerUpdateBorrowed<'a> {
+    #[inline]
+    fn decode_omnibuf_borrowed_at_depth(
+        &mut self,
+        data: &'a [u8],
+        depth: usize,
+        merge: bool,
+    ) -> ::omnibuf::Result<()> {
+        let mut dec = ::omnibuf::Decoder::with_depth(data, depth)?;
+        if !merge {
+            self.clear_omnibuf_borrowed();
+        }
+        while let ::core::option::Option::Some((fnum, wt)) = dec.next_tag()? {
+            match fnum {
+                1 if wt == 0 => {
+                    self.asn = dec.read_uint()? as u32;
+                }
+                2 if wt == 10 => {
+                    self.router_id = dec.read_str()?;
+                }
+                3 if wt == ::omnibuf::wire::WIRE_BOOL_FALSE
+                    || wt == ::omnibuf::wire::WIRE_BOOL_TRUE =>
+                {
+                    self.active = wt == ::omnibuf::wire::WIRE_BOOL_TRUE;
+                }
+                4 if wt == 0 => {
+                    self.uptime_sec = dec.read_uint()?;
+                }
+                5 if wt == 1 => {
+                    self.rssi_dbm = dec.read_sint()? as i32;
+                }
+                6 if wt == 9 => {
+                    self.cpu_load = dec.read_float64()?;
+                }
+                7 if wt == 13 => {
+                    let pos = dec.position();
+                    let next_pos = ::omnibuf::codec::read_scalar_vec_borrowed_field(
+                        &mut self.tags,
+                        dec.data(),
+                        pos,
+                        depth,
+                        10,
+                        false,
+                        ::omnibuf::codec::read_elem_str_borrowed,
+                    )?;
+                    dec.set_position(next_pos);
+                }
+                8 if wt == 13 => {
+                    let pos = dec.position();
+                    let next_pos = ::omnibuf::codec::read_scalar_vec_borrowed_field(
+                        &mut self.prefixes,
+                        dec.data(),
+                        pos,
+                        depth,
+                        0,
+                        false,
+                        |b, p| ::omnibuf::codec::read_elem_uint(b, p).map(|(v, np)| (v as u32, np)),
+                    )?;
+                    dec.set_position(next_pos);
+                }
+                9 if wt == 12 => {
+                    let pos = dec.position();
+                    let next_pos = ::omnibuf::codec::read_opt_sub_msg_borrowed_field(
+                        &mut self.location,
+                        dec.data(),
+                        pos,
+                        depth,
+                        true,
+                    )?;
+                    dec.set_position(next_pos);
+                }
+                10 if wt == 13 => {
+                    let pos = dec.position();
+                    let next_pos = ::omnibuf::codec::read_sub_msg_borrowed_vec_field(
+                        &mut self.neighbors,
+                        dec.data(),
+                        pos,
+                        depth,
+                        false,
+                    )?;
+                    dec.set_position(next_pos);
+                }
+                11 if wt == 0 => {
+                    self.sequence = dec.read_uint()?;
+                }
+                _ => dec.skip_unknown(fnum, wt)?,
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+
+    #[inline]
+    fn clear_omnibuf_borrowed(&mut self) {
+        self.asn = ::core::default::Default::default();
+        self.router_id = "";
+        self.active = ::core::default::Default::default();
+        self.uptime_sec = ::core::default::Default::default();
+        self.rssi_dbm = ::core::default::Default::default();
+        self.cpu_load = ::core::default::Default::default();
+        if !self.tags.is_empty() {
+            self.tags.clear();
+        }
+        if !self.prefixes.is_empty() {
+            self.prefixes.clear();
+        }
+        if self.location.is_some() {
+            self.location = ::core::option::Option::None;
+        }
+        if !self.neighbors.is_empty() {
+            self.neighbors.clear();
+        }
+        self.sequence = ::core::default::Default::default();
+    }
+}
+
+#[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
-struct OpaquePeerUpdateHeap {
+struct OpaquePeerUpdateDirty {
+    f_asn: u32,
     f_router_id: ::std::string::String,
+    f_active: bool,
+    f_uptime_sec: u64,
+    f_rssi_dbm: i32,
+    f_cpu_load: f64,
     f_tags: ::std::vec::Vec<::std::string::String>,
     f_prefixes: ::std::vec::Vec<u32>,
     f_location: ::core::option::Option<Location>,
     f_neighbors: ::std::vec::Vec<Neighbor>,
+    f_sequence: u64,
 }
 
 #[allow(dead_code)]
@@ -1105,13 +1594,8 @@ struct OpaquePeerUpdateHeap {
 pub struct OpaquePeerUpdate<'a> {
     pub(crate) raw: ::std::borrow::Cow<'a, [u8]>,
     dirty: u64,
-    heap: ::core::option::Option<::std::boxed::Box<OpaquePeerUpdateHeap>>,
-    f_asn: u32,
-    f_active: bool,
-    f_uptime_sec: u64,
-    f_rssi_dbm: i32,
-    f_cpu_load: f64,
-    f_sequence: u64,
+    dir: ::omnibuf::opaque::LazyFieldDir,
+    dirty_state: ::core::option::Option<::std::boxed::Box<OpaquePeerUpdateDirty>>,
 }
 
 #[allow(dead_code, clippy::too_many_arguments)]
@@ -1155,6 +1639,7 @@ impl<'a> OpaquePeerUpdate<'a> {
     pub fn unmarshal(&mut self, raw: &'a [u8]) {
         self.raw = ::std::borrow::Cow::Borrowed(raw);
         self.dirty = 0;
+        self.dir.reset();
     }
 
     #[inline]
@@ -1170,102 +1655,120 @@ impl<'a> OpaquePeerUpdate<'a> {
     }
 
     #[inline]
-    fn heap_mut(&mut self) -> &mut OpaquePeerUpdateHeap {
-        self.heap
+    fn dirty_mut(&mut self) -> &mut OpaquePeerUpdateDirty {
+        self.dirty_state
             .get_or_insert_with(::core::default::Default::default)
     }
 
     #[inline]
     pub fn get_asn(&self) -> u32 {
         if (self.dirty & 2u64) != 0 {
-            return self.f_asn;
+            return self
+                .dirty_state
+                .as_deref()
+                .map_or_else(::core::default::Default::default, |d| d.f_asn);
         }
-        ::omnibuf::wire::read_uint(&self.raw, 1).unwrap_or(0) as u32
+        self.dir.read_uint(&self.raw, 1).unwrap_or(0) as u32
     }
     #[inline]
     pub fn set_asn(&mut self, v: u32) {
-        self.f_asn = v;
+        self.dirty_mut().f_asn = v;
         self.dirty |= 2u64;
     }
 
     #[inline]
     pub fn get_router_id(&self) -> &str {
         if (self.dirty & 4u64) != 0 {
-            return self.heap.as_deref().map_or("", |h| h.f_router_id.as_str());
+            return self
+                .dirty_state
+                .as_deref()
+                .map_or("", |d| d.f_router_id.as_str());
         }
-        ::omnibuf::wire::read_str(&self.raw, 2).unwrap_or("")
+        self.dir.read_str(&self.raw, 2).unwrap_or("")
     }
     #[inline]
     pub fn set_router_id(&mut self, v: impl ::std::convert::Into<::std::string::String>) {
-        self.heap_mut().f_router_id = v.into();
+        self.dirty_mut().f_router_id = v.into();
         self.dirty |= 4u64;
     }
 
     #[inline]
     pub fn get_active(&self) -> bool {
         if (self.dirty & 8u64) != 0 {
-            return self.f_active;
+            return self
+                .dirty_state
+                .as_deref()
+                .map_or_else(::core::default::Default::default, |d| d.f_active);
         }
-        ::omnibuf::wire::read_bool(&self.raw, 3).unwrap_or(false)
+        self.dir.read_bool(&self.raw, 3).unwrap_or(false)
     }
     #[inline]
     pub fn set_active(&mut self, v: bool) {
-        self.f_active = v;
+        self.dirty_mut().f_active = v;
         self.dirty |= 8u64;
     }
 
     #[inline]
     pub fn get_uptime_sec(&self) -> u64 {
         if (self.dirty & 16u64) != 0 {
-            return self.f_uptime_sec;
+            return self
+                .dirty_state
+                .as_deref()
+                .map_or_else(::core::default::Default::default, |d| d.f_uptime_sec);
         }
-        ::omnibuf::wire::read_uint(&self.raw, 4).unwrap_or(0)
+        self.dir.read_uint(&self.raw, 4).unwrap_or(0)
     }
     #[inline]
     pub fn set_uptime_sec(&mut self, v: u64) {
-        self.f_uptime_sec = v;
+        self.dirty_mut().f_uptime_sec = v;
         self.dirty |= 16u64;
     }
 
     #[inline]
     pub fn get_rssi_dbm(&self) -> i32 {
         if (self.dirty & 32u64) != 0 {
-            return self.f_rssi_dbm;
+            return self
+                .dirty_state
+                .as_deref()
+                .map_or_else(::core::default::Default::default, |d| d.f_rssi_dbm);
         }
-        ::omnibuf::wire::read_sint(&self.raw, 5).unwrap_or(0) as i32
+        self.dir.read_sint(&self.raw, 5).unwrap_or(0) as i32
     }
     #[inline]
     pub fn set_rssi_dbm(&mut self, v: i32) {
-        self.f_rssi_dbm = v;
+        self.dirty_mut().f_rssi_dbm = v;
         self.dirty |= 32u64;
     }
 
     #[inline]
     pub fn get_cpu_load(&self) -> f64 {
         if (self.dirty & 64u64) != 0 {
-            return self.f_cpu_load;
+            return self
+                .dirty_state
+                .as_deref()
+                .map_or_else(::core::default::Default::default, |d| d.f_cpu_load);
         }
-        ::omnibuf::wire::read_float64(&self.raw, 6).unwrap_or(0.0)
+        self.dir.read_float64(&self.raw, 6).unwrap_or(0.0)
     }
     #[inline]
     pub fn set_cpu_load(&mut self, v: f64) {
-        self.f_cpu_load = v;
+        self.dirty_mut().f_cpu_load = v;
         self.dirty |= 64u64;
     }
 
     #[inline]
     pub fn tags_len(&self) -> usize {
         if (self.dirty & 128u64) != 0 {
-            return self.heap.as_deref().map_or(0, |h| h.f_tags.len());
+            return self.dirty_state.as_deref().map_or(0, |d| d.f_tags.len());
         }
         ::omnibuf::wire::counted_arr_len(&self.raw, 7, 10)
     }
     pub fn get_tags(&self) -> ::std::vec::Vec<::std::string::String> {
         if (self.dirty & 128u64) != 0 {
             return self
-                .heap
+                .dirty_state
                 .as_deref()
-                .map_or_else(::std::vec::Vec::new, |h| h.f_tags.clone());
+                .map_or_else(::std::vec::Vec::new, |d| d.f_tags.clone());
         }
         let mut out = ::std::vec::Vec::new();
         let mut pos = 0usize;
@@ -1305,23 +1808,26 @@ impl<'a> OpaquePeerUpdate<'a> {
     }
     #[inline]
     pub fn set_tags(&mut self, v: ::std::vec::Vec<::std::string::String>) {
-        self.heap_mut().f_tags = v;
+        self.dirty_mut().f_tags = v;
         self.dirty |= 128u64;
     }
 
     #[inline]
     pub fn prefixes_len(&self) -> usize {
         if (self.dirty & 256u64) != 0 {
-            return self.heap.as_deref().map_or(0, |h| h.f_prefixes.len());
+            return self
+                .dirty_state
+                .as_deref()
+                .map_or(0, |d| d.f_prefixes.len());
         }
         ::omnibuf::wire::counted_arr_len(&self.raw, 8, 0)
     }
     pub fn get_prefixes(&self) -> ::std::vec::Vec<u32> {
         if (self.dirty & 256u64) != 0 {
             return self
-                .heap
+                .dirty_state
                 .as_deref()
-                .map_or_else(::std::vec::Vec::new, |h| h.f_prefixes.clone());
+                .map_or_else(::std::vec::Vec::new, |d| d.f_prefixes.clone());
         }
         let mut out = ::std::vec::Vec::new();
         let mut pos = 0usize;
@@ -1361,20 +1867,31 @@ impl<'a> OpaquePeerUpdate<'a> {
     }
     #[inline]
     pub fn set_prefixes(&mut self, v: ::std::vec::Vec<u32>) {
-        self.heap_mut().f_prefixes = v;
+        self.dirty_mut().f_prefixes = v;
         self.dirty |= 256u64;
     }
 
     #[inline]
+    pub fn has_location(&self) -> bool {
+        if (self.dirty & 512u64) != 0 {
+            return self
+                .dirty_state
+                .as_deref()
+                .is_some_and(|d| d.f_location.is_some());
+        }
+        self.dir.has_sub_msg(&self.raw, 9)
+    }
+    #[inline]
     pub fn get_location(&self) -> OpaqueLocation<'_> {
         if (self.dirty & 512u64) != 0 {
-            if let ::core::option::Option::Some(ref sub) = self.heap.as_deref().unwrap().f_location
+            if let ::core::option::Option::Some(ref sub) =
+                self.dirty_state.as_deref().unwrap().f_location
             {
                 return OpaqueLocation::from_owned((sub).marshal_omnibuf());
             }
             return OpaqueLocation::new(&[]);
         }
-        match ::omnibuf::wire::read_sub_msg(&self.raw, 9) {
+        match self.dir.read_sub_msg(&self.raw, 9) {
             ::core::option::Option::Some(::std::borrow::Cow::Borrowed(slice)) => {
                 OpaqueLocation::new(slice)
             }
@@ -1386,21 +1903,41 @@ impl<'a> OpaquePeerUpdate<'a> {
     }
     #[inline]
     pub fn set_location(&mut self, v: ::core::option::Option<Location>) {
-        self.heap_mut().f_location = v;
+        self.dirty_mut().f_location = v;
         self.dirty |= 512u64;
     }
 
     #[inline]
     pub fn neighbors_len(&self) -> usize {
         if (self.dirty & 1024u64) != 0 {
-            return self.heap.as_deref().map_or(0, |h| h.f_neighbors.len());
+            return self
+                .dirty_state
+                .as_deref()
+                .map_or(0, |d| d.f_neighbors.len());
         }
         ::omnibuf::wire::sub_msg_arr_len(&self.raw, 10)
     }
+    #[inline]
+    pub fn iter_neighbors(
+        &self,
+    ) -> impl ::core::iter::ExactSizeIterator<Item = OpaqueNeighbor<'_>> + '_ {
+        if (self.dirty & 1024u64) != 0 {
+            let slice = self
+                .dirty_state
+                .as_deref()
+                .map_or(&[][..], |d| d.f_neighbors.as_slice());
+            return ::omnibuf::opaque::OpaqueSubMsgIter::dirty(slice, |elem: &Neighbor| {
+                OpaqueNeighbor::from_owned(elem.marshal_omnibuf())
+            });
+        }
+        ::omnibuf::opaque::OpaqueSubMsgIter::clean(&self.raw, 10, OpaqueNeighbor::new)
+    }
     pub fn get_neighbors(&self, idx: usize) -> OpaqueNeighbor<'_> {
         if (self.dirty & 1024u64) != 0 {
-            if let ::core::option::Option::Some(elem) =
-                self.heap.as_deref().and_then(|h| h.f_neighbors.get(idx))
+            if let ::core::option::Option::Some(elem) = self
+                .dirty_state
+                .as_deref()
+                .and_then(|d| d.f_neighbors.get(idx))
             {
                 return OpaqueNeighbor::from_owned(elem.marshal_omnibuf());
             }
@@ -1413,20 +1950,23 @@ impl<'a> OpaquePeerUpdate<'a> {
     }
     #[inline]
     pub fn set_neighbors(&mut self, v: ::std::vec::Vec<Neighbor>) {
-        self.heap_mut().f_neighbors = v;
+        self.dirty_mut().f_neighbors = v;
         self.dirty |= 1024u64;
     }
 
     #[inline]
     pub fn get_sequence(&self) -> u64 {
         if (self.dirty & 2048u64) != 0 {
-            return self.f_sequence;
+            return self
+                .dirty_state
+                .as_deref()
+                .map_or_else(::core::default::Default::default, |d| d.f_sequence);
         }
-        ::omnibuf::wire::read_uint(&self.raw, 11).unwrap_or(0)
+        self.dir.read_uint(&self.raw, 11).unwrap_or(0)
     }
     #[inline]
     pub fn set_sequence(&mut self, v: u64) {
-        self.f_sequence = v;
+        self.dirty_mut().f_sequence = v;
         self.dirty |= 2048u64;
     }
 
@@ -1439,42 +1979,61 @@ impl<'a> OpaquePeerUpdate<'a> {
 
     pub fn marshal_append(&self, dst: &mut ::std::vec::Vec<u8>) {
         if self.dirty == 0 {
-            ::omnibuf::opaque::copy_packet(dst, &self.raw);
+            ::omnibuf::opaque::append_packet(dst, &self.raw);
             return;
         }
-        dst.clear();
         ::omnibuf::opaque::splice_fields(dst, &self.raw, self.dirty, 11, |dst, fnum| {
             let deterministic = true;
             let _ = deterministic;
             match fnum {
                 1 => {
-                    ::omnibuf::codec::write_uint_field(dst, 1, u64::from(self.f_asn));
+                    ::omnibuf::codec::write_uint_field(
+                        dst,
+                        1,
+                        u64::from(self.dirty_state.as_deref().unwrap().f_asn),
+                    );
                 }
                 2 => {
                     ::omnibuf::codec::write_string_field(
                         dst,
                         2,
-                        self.heap.as_deref().unwrap().f_router_id.as_str(),
+                        self.dirty_state.as_deref().unwrap().f_router_id.as_str(),
                     );
                 }
                 3 => {
-                    ::omnibuf::codec::write_bool_field(dst, 3, self.f_active);
+                    ::omnibuf::codec::write_bool_field(
+                        dst,
+                        3,
+                        self.dirty_state.as_deref().unwrap().f_active,
+                    );
                 }
                 4 => {
-                    ::omnibuf::codec::write_uint_field(dst, 4, self.f_uptime_sec);
+                    ::omnibuf::codec::write_uint_field(
+                        dst,
+                        4,
+                        self.dirty_state.as_deref().unwrap().f_uptime_sec,
+                    );
                 }
                 5 => {
-                    ::omnibuf::codec::write_sint_field(dst, 5, i64::from(self.f_rssi_dbm));
+                    ::omnibuf::codec::write_sint_field(
+                        dst,
+                        5,
+                        i64::from(self.dirty_state.as_deref().unwrap().f_rssi_dbm),
+                    );
                 }
                 6 => {
-                    ::omnibuf::codec::write_float64_field(dst, 6, self.f_cpu_load);
+                    ::omnibuf::codec::write_float64_field(
+                        dst,
+                        6,
+                        self.dirty_state.as_deref().unwrap().f_cpu_load,
+                    );
                 }
                 7 => {
                     ::omnibuf::codec::write_scalar_vec_field(
                         dst,
                         7,
                         10,
-                        &self.heap.as_deref().unwrap().f_tags,
+                        &self.dirty_state.as_deref().unwrap().f_tags,
                         |dst, item| {
                             ::omnibuf::wire::append_bytes_elem(dst, (item).as_bytes());
                             ::core::result::Result::Ok(())
@@ -1487,14 +2046,14 @@ impl<'a> OpaquePeerUpdate<'a> {
                         dst,
                         8,
                         0,
-                        &self.heap.as_deref().unwrap().f_prefixes,
+                        &self.dirty_state.as_deref().unwrap().f_prefixes,
                         |item| u64::from(*item),
                     )
                     .unwrap();
                 }
                 9 => {
                     if let ::core::option::Option::Some(ref sub) =
-                        self.heap.as_deref().unwrap().f_location
+                        self.dirty_state.as_deref().unwrap().f_location
                     {
                         ::omnibuf::codec::write_sub_msg_field(dst, 9, sub, deterministic).unwrap();
                     }
@@ -1503,13 +2062,17 @@ impl<'a> OpaquePeerUpdate<'a> {
                     ::omnibuf::codec::write_sub_msg_vec_field(
                         dst,
                         10,
-                        &self.heap.as_deref().unwrap().f_neighbors,
+                        &self.dirty_state.as_deref().unwrap().f_neighbors,
                         deterministic,
                     )
                     .unwrap();
                 }
                 11 => {
-                    ::omnibuf::codec::write_uint_field(dst, 11, self.f_sequence);
+                    ::omnibuf::codec::write_uint_field(
+                        dst,
+                        11,
+                        self.dirty_state.as_deref().unwrap().f_sequence,
+                    );
                 }
                 _ => {}
             }
@@ -1525,41 +2088,60 @@ impl<'a> OpaquePeerUpdate<'a> {
 
     pub fn try_marshal_append(&self, dst: &mut ::std::vec::Vec<u8>) -> ::omnibuf::Result<()> {
         if self.dirty == 0 {
-            return ::omnibuf::opaque::try_copy_packet(dst, &self.raw);
+            return ::omnibuf::opaque::try_append_packet(dst, &self.raw);
         }
-        dst.clear();
         ::omnibuf::opaque::try_splice_fields(dst, &self.raw, self.dirty, 11, |dst, fnum| {
             let deterministic = true;
             let _ = deterministic;
             match fnum {
                 1 => {
-                    ::omnibuf::codec::write_uint_field(dst, 1, u64::from(self.f_asn));
+                    ::omnibuf::codec::write_uint_field(
+                        dst,
+                        1,
+                        u64::from(self.dirty_state.as_deref().unwrap().f_asn),
+                    );
                 }
                 2 => {
                     ::omnibuf::codec::write_string_field(
                         dst,
                         2,
-                        self.heap.as_deref().unwrap().f_router_id.as_str(),
+                        self.dirty_state.as_deref().unwrap().f_router_id.as_str(),
                     );
                 }
                 3 => {
-                    ::omnibuf::codec::write_bool_field(dst, 3, self.f_active);
+                    ::omnibuf::codec::write_bool_field(
+                        dst,
+                        3,
+                        self.dirty_state.as_deref().unwrap().f_active,
+                    );
                 }
                 4 => {
-                    ::omnibuf::codec::write_uint_field(dst, 4, self.f_uptime_sec);
+                    ::omnibuf::codec::write_uint_field(
+                        dst,
+                        4,
+                        self.dirty_state.as_deref().unwrap().f_uptime_sec,
+                    );
                 }
                 5 => {
-                    ::omnibuf::codec::write_sint_field(dst, 5, i64::from(self.f_rssi_dbm));
+                    ::omnibuf::codec::write_sint_field(
+                        dst,
+                        5,
+                        i64::from(self.dirty_state.as_deref().unwrap().f_rssi_dbm),
+                    );
                 }
                 6 => {
-                    ::omnibuf::codec::write_float64_field(dst, 6, self.f_cpu_load);
+                    ::omnibuf::codec::write_float64_field(
+                        dst,
+                        6,
+                        self.dirty_state.as_deref().unwrap().f_cpu_load,
+                    );
                 }
                 7 => {
                     ::omnibuf::codec::write_scalar_vec_field(
                         dst,
                         7,
                         10,
-                        &self.heap.as_deref().unwrap().f_tags,
+                        &self.dirty_state.as_deref().unwrap().f_tags,
                         |dst, item| {
                             ::omnibuf::wire::append_bytes_elem(dst, (item).as_bytes());
                             ::core::result::Result::Ok(())
@@ -1572,14 +2154,14 @@ impl<'a> OpaquePeerUpdate<'a> {
                         dst,
                         8,
                         0,
-                        &self.heap.as_deref().unwrap().f_prefixes,
+                        &self.dirty_state.as_deref().unwrap().f_prefixes,
                         |item| u64::from(*item),
                     )
                     .unwrap();
                 }
                 9 => {
                     if let ::core::option::Option::Some(ref sub) =
-                        self.heap.as_deref().unwrap().f_location
+                        self.dirty_state.as_deref().unwrap().f_location
                     {
                         ::omnibuf::codec::write_sub_msg_field(dst, 9, sub, deterministic).unwrap();
                     }
@@ -1588,16 +2170,30 @@ impl<'a> OpaquePeerUpdate<'a> {
                     ::omnibuf::codec::write_sub_msg_vec_field(
                         dst,
                         10,
-                        &self.heap.as_deref().unwrap().f_neighbors,
+                        &self.dirty_state.as_deref().unwrap().f_neighbors,
                         deterministic,
                     )
                     .unwrap();
                 }
                 11 => {
-                    ::omnibuf::codec::write_uint_field(dst, 11, self.f_sequence);
+                    ::omnibuf::codec::write_uint_field(
+                        dst,
+                        11,
+                        self.dirty_state.as_deref().unwrap().f_sequence,
+                    );
                 }
                 _ => {}
             }
         })
+    }
+
+    #[inline]
+    pub fn marshal_validated(&self) -> ::omnibuf::Result<::std::vec::Vec<u8>> {
+        self.try_marshal()
+    }
+
+    #[inline]
+    pub fn marshal_validated_append(&self, dst: &mut ::std::vec::Vec<u8>) -> ::omnibuf::Result<()> {
+        self.try_marshal_append(dst)
     }
 }

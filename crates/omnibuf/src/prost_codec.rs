@@ -603,9 +603,12 @@ fn decode_dynamic_at_depth(
         }
     }
 
+    if !merge {
+        *msg = DynamicMessage::new(desc.clone());
+    }
+
     let n = data.len();
     let mut pos = 0usize;
-    let mut seen: HashSet<u32> = HashSet::new();
 
     while pos < n {
         let (tag, tn) = decode_varint(&data[pos..])
@@ -645,8 +648,6 @@ fn decode_dynamic_at_depth(
             if depth + 1 > MAX_NESTING_DEPTH {
                 return Err(Error::DepthLimitExceeded(depth + 1));
             }
-            let already_seen = seen.contains(&fnum) || merge;
-            seen.insert(fnum);
 
             let Kind::Message(entry_desc) = fd.kind() else {
                 return Err(Error::parse("invalid map descriptor"));
@@ -666,9 +667,6 @@ fn decode_dynamic_at_depth(
                 return Err(Error::parse("WireMap key/value wire type mismatch"));
             }
 
-            if !already_seen {
-                msg.clear_field(&fd);
-            }
             let Value::Map(map) = msg.get_field_mut(&fd) else {
                 return Err(Error::parse("expected Value::Map"));
             };
@@ -701,8 +699,6 @@ fn decode_dynamic_at_depth(
             if depth + 1 > MAX_NESTING_DEPTH {
                 return Err(Error::DepthLimitExceeded(depth + 1));
             }
-            let already_seen = seen.contains(&fnum) || merge;
-            seen.insert(fnum);
 
             let exp_elem_wt = proto_kind_wire_type(&fd.kind())?;
             let (body, next_pos) = read_len_slice(data, pos, 2)?;
@@ -712,9 +708,6 @@ fn decode_dynamic_at_depth(
                 return Err(Error::parse("WireArray element wire type mismatch"));
             }
 
-            if !already_seen {
-                msg.clear_field(&fd);
-            }
             let Value::List(list) = msg.get_field_mut(&fd) else {
                 return Err(Error::parse("expected Value::List"));
             };
@@ -744,7 +737,6 @@ fn decode_dynamic_at_depth(
                 pos = validate_value(data, pos, wt, depth)?;
                 continue;
             }
-            seen.insert(fnum);
             msg.set_field(&fd, Value::Bool(wt == WIRE_BOOL_TRUE));
             continue;
         }
@@ -755,12 +747,9 @@ fn decode_dynamic_at_depth(
             continue;
         }
 
-        let already_seen = seen.contains(&fnum) || merge;
-        seen.insert(fnum);
-
         if let Kind::Message(sub_desc) = fd.kind() {
             let (sub_bytes, next_pos) = read_len_slice(data, pos, 0)?;
-            if !already_seen || !msg.has_field(&fd) {
+            if !msg.has_field(&fd) {
                 let mut sub_msg = DynamicMessage::new(sub_desc);
                 decode_dynamic_at_depth(sub_bytes, &mut sub_msg, depth + 1, false)?;
                 msg.set_field(&fd, Value::Message(sub_msg));
@@ -774,18 +763,6 @@ fn decode_dynamic_at_depth(
         let (sv, next_pos) = decode_proto_scalar_payload(data, pos, &fd.kind())?;
         msg.set_field(&fd, sv);
         pos = next_pos;
-    }
-
-    if !merge {
-        let mut to_clear = Vec::new();
-        for fd in desc.fields() {
-            if !seen.contains(&fd.number()) && msg.has_field(&fd) {
-                to_clear.push(fd);
-            }
-        }
-        for fd in to_clear {
-            msg.clear_field(&fd);
-        }
     }
 
     Ok(())

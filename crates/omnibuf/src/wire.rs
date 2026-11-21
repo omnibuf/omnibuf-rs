@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::error::{Error, Result};
-use crate::field0::validate_field0;
+use crate::field0::{validate_field0, validate_field0_with_max_depth};
 
 /// Unsigned integer (`[Prefix-Varint]`).
 pub const WIRE_UINT: u8 = 0;
@@ -55,6 +55,32 @@ pub const fn encode_zigzag(n: i64) -> u64 {
 #[inline]
 pub const fn decode_zigzag(u: u64) -> i64 {
     ((u >> 1) as i64) ^ -((u & 1) as i64)
+}
+
+/// Returns the encoded byte width (1, 2, 4, or 9) of `v` as a Prefix-Varint.
+#[inline(always)]
+pub const fn varint_len(v: u64) -> usize {
+    if v <= 127 {
+        1
+    } else if v <= 16_383 {
+        2
+    } else if v <= 536_870_911 {
+        4
+    } else {
+        9
+    }
+}
+
+/// Returns the canonical container length header width (2, 4, or 9 bytes) for `sub_len`.
+#[inline(always)]
+pub const fn container_len_width(sub_len: usize) -> usize {
+    if sub_len <= 16_383 {
+        2
+    } else if sub_len <= 536_870_911 {
+        4
+    } else {
+        9
+    }
 }
 
 /// Encodes `v` as a Prefix-Varint directly at `ptr`, returning the byte width (1, 2, 4, or 9).
@@ -260,6 +286,44 @@ fn backpatch_large_container_len(dst: &mut Vec<u8>, len_pos: usize, sub_len: usi
     }
 }
 
+/// Backpatches a 4-byte container length slot reserved at `dst[len_pos..len_pos + 4]`.
+///
+/// Payloads in `16_384..=536_870_911` patch in place without shifting; smaller payloads
+/// compact back to the canonical 2-byte header and larger payloads expand to 9 bytes.
+#[inline(always)]
+pub fn backpatch_container_len_4b(dst: &mut Vec<u8>, len_pos: usize) {
+    let Some(header_end) = len_pos.checked_add(4) else {
+        return;
+    };
+    let Some(sub_len) = dst.len().checked_sub(header_end) else {
+        return;
+    };
+    if (16_384..=536_870_911).contains(&sub_len) {
+        let u = ((sub_len as u32) << 3) | 4;
+        dst[len_pos..header_end].copy_from_slice(&u.to_le_bytes());
+    } else {
+        backpatch_container_len_4b_adjust(dst, len_pos, sub_len);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn backpatch_container_len_4b_adjust(dst: &mut Vec<u8>, len_pos: usize, sub_len: usize) {
+    let old_len = dst.len();
+    if sub_len <= 16_383 {
+        dst.copy_within(len_pos + 4..old_len, len_pos + 2);
+        dst.truncate(old_len - 2);
+        let u = ((sub_len as u16) << 2) | 2;
+        dst[len_pos..len_pos + 2].copy_from_slice(&u.to_le_bytes());
+    } else {
+        dst.resize(old_len + 5, 0);
+        dst.copy_within(len_pos + 4..old_len, len_pos + 9);
+        dst[len_pos] = 0;
+        let bytes = (sub_len as u64).to_le_bytes();
+        dst[len_pos + 1..len_pos + 9].copy_from_slice(&bytes);
+    }
+}
+
 /// Fills a 1-byte reserved varint slot at `dst[pos]` and expands it if `value > 127`.
 #[inline]
 pub fn patch_reserved_varint(dst: &mut Vec<u8>, pos: usize, value: u64) {
@@ -305,7 +369,7 @@ pub fn grow_capacity(current: usize, required: usize) -> usize {
     required
 }
 
-/// Checks whether `b` is valid UTF-8 with a branch-light word-scan path for short ASCII strings.
+/// Checks whether `b` is valid UTF-8 with an unrestricted word-scan fast path for ASCII strings.
 #[inline(always)]
 pub fn validate_utf8(b: &[u8]) -> Result<&str> {
     let n = b.len();
@@ -334,7 +398,9 @@ pub fn validate_utf8(b: &[u8]) -> Result<&str> {
                 return Ok(unsafe { core::str::from_utf8_unchecked(b) });
             }
         }
-    } else if n <= 32 {
+        return validate_utf8_from(b, 0);
+    }
+    if n <= 32 {
         let w0 = u64::from_le_bytes(b[..8].try_into().unwrap());
         let w1 = u64::from_le_bytes(b[8..16].try_into().unwrap());
         let w2 = u64::from_le_bytes(b[n - 16..n - 8].try_into().unwrap());
@@ -343,30 +409,39 @@ pub fn validate_utf8(b: &[u8]) -> Result<&str> {
             // SAFETY: Every byte in 0..n has its high bit clear (0x00..=0x7F).
             return Ok(unsafe { core::str::from_utf8_unchecked(b) });
         }
-    } else if n <= 64 {
-        let w0 = u64::from_le_bytes(b[..8].try_into().unwrap());
-        let w1 = u64::from_le_bytes(b[8..16].try_into().unwrap());
-        let w2 = u64::from_le_bytes(b[16..24].try_into().unwrap());
-        let w3 = u64::from_le_bytes(b[24..32].try_into().unwrap());
-        let mut bits = w0 | w1 | w2 | w3;
-        if n > 48 {
-            bits |= u64::from_le_bytes(b[32..40].try_into().unwrap())
-                | u64::from_le_bytes(b[40..48].try_into().unwrap());
+        return validate_utf8_from(b, 0);
+    }
+
+    let mut i = 0usize;
+    while i + 32 <= n {
+        let w0 = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        let w1 = u64::from_le_bytes(b[i + 8..i + 16].try_into().unwrap());
+        let w2 = u64::from_le_bytes(b[i + 16..i + 24].try_into().unwrap());
+        let w3 = u64::from_le_bytes(b[i + 24..i + 32].try_into().unwrap());
+        if ((w0 | w1 | w2 | w3) & 0x8080_8080_8080_8080) != 0 {
+            return validate_utf8_from(b, i);
         }
-        bits |= u64::from_le_bytes(b[n - 16..n - 8].try_into().unwrap())
-            | u64::from_le_bytes(b[n - 8..n].try_into().unwrap());
-        if (bits & 0x8080_8080_8080_8080) == 0 {
-            // SAFETY: Every byte in 0..n has its high bit clear (0x00..=0x7F).
-            return Ok(unsafe { core::str::from_utf8_unchecked(b) });
+        i += 32;
+    }
+    if i < n {
+        let t0 = u64::from_le_bytes(b[n - 32..n - 24].try_into().unwrap());
+        let t1 = u64::from_le_bytes(b[n - 24..n - 16].try_into().unwrap());
+        let t2 = u64::from_le_bytes(b[n - 16..n - 8].try_into().unwrap());
+        let t3 = u64::from_le_bytes(b[n - 8..n].try_into().unwrap());
+        if ((t0 | t1 | t2 | t3) & 0x8080_8080_8080_8080) != 0 {
+            return validate_utf8_from(b, i);
         }
     }
-    validate_utf8_slow(b)
+    // SAFETY: Every byte in 0..n has its high bit clear (0x00..=0x7F).
+    Ok(unsafe { core::str::from_utf8_unchecked(b) })
 }
 
 #[cold]
 #[inline(never)]
-fn validate_utf8_slow(b: &[u8]) -> Result<&str> {
-    core::str::from_utf8(b).map_err(|_| Error::InvalidUtf8)
+fn validate_utf8_from(b: &[u8], ascii_prefix_len: usize) -> Result<&str> {
+    core::str::from_utf8(&b[ascii_prefix_len..]).map_err(|_| Error::InvalidUtf8)?;
+    // SAFETY: `b[..ascii_prefix_len]` is verified pure ASCII (< 0x80) and `b[ascii_prefix_len..]` is valid UTF-8.
+    Ok(unsafe { core::str::from_utf8_unchecked(b) })
 }
 
 /// Reports whether `wt` is a valid 1-byte `KeyType` in a `WireMap` header.
@@ -634,7 +709,17 @@ pub fn skip_value(b: &[u8], pos: usize, wire_type: u8) -> Result<usize> {
 
 /// Validates a field value recursively up to `MAX_NESTING_DEPTH`, including unknown containers and UTF-8 strings.
 pub fn validate_value(data: &[u8], pos: usize, wire_type: u8, depth: usize) -> Result<usize> {
-    if depth > MAX_NESTING_DEPTH {
+    validate_value_with_max_depth(data, pos, wire_type, depth, MAX_NESTING_DEPTH)
+}
+
+pub(crate) fn validate_value_with_max_depth(
+    data: &[u8],
+    pos: usize,
+    wire_type: u8,
+    depth: usize,
+    max_depth: usize,
+) -> Result<usize> {
+    if depth > max_depth {
         return Err(Error::DepthLimitExceeded(depth));
     }
     if pos > data.len() {
@@ -647,29 +732,29 @@ pub fn validate_value(data: &[u8], pos: usize, wire_type: u8, depth: usize) -> R
         }
         WIRE_SUB_MSG => {
             let (body, end) = read_len_slice(data, pos, 0)?;
-            validate_message(body, depth + 1)?;
+            validate_message_with_max_depth(body, depth + 1, max_depth)?;
             Ok(end)
         }
         WIRE_ARRAY => {
-            if depth + 1 > MAX_NESTING_DEPTH {
+            if depth + 1 > max_depth {
                 return Err(Error::DepthLimitExceeded(depth + 1));
             }
             let (body, end) = read_len_slice(data, pos, 2)?;
             let (elem_wt, count, start_p) =
                 parse_array_header(body).ok_or_else(|| Error::parse("invalid array header"))?;
-            validate_array_body(body, start_p, elem_wt, count, depth + 1)?;
+            validate_array_body(body, start_p, elem_wt, count, depth + 1, max_depth)?;
             Ok(end)
         }
         WIRE_MAP => {
-            if depth + 1 > MAX_NESTING_DEPTH {
+            if depth + 1 > max_depth {
                 return Err(Error::DepthLimitExceeded(depth + 1));
             }
             let (body, end) = read_len_slice(data, pos, 3)?;
             let (key_wt, val_wt, count, mut p) =
                 parse_map_header(body).ok_or_else(|| Error::parse("invalid map header"))?;
             for _ in 0..count {
-                p = validate_container_entry(body, p, key_wt, depth + 1)?;
-                p = validate_container_entry(body, p, val_wt, depth + 1)?;
+                p = validate_container_entry(body, p, key_wt, depth + 1, max_depth)?;
+                p = validate_container_entry(body, p, val_wt, depth + 1, max_depth)?;
             }
             if p != body.len() {
                 return Err(Error::parse("trailing map bytes"));
@@ -694,6 +779,7 @@ fn validate_array_body(
     elem_wt: u8,
     count: usize,
     depth: usize,
+    max_depth: usize,
 ) -> Result<()> {
     match elem_wt {
         WIRE_BOOL_FALSE => {
@@ -722,7 +808,7 @@ fn validate_array_body(
         _ => {}
     }
     for _ in 0..count {
-        p = validate_container_entry(body, p, elem_wt, depth)?;
+        p = validate_container_entry(body, p, elem_wt, depth, max_depth)?;
     }
     if p != body.len() {
         return Err(Error::parse("trailing array bytes"));
@@ -730,7 +816,13 @@ fn validate_array_body(
     Ok(())
 }
 
-fn validate_container_entry(body: &[u8], p: usize, wt: u8, depth: usize) -> Result<usize> {
+fn validate_container_entry(
+    body: &[u8],
+    p: usize,
+    wt: u8,
+    depth: usize,
+    max_depth: usize,
+) -> Result<usize> {
     if wt == WIRE_BOOL_FALSE {
         let b = *body
             .get(p)
@@ -740,12 +832,20 @@ fn validate_container_entry(body: &[u8], p: usize, wt: u8, depth: usize) -> Resu
         }
         return Ok(p + 1);
     }
-    validate_value(body, p, wt, depth)
+    validate_value_with_max_depth(body, p, wt, depth, max_depth)
 }
 
 /// Validates an entire OmniBuf message buffer recursively up to `MAX_NESTING_DEPTH`.
 pub fn validate_message(data: &[u8], depth: usize) -> Result<()> {
-    if depth > MAX_NESTING_DEPTH {
+    validate_message_with_max_depth(data, depth, MAX_NESTING_DEPTH)
+}
+
+pub(crate) fn validate_message_with_max_depth(
+    data: &[u8],
+    depth: usize,
+    max_depth: usize,
+) -> Result<()> {
+    if depth > max_depth {
         return Err(Error::DepthLimitExceeded(depth));
     }
     let mut pos = 0;
@@ -763,9 +863,9 @@ pub fn validate_message(data: &[u8], depth: usize) -> Result<()> {
             if wt != WIRE_SUB_MSG {
                 return Err(Error::parse(format!("invalid Field #0 wire type {wt}")));
             }
-            pos = validate_field0(data, pos, depth)?;
+            pos = validate_field0_with_max_depth(data, pos, depth, max_depth)?;
         } else {
-            pos = validate_value(data, pos, wt, depth)?;
+            pos = validate_value_with_max_depth(data, pos, wt, depth, max_depth)?;
         }
     }
     Ok(())
@@ -1294,6 +1394,41 @@ pub fn lookup_map_string_uint(packet: &[u8], field_num: u16, target_key: &str) -
     }
 }
 
+/// Searches a `WireMap<WireString, WireString>` field for `target_key` with zero map allocations.
+pub fn lookup_map_string_str<'a>(
+    packet: &'a [u8],
+    field_num: u16,
+    target_key: &str,
+) -> Option<&'a str> {
+    let mut last_val: Option<&'a str> = None;
+    let mut pos = 0usize;
+    loop {
+        let (matched, valid) = next_container_field(packet, pos, field_num, WIRE_MAP, 3, false);
+        if !valid {
+            return None;
+        }
+        let Some((body, next_pos)) = matched else {
+            return last_val;
+        };
+        pos = next_pos;
+        let (key_wt, val_wt, count, mut p) = parse_map_header(body)?;
+        if key_wt != WIRE_STRING || val_wt != WIRE_STRING {
+            return None;
+        }
+        for _ in 0..count {
+            let (k, after_k) = read_str_slice(body, p).ok()?;
+            let (v, after_v) = read_str_slice(body, after_k).ok()?;
+            p = after_v;
+            if k == target_key {
+                last_val = Some(v);
+            }
+        }
+        if p != body.len() {
+            return None;
+        }
+    }
+}
+
 /// Reads a `WireMap<WireString, WireUint>` field into a `HashMap<String, u64>`.
 pub fn read_map_string_uint(packet: &[u8], field_num: u16) -> Option<HashMap<String, u64>> {
     let mut out: Option<HashMap<String, u64>> = None;
@@ -1720,6 +1855,7 @@ pub struct Decoder<'a> {
     data: &'a [u8],
     pos: usize,
     depth: usize,
+    rem_alloc: usize,
 }
 
 impl<'a> Decoder<'a> {
@@ -1730,6 +1866,18 @@ impl<'a> Decoder<'a> {
             data,
             pos: 0,
             depth: 0,
+            rem_alloc: usize::MAX,
+        }
+    }
+
+    /// Creates a root `Decoder` bounded by `max_alloc_bytes`.
+    #[inline]
+    pub const fn with_max_alloc(data: &'a [u8], max_alloc_bytes: usize) -> Self {
+        Self {
+            data,
+            pos: 0,
+            depth: 0,
+            rem_alloc: max_alloc_bytes,
         }
     }
 
@@ -1743,7 +1891,41 @@ impl<'a> Decoder<'a> {
             data,
             pos: 0,
             depth,
+            rem_alloc: usize::MAX,
         })
+    }
+
+    /// Creates a nested `Decoder` over `data` at `depth` bounded by `rem_alloc` bytes.
+    #[inline]
+    pub fn with_depth_and_alloc(data: &'a [u8], depth: usize, rem_alloc: usize) -> Result<Self> {
+        if depth > MAX_NESTING_DEPTH {
+            return Err(Error::DepthLimitExceeded(depth));
+        }
+        Ok(Self {
+            data,
+            pos: 0,
+            depth,
+            rem_alloc,
+        })
+    }
+
+    /// Returns the remaining allocation budget tracked by this decoder (`usize::MAX` when unbounded).
+    #[inline]
+    pub const fn remaining_alloc(&self) -> usize {
+        self.rem_alloc
+    }
+
+    /// Charges `bytes` against this decoder's remaining allocation budget.
+    #[inline]
+    pub fn charge_alloc(&mut self, bytes: usize) -> Result<()> {
+        if self.rem_alloc == usize::MAX {
+            return Ok(());
+        }
+        if bytes > self.rem_alloc {
+            return Err(cold_parse_err("allocation budget exceeds max_alloc_bytes"));
+        }
+        self.rem_alloc -= bytes;
+        Ok(())
     }
 
     /// Returns `true` when all bytes in the buffer have been consumed.

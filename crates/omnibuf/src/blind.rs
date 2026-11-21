@@ -3,8 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::error::{Error, Result};
 use crate::field0::{
-    SchemaMeta, decode_schema_meta_with_max_depth, merge_schema_meta,
-    validate_field0_with_max_depth,
+    SchemaMeta, decode_schema_meta_with_budget, merge_schema_meta, validate_field0_with_max_depth,
 };
 use crate::message::DecodeOptions;
 use crate::wire::{
@@ -12,7 +11,7 @@ use crate::wire::{
     WIRE_EXTENDED, WIRE_FIXED32, WIRE_FIXED64, WIRE_FLOAT32, WIRE_FLOAT64, WIRE_MAP, WIRE_SFIXED32,
     WIRE_SFIXED64, WIRE_SINT, WIRE_STRING, WIRE_SUB_MSG, WIRE_UINT, decode_varint, decode_zigzag,
     fast_skip_value, parse_array_header, parse_map_header, read_len_slice, read_str_slice,
-    validate_value,
+    validate_value_with_max_depth,
 };
 
 /// Dynamic value returned by schema-less [`decode_blind`] packet inspection.
@@ -523,7 +522,7 @@ fn validate_blind_message_slice(data: &[u8], depth: usize, max_depth: usize) -> 
             }
             pos = validate_field0_with_max_depth(data, pos, depth, max_depth)?;
         } else {
-            pos = validate_value(data, pos, wt, depth)?;
+            pos = validate_value_with_max_depth(data, pos, wt, depth, max_depth)?;
         }
     }
     Ok(())
@@ -562,8 +561,15 @@ fn decode_blind_inner(
                 return Err(Error::parse(format!("invalid Field #0 wire type {wt}")));
             }
             let (body, next) = read_len_slice(data, scan, 0)?;
-            budget.add_alloc(body.len())?;
-            let meta = decode_schema_meta_with_max_depth(body, depth + 1, budget.max_depth)?;
+            let avail = budget.max_alloc_bytes.saturating_sub(budget.alloc_bytes);
+            if body.len() > avail {
+                budget.add_alloc(body.len())?;
+            }
+            let mut rem_schema = avail;
+            let meta =
+                decode_schema_meta_with_budget(body, depth + 1, budget.max_depth, &mut rem_schema)?;
+            let schema_used = avail.saturating_sub(rem_schema).max(body.len());
+            budget.add_alloc(schema_used)?;
             local_schema = Some(merge_schema_meta(local_schema, meta));
             scan = next;
         } else {
@@ -1016,13 +1022,89 @@ fn write_escaped_json_str(dst: &mut String, s: &str) {
     dst.push('"');
 }
 
-fn write_ryu_trimmed(dst: &mut String, formatted: &str) {
-    if formatted != "-0.0"
-        && let Some(stripped) = formatted.strip_suffix(".0")
-    {
-        dst.push_str(stripped);
+fn write_canonical_ryu_float(dst: &mut String, is_zero: bool, is_neg: bool, formatted: &str) {
+    if is_zero {
+        dst.push_str(if is_neg { "-0.0" } else { "0" });
+        return;
+    }
+    let body = formatted.strip_prefix('-').unwrap_or(formatted);
+    let (mant, raw_exp) = match body.find(['e', 'E']) {
+        Some(idx) => {
+            let exp: i32 = body[idx + 1..].parse().unwrap_or(0);
+            (&body[..idx], exp)
+        }
+        None => {
+            if is_neg {
+                dst.push('-');
+            }
+            if let Some(stripped) = body.strip_suffix(".0") {
+                dst.push_str(stripped);
+            } else {
+                dst.push_str(body);
+            }
+            return;
+        }
+    };
+
+    let mut digits = [0u8; 32];
+    let mut dlen = 0usize;
+    let mut dot_pos = mant.len();
+    for (idx, b) in mant.bytes().enumerate() {
+        if b == b'.' {
+            dot_pos = idx;
+        } else {
+            digits[dlen] = b;
+            dlen += 1;
+        }
+    }
+    let mut lead = 0usize;
+    while lead < dlen && digits[lead] == b'0' {
+        lead += 1;
+    }
+    let sci_exp = raw_exp + (dot_pos as i32) - (lead as i32) - 1;
+    let mut end = dlen;
+    while end > lead + 1 && digits[end - 1] == b'0' {
+        end -= 1;
+    }
+    // SAFETY: `ryu` emits exclusively ASCII digits.
+    let sig = unsafe { core::str::from_utf8_unchecked(&digits[lead..end]) };
+
+    if is_neg {
+        dst.push('-');
+    }
+    if (-6..=20).contains(&sci_exp) {
+        let point_pos = sci_exp + 1;
+        if point_pos <= 0 {
+            dst.push_str("0.");
+            for _ in 0..(-point_pos) {
+                dst.push('0');
+            }
+            dst.push_str(sig);
+        } else if (point_pos as usize) >= sig.len() {
+            dst.push_str(sig);
+            for _ in 0..(point_pos as usize - sig.len()) {
+                dst.push('0');
+            }
+        } else {
+            let pp = point_pos as usize;
+            dst.push_str(&sig[..pp]);
+            dst.push('.');
+            dst.push_str(&sig[pp..]);
+        }
     } else {
-        dst.push_str(formatted);
+        let bytes = sig.as_bytes();
+        dst.push(bytes[0] as char);
+        if bytes.len() > 1 {
+            dst.push('.');
+            dst.push_str(&sig[1..]);
+        }
+        if sci_exp >= 0 {
+            dst.push_str("e+");
+        } else {
+            dst.push('e');
+        }
+        let mut exp_buf = itoa::Buffer::new();
+        dst.push_str(exp_buf.format(sci_exp));
     }
 }
 
@@ -1049,7 +1131,12 @@ fn serialize_blind_value(
                 dst.push_str("null");
             } else {
                 let mut buf = ryu::Buffer::new();
-                write_ryu_trimmed(dst, buf.format_finite(*f));
+                write_canonical_ryu_float(
+                    dst,
+                    *f == 0.0,
+                    f.is_sign_negative(),
+                    buf.format_finite(*f),
+                );
             }
         }
         BlindValue::Float64(f) => {
@@ -1058,7 +1145,12 @@ fn serialize_blind_value(
                 dst.push_str("null");
             } else {
                 let mut buf = ryu::Buffer::new();
-                write_ryu_trimmed(dst, buf.format_finite(*f));
+                write_canonical_ryu_float(
+                    dst,
+                    *f == 0.0,
+                    f.is_sign_negative(),
+                    buf.format_finite(*f),
+                );
             }
         }
         BlindValue::String(s) => write_escaped_json_str(dst, s),

@@ -721,6 +721,12 @@ fn handle_plugin_tier(req: &ConformanceRequest) -> ConformanceResponse {
                 };
             }
 
+            if req.self_describing {
+                return match msg.encode_omnibuf_with_options(EncodeOptions::self_describing()) {
+                    Ok(out) => ConformanceResponse::wire(out),
+                    Err(err) => ConformanceResponse::serialize_err(err.to_string()),
+                };
+            }
             ConformanceResponse::wire(msg.marshal_omnibuf())
         }
 

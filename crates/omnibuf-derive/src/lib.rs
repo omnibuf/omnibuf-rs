@@ -111,6 +111,8 @@ impl ElemShape {
     fn leaf_submsg_type(&self) -> Option<&Type> {
         match self {
             Self::SubMsg { ty, .. } => Some(ty),
+            Self::Vec(inner) => inner.leaf_submsg_type(),
+            Self::Map { val, .. } => val.leaf_submsg_type(),
             _ => None,
         }
     }
@@ -235,6 +237,7 @@ fn expand_struct(
     let type_name_lit = &cfg.type_name;
 
     let mut encode_stmts = Vec::with_capacity(num_fields);
+    let mut min_size_stmts = Vec::with_capacity(num_fields);
     let mut decode_arms = Vec::with_capacity(num_fields + 2);
     let mut fallback_oneof_tries = Vec::new();
     let mut clear_all_stmts = Vec::with_capacity(num_fields);
@@ -247,6 +250,7 @@ fn expand_struct(
     for cf in &compiled {
         let f_ident = &cf.ident;
         encode_stmts.push(gen_encode_field(krate, cf));
+        min_size_stmts.push(gen_min_wire_size_field(krate, cf));
         if let FieldShape::Oneof { ty, tags } = &cf.shape {
             if tags.is_empty() {
                 fallback_oneof_tries.push(quote! {
@@ -310,6 +314,14 @@ fn expand_struct(
         }
 
         impl #impl_generics #krate::Message for #ident #ty_generics #where_clause {
+            #[inline]
+            fn min_wire_size_bounded(&self, depth_rem: usize) -> usize {
+                let _ = depth_rem;
+                let mut __sz = 0usize;
+                #(#min_size_stmts)*
+                __sz
+            }
+
             #[inline]
             fn encode_omnibuf_append(
                 &self,
@@ -477,6 +489,7 @@ fn expand_oneof_enum(
     }
 
     let mut encode_arms = Vec::with_capacity(variants.len());
+    let mut min_size_arms = Vec::with_capacity(variants.len());
     let mut decode_arms = Vec::with_capacity(variants.len());
     let mut schema_field_stmts = Vec::with_capacity(variants.len());
     let mut schema_child_stmts = Vec::new();
@@ -501,6 +514,14 @@ fn expand_oneof_enum(
                         #write_stmt
                     }
                 });
+                let min_expr =
+                    gen_scalar_min_size_expr(krate, v_id, *scalar, *wire_wt, quote!(__val));
+                min_size_arms.push(quote! {
+                    Self::#v_ident(ref __val) => {
+                        let _ = __val;
+                        #min_expr
+                    }
+                });
 
                 if *scalar == ScalarType::Bool {
                     decode_arms.push(quote! {
@@ -523,10 +544,14 @@ fn expand_oneof_enum(
                 }
             }
             OneofVariantShape::BuffaEnum { enum_ty } => {
+                let tw = tag_varint_width(v_id, WIRE_SINT);
                 encode_arms.push(quote! {
                     Self::#v_ident(ref __val) => {
                         #krate::codec::write_buffa_enum_field(dst, #v_id, __val);
                     }
+                });
+                min_size_arms.push(quote! {
+                    Self::#v_ident(_) => #tw + 1usize,
                 });
                 decode_arms.push(quote! {
                     #v_id if wt == #WIRE_SINT => {
@@ -537,10 +562,21 @@ fn expand_oneof_enum(
                 });
             }
             OneofVariantShape::SubMsg { ty, boxed } => {
+                let tw = tag_varint_width(v_id, WIRE_SUB_MSG);
                 if *boxed {
                     encode_arms.push(quote! {
                         Self::#v_ident(ref __sub) => {
                             #krate::codec::write_sub_msg_field(dst, #v_id, &**__sub, deterministic)?;
+                        }
+                    });
+                    min_size_arms.push(quote! {
+                        Self::#v_ident(ref __sub) => {
+                            let __s = if depth_rem > 0 {
+                                <#ty as #krate::Message>::min_wire_size_bounded(&**__sub, depth_rem - 1)
+                            } else {
+                                0usize
+                            };
+                            #tw + #krate::wire::container_len_width(__s) + __s
                         }
                     });
                     decode_arms.push(quote! {
@@ -567,6 +603,16 @@ fn expand_oneof_enum(
                     encode_arms.push(quote! {
                         Self::#v_ident(ref __sub) => {
                             #krate::codec::write_sub_msg_field(dst, #v_id, __sub, deterministic)?;
+                        }
+                    });
+                    min_size_arms.push(quote! {
+                        Self::#v_ident(ref __sub) => {
+                            let __s = if depth_rem > 0 {
+                                <#ty as #krate::Message>::min_wire_size_bounded(__sub, depth_rem - 1)
+                            } else {
+                                0usize
+                            };
+                            #tw + #krate::wire::container_len_width(__s) + __s
                         }
                     });
                     decode_arms.push(quote! {
@@ -606,6 +652,14 @@ fn expand_oneof_enum(
 
     Ok(quote! {
         impl #impl_generics #krate::codec::Oneof for #ident #ty_generics #where_clause {
+            #[inline]
+            fn min_wire_size_bounded(&self, depth_rem: usize) -> usize {
+                let _ = depth_rem;
+                match *self {
+                    #(#min_size_arms)*
+                }
+            }
+
             #[inline]
             fn encode_oneof(
                 &self,
@@ -695,9 +749,11 @@ fn compile_oneof_variant(var: &Variant, used_ids: &mut HashSet<u32>) -> Result<C
     })?;
     validate_field_number(id, used_ids, var)?;
 
+    let raw_vident = var.ident.to_string();
+    let clean_vident = raw_vident.strip_prefix("r#").unwrap_or(&raw_vident);
     let schema_name = match attr.name {
         Some(n) => n,
-        None => to_snake_case(&var.ident.to_string()),
+        None => to_snake_case(clean_vident),
     };
 
     let shape = if is_vec_u8(inner_ty) && matches!(attr.wire.as_deref(), None | Some("bytes")) {
@@ -1981,6 +2037,195 @@ fn gen_encode_field(krate: &syn::Path, cf: &CompiledField) -> TokenStream2 {
         }
     } else {
         body
+    }
+}
+
+const fn tag_varint_width(field_num: u32, wt: u8) -> usize {
+    let tag = ((field_num as u64) << 4) | ((wt & 0x0F) as u64);
+    if tag <= 127 {
+        1
+    } else if tag <= 16_383 {
+        2
+    } else if tag <= 536_870_911 {
+        4
+    } else {
+        9
+    }
+}
+
+fn gen_scalar_min_size_expr(
+    krate: &syn::Path,
+    f_id: u32,
+    scalar: ScalarType,
+    wire_wt: u8,
+    val_expr: TokenStream2,
+) -> TokenStream2 {
+    let tw = tag_varint_width(f_id, wire_wt);
+    match (scalar, wire_wt) {
+        (ScalarType::Bool, _) => quote!(#tw),
+        (ScalarType::String, _) => quote!({
+            let __l = (#val_expr).len();
+            #tw + #krate::wire::varint_len(__l as u64) + __l
+        }),
+        (ScalarType::Bytes, _) => quote!({
+            let __l = (#val_expr).len();
+            #tw + #krate::wire::varint_len(__l as u64) + __l
+        }),
+        (_, WIRE_FIXED32 | WIRE_SFIXED32 | WIRE_FLOAT32) => quote!(#tw + 4usize),
+        (_, WIRE_FIXED64 | WIRE_SFIXED64 | WIRE_FLOAT64) => quote!(#tw + 8usize),
+        _ => quote!(#tw + 1usize),
+    }
+}
+
+fn gen_min_wire_size_field(krate: &syn::Path, cf: &CompiledField) -> TokenStream2 {
+    let f_ident = &cf.ident;
+    let f_id = cf.id;
+
+    let add_stmt = match &cf.shape {
+        FieldShape::Scalar { scalar, wire_wt } => {
+            let expr =
+                gen_scalar_min_size_expr(krate, f_id, *scalar, *wire_wt, quote!(&self.#f_ident));
+            quote! { __sz += #expr; }
+        }
+        FieldShape::OptScalar { scalar, wire_wt } => {
+            let expr = gen_scalar_min_size_expr(krate, f_id, *scalar, *wire_wt, quote!(__val));
+            return quote! {
+                if let ::core::option::Option::Some(ref __val) = self.#f_ident {
+                    let _ = __val;
+                    __sz += #expr;
+                }
+            };
+        }
+        FieldShape::BuffaEnum { .. } => {
+            let tw = tag_varint_width(f_id, WIRE_SINT);
+            quote! { __sz += #tw + 1usize; }
+        }
+        FieldShape::OptBuffaEnum { .. } => {
+            let tw = tag_varint_width(f_id, WIRE_SINT);
+            return quote! {
+                if self.#f_ident.is_some() {
+                    __sz += #tw + 1usize;
+                }
+            };
+        }
+        FieldShape::SubMsg { ty, boxed } => {
+            let tw = tag_varint_width(f_id, WIRE_SUB_MSG);
+            let sub_ref = if *boxed {
+                quote!(&*self.#f_ident)
+            } else {
+                quote!(&self.#f_ident)
+            };
+            quote! {
+                let __sub = if depth_rem > 0 {
+                    <#ty as #krate::Message>::min_wire_size_bounded(#sub_ref, depth_rem - 1)
+                } else {
+                    0usize
+                };
+                __sz += #tw + #krate::wire::container_len_width(__sub) + __sub;
+            }
+        }
+        FieldShape::OptSubMsg { ty, boxed } => {
+            let tw = tag_varint_width(f_id, WIRE_SUB_MSG);
+            let sub_ref = if *boxed { quote!(&**__s) } else { quote!(__s) };
+            return quote! {
+                if let ::core::option::Option::Some(ref __s) = self.#f_ident {
+                    let __sub = if depth_rem > 0 {
+                        <#ty as #krate::Message>::min_wire_size_bounded(#sub_ref, depth_rem - 1)
+                    } else {
+                        0usize
+                    };
+                    __sz += #tw + #krate::wire::container_len_width(__sub) + __sub;
+                }
+            };
+        }
+        FieldShape::BuffaMessageField { .. } => {
+            return quote! {
+                __sz += #krate::codec::buffa_message_field_min_wire_size(#f_id, &self.#f_ident, depth_rem);
+            };
+        }
+        FieldShape::ScalarVec { scalar, elem_wt } => {
+            let tw = tag_varint_width(f_id, WIRE_ARRAY);
+            let elems_expr = match (scalar, *elem_wt) {
+                (ScalarType::String, _) | (ScalarType::Bytes, _) => quote! {
+                    self.#f_ident
+                        .iter()
+                        .map(|__x| {
+                            let __l = __x.len();
+                            #krate::wire::varint_len(__l as u64) + __l
+                        })
+                        .sum::<usize>()
+                },
+                (_, WIRE_FIXED32 | WIRE_SFIXED32 | WIRE_FLOAT32) => quote!(__c * 4usize),
+                (_, WIRE_FIXED64 | WIRE_SFIXED64 | WIRE_FLOAT64) => quote!(__c * 8usize),
+                _ => quote!(__c),
+            };
+            quote! {
+                let __c = self.#f_ident.len();
+                let __b = 1usize + #krate::wire::varint_len(__c as u64) + (#elems_expr);
+                __sz += #tw + #krate::wire::container_len_width(__b) + __b;
+            }
+        }
+        FieldShape::BuffaEnumVec { .. } => {
+            let tw = tag_varint_width(f_id, WIRE_ARRAY);
+            quote! {
+                let __c = self.#f_ident.len();
+                let __b = 1usize + #krate::wire::varint_len(__c as u64) + __c;
+                __sz += #tw + #krate::wire::container_len_width(__b) + __b;
+            }
+        }
+        FieldShape::SubMsgVec { ty, boxed } => {
+            let tw = tag_varint_width(f_id, WIRE_ARRAY);
+            let elem_ref = if *boxed { quote!(&**__m) } else { quote!(__m) };
+            quote! {
+                let __c = self.#f_ident.len();
+                let __eb: usize = if depth_rem > 0 {
+                    self.#f_ident
+                        .iter()
+                        .map(|__m| {
+                            let __s = <#ty as #krate::Message>::min_wire_size_bounded(#elem_ref, depth_rem - 1);
+                            #krate::wire::container_len_width(__s) + __s
+                        })
+                        .sum()
+                } else {
+                    __c * 2usize
+                };
+                let __b = 1usize + #krate::wire::varint_len(__c as u64) + __eb;
+                __sz += #tw + #krate::wire::container_len_width(__b) + __b;
+            }
+        }
+        FieldShape::NestedVec { .. } => {
+            let tw = tag_varint_width(f_id, WIRE_ARRAY);
+            quote! {
+                let __c = self.#f_ident.len();
+                let __b = 1usize + #krate::wire::varint_len(__c as u64) + __c * 2usize;
+                __sz += #tw + #krate::wire::container_len_width(__b) + __b;
+            }
+        }
+        FieldShape::Map { .. } => {
+            let tw = tag_varint_width(f_id, WIRE_MAP);
+            quote! {
+                let __c = self.#f_ident.len();
+                let __b = 2usize + #krate::wire::varint_len(__c as u64) + __c * 2usize;
+                __sz += #tw + #krate::wire::container_len_width(__b) + __b;
+            }
+        }
+        FieldShape::Oneof { ty, .. } => {
+            return quote! {
+                if let ::core::option::Option::Some(ref __active) = self.#f_ident {
+                    __sz += <#ty as #krate::codec::Oneof>::min_wire_size_bounded(__active, depth_rem);
+                }
+            };
+        }
+    };
+
+    if cf.omit_empty {
+        quote! {
+            if !#krate::codec::IsEmpty::is_omnibuf_empty(&self.#f_ident) {
+                #add_stmt
+            }
+        }
+    } else {
+        add_stmt
     }
 }
 

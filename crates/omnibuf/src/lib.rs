@@ -76,12 +76,14 @@ pub use field0::{
     SchemaMeta, decode_schema_meta, merge_schema_meta, read_field0_schema_meta, validate_field0,
 };
 pub use message::{
-    DecodeOptions, EncodeOptions, Message, codec, decode_into, decode_into_with_options,
-    from_slice, from_slice_with_options, to_vec, to_vec_deterministic, to_vec_with_options,
+    DecodeBorrowed, DecodeOptions, EncodeOptions, Message, codec, decode_into,
+    decode_into_borrowed, decode_into_borrowed_with_options, decode_into_with_options, from_slice,
+    from_slice_borrowed, from_slice_borrowed_with_options, from_slice_with_options, to_vec,
+    to_vec_deterministic, to_vec_with_options,
 };
 pub use opaque::{
-    copy_packet, splice_fields, splice_fields_vec, try_copy_packet, try_splice_fields,
-    try_splice_fields_vec,
+    append_packet, copy_packet, splice_fields, splice_fields_vec, try_append_packet,
+    try_copy_packet, try_splice_fields, try_splice_fields_vec,
 };
 pub use wire::{Decoder, Encoder, MAX_FIELD_NUMBER, MAX_NESTING_DEPTH};
 

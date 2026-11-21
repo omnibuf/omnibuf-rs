@@ -1,18 +1,61 @@
 use core::any::TypeId;
+use core::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 
 use crate::error::{Error, Result};
-use crate::field0::{SchemaMeta, validate_field0_with_max_depth};
+use crate::field0::{SchemaMeta, validate_field0_with_alloc};
 use crate::wire::{
     MAX_FIELD_NUMBER, MAX_NESTING_DEPTH, WIRE_ARRAY, WIRE_BOOL_FALSE, WIRE_BOOL_TRUE, WIRE_BYTES,
     WIRE_EXTENDED, WIRE_FIXED32, WIRE_FIXED64, WIRE_FLOAT32, WIRE_FLOAT64, WIRE_MAP, WIRE_SFIXED32,
     WIRE_SFIXED64, WIRE_SINT, WIRE_STRING, WIRE_SUB_MSG, WIRE_UINT, append_bytes_elem, append_tag,
-    append_varint, backpatch_container_len, cold_parse_err, decode_varint, decode_zigzag,
-    encode_zigzag, fast_skip_value, grow_capacity, parse_array_header, parse_map_header,
-    put_varint_raw, read_len_slice, read_str_slice, read_varint_at, write_bool_tagged,
-    write_bytes_tagged, write_fixed_tagged, write_varint_tagged,
+    append_varint, backpatch_container_len, backpatch_container_len_4b, cold_parse_err,
+    container_len_width, decode_varint, decode_zigzag, encode_zigzag, fast_skip_value,
+    grow_capacity, parse_array_header, parse_map_header, put_varint_raw, read_len_slice,
+    read_str_slice, read_varint_at, varint_len, write_bool_tagged, write_bytes_tagged,
+    write_fixed_tagged, write_varint_tagged,
 };
+
+thread_local! {
+    static ACTIVE_TYPED_ALLOC_REM: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+pub(crate) struct AllocBudgetGuard {
+    prev: usize,
+}
+
+impl AllocBudgetGuard {
+    #[inline]
+    pub(crate) fn new(limit: usize) -> Self {
+        let prev = ACTIVE_TYPED_ALLOC_REM.with(|c| c.replace(limit));
+        Self { prev }
+    }
+}
+
+impl Drop for AllocBudgetGuard {
+    #[inline]
+    fn drop(&mut self) {
+        ACTIVE_TYPED_ALLOC_REM.with(|c| c.set(self.prev));
+    }
+}
+
+#[inline]
+pub(crate) fn charge_typed_alloc(bytes: usize) -> Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    ACTIVE_TYPED_ALLOC_REM.with(|c| {
+        let rem = c.get();
+        if rem == usize::MAX {
+            return Ok(());
+        }
+        if bytes > rem {
+            return Err(cold_parse_err("allocation budget exceeds max_alloc_bytes"));
+        }
+        c.set(rem - bytes);
+        Ok(())
+    })
+}
 
 /// Options controlling OmniBuf serialization.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -82,6 +125,7 @@ impl Default for DecodeOptions {
 struct BudgetTracker {
     elements: usize,
     alloc_bytes: usize,
+    precharged_bytes: usize,
 }
 
 impl BudgetTracker {
@@ -118,6 +162,14 @@ impl BudgetTracker {
 
 /// Validates `data` against explicit [`DecodeOptions`] resource limits before materializing values.
 pub(crate) fn enforce_decode_options(data: &[u8], opts: &DecodeOptions) -> Result<()> {
+    let _ = enforce_decode_options_with_schema_alloc(data, opts)?;
+    Ok(())
+}
+
+pub(crate) fn enforce_decode_options_with_schema_alloc(
+    data: &[u8],
+    opts: &DecodeOptions,
+) -> Result<usize> {
     if data.len() > opts.max_message_bytes {
         return Err(Error::parse(format!(
             "message length {} exceeds max_message_bytes {}",
@@ -127,7 +179,8 @@ pub(crate) fn enforce_decode_options(data: &[u8], opts: &DecodeOptions) -> Resul
     }
     let effective_depth = opts.max_depth.min(MAX_NESTING_DEPTH);
     let mut tracker = BudgetTracker::default();
-    validate_message_with_limits(data, 0, effective_depth, opts, &mut tracker)
+    validate_message_with_limits(data, 0, effective_depth, opts, &mut tracker)?;
+    Ok(tracker.precharged_bytes)
 }
 
 fn validate_message_with_limits(
@@ -155,8 +208,10 @@ fn validate_message_with_limits(
             if wt != WIRE_SUB_MSG {
                 return Err(Error::parse(format!("invalid Field #0 wire type {wt}")));
             }
-            let end = validate_field0_with_max_depth(data, pos, depth, max_depth)?;
-            tracker.add_alloc(end.saturating_sub(pos), opts)?;
+            let (end, est_alloc) = validate_field0_with_alloc(data, pos, depth, max_depth)?;
+            let charged = end.saturating_sub(pos).max(est_alloc);
+            tracker.add_alloc(charged, opts)?;
+            tracker.precharged_bytes = tracker.precharged_bytes.saturating_add(charged);
             pos = end;
         } else {
             pos = validate_value_with_limits(data, pos, wt, depth, max_depth, opts, tracker)?;
@@ -181,11 +236,13 @@ fn validate_value_with_limits(
         WIRE_STRING => {
             let (s, end) = read_str_slice(data, pos)?;
             tracker.add_alloc(s.len(), opts)?;
+            tracker.precharged_bytes = tracker.precharged_bytes.saturating_add(s.len());
             Ok(end)
         }
         WIRE_BYTES => {
             let (b, end) = read_len_slice(data, pos, 0)?;
             tracker.add_alloc(b.len(), opts)?;
+            tracker.precharged_bytes = tracker.precharged_bytes.saturating_add(b.len());
             Ok(end)
         }
         WIRE_SUB_MSG => {
@@ -345,6 +402,25 @@ pub trait Message: Default + Sized + 'static {
         Self::build_schema_meta(&mut active, 1).unwrap_or_default()
     }
 
+    /// Returns a strict lower bound on the encoded byte length of `self` (bounded by `depth_rem`).
+    #[inline]
+    fn min_wire_size_bounded(&self, depth_rem: usize) -> usize {
+        let _ = depth_rem;
+        0
+    }
+
+    /// Returns a strict lower bound on the encoded byte length of `self`.
+    #[inline]
+    fn min_wire_size(&self) -> usize {
+        self.min_wire_size_bounded(4)
+    }
+
+    /// Returns a fast byte-length estimate used to pre-size encode buffers and container headers.
+    #[inline]
+    fn encoded_size_hint(&self) -> usize {
+        self.min_wire_size().max(64)
+    }
+
     /// Encodes `self` into a newly allocated `Vec<u8>`.
     #[inline]
     fn encode_omnibuf(&self) -> Result<Vec<u8>> {
@@ -379,7 +455,9 @@ pub trait Message: Default + Sized + 'static {
     /// Encodes `self` into a newly allocated `Vec<u8>` using explicit [`EncodeOptions`].
     #[inline]
     fn encode_omnibuf_with_options(&self, opts: EncodeOptions) -> Result<Vec<u8>> {
-        let mut dst = Vec::with_capacity(128);
+        let extra = if opts.self_describing { 256 } else { 16 };
+        let cap = self.encoded_size_hint().saturating_add(extra);
+        let mut dst = Vec::with_capacity(cap);
         self.encode_omnibuf_with_options_append(&mut dst, opts)?;
         Ok(dst)
     }
@@ -393,7 +471,8 @@ pub trait Message: Default + Sized + 'static {
     /// Decodes `data` into `self` while enforcing explicit [`DecodeOptions`] resource limits.
     #[inline]
     fn decode_omnibuf_with_options(&mut self, data: &[u8], opts: DecodeOptions) -> Result<()> {
-        enforce_decode_options(data, &opts)?;
+        let schema_alloc = enforce_decode_options_with_schema_alloc(data, &opts)?;
+        let _guard = AllocBudgetGuard::new(opts.max_alloc_bytes.saturating_sub(schema_alloc));
         self.decode_omnibuf_at_depth(data, 0, false)
     }
 
@@ -408,10 +487,66 @@ pub trait Message: Default + Sized + 'static {
     /// Allocates a default instance of `Self` and decodes `data` under explicit [`DecodeOptions`].
     #[inline]
     fn from_omnibuf_with_options(data: &[u8], opts: DecodeOptions) -> Result<Self> {
-        enforce_decode_options(data, &opts)?;
+        let schema_alloc = enforce_decode_options_with_schema_alloc(data, &opts)?;
+        let _guard = AllocBudgetGuard::new(opts.max_alloc_bytes.saturating_sub(schema_alloc));
         let mut msg = Self::default();
         msg.decode_omnibuf_at_depth(data, 0, true)?;
         Ok(msg)
+    }
+}
+
+/// Trait implemented by zero-copy borrowed view types that decode directly from `&'de [u8]`
+/// without allocating `String` or `Vec<u8>` buffers for scalar UTF-8 and byte fields.
+pub trait DecodeBorrowed<'de>: Default + Sized {
+    /// Decodes `data` into `self` at recursion `depth`, borrowing `&'de str` and `&'de [u8]`
+    /// slices directly from `data`.
+    fn decode_omnibuf_borrowed_at_depth(
+        &mut self,
+        data: &'de [u8],
+        depth: usize,
+        merge: bool,
+    ) -> Result<()>;
+
+    /// Resets all fields of `self` to their default values.
+    #[inline]
+    fn clear_omnibuf_borrowed(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Decodes `data` into `self`, resetting unseen fields.
+    #[inline]
+    fn decode_omnibuf_borrowed(&mut self, data: &'de [u8]) -> Result<()> {
+        self.decode_omnibuf_borrowed_at_depth(data, 0, false)
+    }
+
+    /// Decodes `data` into `self` while enforcing explicit [`DecodeOptions`] resource limits.
+    #[inline]
+    fn decode_omnibuf_borrowed_with_options(
+        &mut self,
+        data: &'de [u8],
+        opts: DecodeOptions,
+    ) -> Result<()> {
+        let schema_alloc = enforce_decode_options_with_schema_alloc(data, &opts)?;
+        let _guard = AllocBudgetGuard::new(opts.max_alloc_bytes.saturating_sub(schema_alloc));
+        self.decode_omnibuf_borrowed_at_depth(data, 0, false)
+    }
+
+    /// Decodes `data` into a newly constructed zero-copy borrowed `Self`.
+    #[inline]
+    fn from_omnibuf_borrowed(data: &'de [u8]) -> Result<Self> {
+        let mut view = Self::default();
+        view.decode_omnibuf_borrowed_at_depth(data, 0, true)?;
+        Ok(view)
+    }
+
+    /// Decodes `data` into a newly constructed zero-copy borrowed `Self` under [`DecodeOptions`].
+    #[inline]
+    fn from_omnibuf_borrowed_with_options(data: &'de [u8], opts: DecodeOptions) -> Result<Self> {
+        let schema_alloc = enforce_decode_options_with_schema_alloc(data, &opts)?;
+        let _guard = AllocBudgetGuard::new(opts.max_alloc_bytes.saturating_sub(schema_alloc));
+        let mut view = Self::default();
+        view.decode_omnibuf_borrowed_at_depth(data, 0, true)?;
+        Ok(view)
     }
 }
 
@@ -445,6 +580,40 @@ pub fn from_slice_with_options<M: Message>(data: &[u8], opts: DecodeOptions) -> 
     M::from_omnibuf_with_options(data, opts)
 }
 
+/// Decodes an OmniBuf byte slice into a zero-copy borrowed `M: DecodeBorrowed<'de>`.
+#[inline]
+pub fn from_slice_borrowed<'de, M: DecodeBorrowed<'de>>(data: &'de [u8]) -> Result<M> {
+    M::from_omnibuf_borrowed(data)
+}
+
+/// Decodes an OmniBuf byte slice into a zero-copy borrowed `M` under [`DecodeOptions`].
+#[inline]
+pub fn from_slice_borrowed_with_options<'de, M: DecodeBorrowed<'de>>(
+    data: &'de [u8],
+    opts: DecodeOptions,
+) -> Result<M> {
+    M::from_omnibuf_borrowed_with_options(data, opts)
+}
+
+/// Decodes an OmniBuf byte slice into an existing borrowed `dst` view, clearing absent fields.
+#[inline]
+pub fn decode_into_borrowed<'de, M: DecodeBorrowed<'de>>(
+    data: &'de [u8],
+    dst: &mut M,
+) -> Result<()> {
+    dst.decode_omnibuf_borrowed(data)
+}
+
+/// Decodes an OmniBuf byte slice into an existing borrowed `dst` view under [`DecodeOptions`].
+#[inline]
+pub fn decode_into_borrowed_with_options<'de, M: DecodeBorrowed<'de>>(
+    data: &'de [u8],
+    dst: &mut M,
+    opts: DecodeOptions,
+) -> Result<()> {
+    dst.decode_omnibuf_borrowed_with_options(data, opts)
+}
+
 /// Decodes an OmniBuf byte slice into an existing `dst` instance, clearing absent fields.
 #[inline]
 pub fn decode_into<M: Message>(data: &[u8], dst: &mut M) -> Result<()> {
@@ -469,6 +638,19 @@ pub mod codec {
     pub trait Oneof: Sized + 'static {
         /// Appends the active oneof variant's tagged field to `dst`.
         fn encode_oneof(&self, dst: &mut Vec<u8>, deterministic: bool) -> Result<()>;
+
+        /// Returns a strict lower bound on the encoded byte size for the active oneof arm.
+        #[inline]
+        fn min_wire_size_bounded(&self, depth_rem: usize) -> usize {
+            let _ = depth_rem;
+            0
+        }
+
+        /// Returns an estimated encoded byte size for the active oneof arm.
+        #[inline]
+        fn encoded_size_hint(&self) -> usize {
+            self.min_wire_size_bounded(4).max(16)
+        }
 
         /// Attempts to decode field `(fnum, wt)` at `data[pos..]` into `slot`.
         ///
@@ -621,6 +803,14 @@ pub mod codec {
     }
 
     #[inline(always)]
+    fn begin_tagged_container_4b(dst: &mut Vec<u8>, field_num: u32, wire_type: u8) -> usize {
+        append_tag(dst, field_num, wire_type);
+        let len_pos = dst.len();
+        dst.extend_from_slice(&[0, 0, 0, 0]);
+        len_pos
+    }
+
+    #[inline(always)]
     fn begin_tagged_array(dst: &mut Vec<u8>, field_num: u32, elem_wt: u8, count: usize) -> usize {
         let tag = (u64::from(field_num) << 4) | u64::from(WIRE_ARRAY);
         dst.reserve(9 + 3 + 9);
@@ -635,6 +825,58 @@ pub mod codec {
             let cn = put_varint_raw(ptr.add(tn + 3), count as u64);
             dst.set_len(len + tn + 3 + cn);
             len_pos
+        }
+    }
+
+    #[inline(always)]
+    fn begin_tagged_array_4b(
+        dst: &mut Vec<u8>,
+        field_num: u32,
+        elem_wt: u8,
+        count: usize,
+    ) -> usize {
+        let tag = (u64::from(field_num) << 4) | u64::from(WIRE_ARRAY);
+        dst.reserve(9 + 5 + 9);
+        unsafe {
+            let len = dst.len();
+            let ptr = dst.as_mut_ptr().add(len);
+            let tn = put_varint_raw(ptr, tag);
+            let len_pos = len + tn;
+            *ptr.add(tn) = 0;
+            *ptr.add(tn + 1) = 0;
+            *ptr.add(tn + 2) = 0;
+            *ptr.add(tn + 3) = 0;
+            *ptr.add(tn + 4) = elem_wt;
+            let cn = put_varint_raw(ptr.add(tn + 5), count as u64);
+            dst.set_len(len + tn + 5 + cn);
+            len_pos
+        }
+    }
+
+    /// Writes a canonical container length header (minimum 2 bytes) directly at `ptr`, returning its width.
+    ///
+    /// # Safety
+    /// `ptr` must be valid for writes of at least 9 bytes.
+    #[inline(always)]
+    unsafe fn put_container_len_raw(ptr: *mut u8, sub_len: usize) -> usize {
+        unsafe {
+            if sub_len <= 16_383 {
+                let u = ((sub_len as u16) << 2) | 2;
+                core::ptr::copy_nonoverlapping(u.to_le_bytes().as_ptr(), ptr, 2);
+                2
+            } else if sub_len <= 536_870_911 {
+                let u = ((sub_len as u32) << 3) | 4;
+                core::ptr::copy_nonoverlapping(u.to_le_bytes().as_ptr(), ptr, 4);
+                4
+            } else {
+                *ptr = 0;
+                core::ptr::copy_nonoverlapping(
+                    (sub_len as u64).to_le_bytes().as_ptr(),
+                    ptr.add(1),
+                    8,
+                );
+                9
+            }
         }
     }
 
@@ -831,9 +1073,17 @@ pub mod codec {
         msg: &M,
         deterministic: bool,
     ) -> Result<()> {
-        let len_pos = begin_tagged_container(dst, field_num, WIRE_SUB_MSG);
-        msg.encode_omnibuf_append(dst, deterministic)?;
-        backpatch_container_len(dst, len_pos);
+        let min_body = msg.min_wire_size();
+        if min_body > 16_383 {
+            dst.reserve(min_body.saturating_add(16));
+            let len_pos = begin_tagged_container_4b(dst, field_num, WIRE_SUB_MSG);
+            msg.encode_omnibuf_append(dst, deterministic)?;
+            backpatch_container_len_4b(dst, len_pos);
+        } else {
+            let len_pos = begin_tagged_container(dst, field_num, WIRE_SUB_MSG);
+            msg.encode_omnibuf_append(dst, deterministic)?;
+            backpatch_container_len(dst, len_pos);
+        }
         Ok(())
     }
 
@@ -882,6 +1132,7 @@ pub mod codec {
         match slot {
             Some(msg) => msg.decode_omnibuf_at_depth(sub_bytes, depth + 1, merge)?,
             None => {
+                super::charge_typed_alloc(core::mem::size_of::<M>())?;
                 let mut msg = Box::new(M::default());
                 msg.decode_omnibuf_at_depth(sub_bytes, depth + 1, true)?;
                 *slot = Some(msg);
@@ -890,7 +1141,7 @@ pub mod codec {
         Ok(next_pos)
     }
 
-    /// Encodes a `WireArray` of varint-encoded scalar elements in a single buffer reservation.
+    /// Encodes a `WireArray` of varint-encoded scalar elements using exact size pre-computation.
     #[inline]
     pub fn write_varint_vec_field<T, F>(
         dst: &mut Vec<u8>,
@@ -904,31 +1155,81 @@ pub mod codec {
     {
         let tag = (u64::from(field_num) << 4) | u64::from(WIRE_ARRAY);
         let count = items.len();
-        let needed = count
-            .checked_mul(9)
-            .and_then(|n| n.checked_add(21))
-            .expect("capacity overflow");
-        dst.reserve(needed);
-        let len_pos = unsafe {
-            let start_len = dst.len();
-            let base = dst.as_mut_ptr();
-            let mut ptr = base.add(start_len);
-            let tn = put_varint_raw(ptr, tag);
-            let lp = start_len + tn;
-            *ptr.add(tn) = 0;
-            *ptr.add(tn + 1) = 0;
-            *ptr.add(tn + 2) = elem_wt;
-            let cn = put_varint_raw(ptr.add(tn + 3), count as u64);
-            ptr = ptr.add(tn + 3 + cn);
-            for item in items {
-                let vn = put_varint_raw(ptr, to_u64(item));
-                ptr = ptr.add(vn);
+        if count <= 32 {
+            let mut vals = [0u64; 32];
+            let mut payload_bytes = 0usize;
+            for (slot, item) in vals[..count].iter_mut().zip(items.iter()) {
+                let v = to_u64(item);
+                *slot = v;
+                payload_bytes += varint_len(v);
             }
-            let total_len = ptr.offset_from(base) as usize;
-            dst.set_len(total_len);
-            lp
-        };
-        backpatch_container_len(dst, len_pos);
+            let cn = varint_len(count as u64);
+            let sub_len = 1 + cn + payload_bytes;
+            let lw = container_len_width(sub_len);
+            let tw = varint_len(tag);
+            let exact = tw + lw + sub_len;
+            dst.reserve(exact + 8);
+            unsafe {
+                let start_len = dst.len();
+                let mut ptr = dst.as_mut_ptr().add(start_len);
+                ptr = ptr.add(put_varint_raw(ptr, tag));
+                ptr = ptr.add(put_container_len_raw(ptr, sub_len));
+                *ptr = elem_wt;
+                ptr = ptr.add(1);
+                ptr = ptr.add(put_varint_raw(ptr, count as u64));
+                for &v in &vals[..count] {
+                    ptr = ptr.add(put_varint_raw(ptr, v));
+                }
+                dst.set_len(start_len + exact);
+            }
+            return Ok(());
+        }
+
+        let payload_bytes: usize = items
+            .iter()
+            .map(|item| varint_len(to_u64(item)))
+            .fold(0usize, usize::saturating_add);
+        let cn = varint_len(count as u64);
+        let sub_len = 1usize
+            .checked_add(cn)
+            .and_then(|n| n.checked_add(payload_bytes))
+            .expect("capacity overflow");
+        let lw = container_len_width(sub_len);
+        let tw = varint_len(tag);
+        let exact = tw
+            .checked_add(lw)
+            .and_then(|n| n.checked_add(sub_len))
+            .expect("capacity overflow");
+        dst.reserve(exact.checked_add(8).expect("capacity overflow"));
+        let start_len = dst.len();
+        let len_pos = start_len + tw;
+        unsafe {
+            let mut ptr = dst.as_mut_ptr().add(start_len);
+            ptr = ptr.add(put_varint_raw(ptr, tag));
+            ptr = ptr.add(put_container_len_raw(ptr, sub_len));
+            *ptr = elem_wt;
+            ptr = ptr.add(1);
+            ptr = ptr.add(put_varint_raw(ptr, count as u64));
+            let mut written = ptr.offset_from(dst.as_ptr()) as usize;
+            for item in items {
+                let v = to_u64(item);
+                if written + 9 > dst.capacity() {
+                    dst.set_len(written);
+                    dst.reserve(9);
+                }
+                let vn = put_varint_raw(dst.as_mut_ptr().add(written), v);
+                written += vn;
+            }
+            dst.set_len(written);
+        }
+        let actual_sub_len = dst.len() - (len_pos + lw);
+        if actual_sub_len != sub_len {
+            if lw == 4 {
+                backpatch_container_len_4b(dst, len_pos);
+            } else if lw == 2 {
+                backpatch_container_len(dst, len_pos);
+            }
+        }
         Ok(())
     }
 
@@ -944,11 +1245,39 @@ pub mod codec {
     where
         F: FnMut(&mut Vec<u8>, &T) -> Result<()>,
     {
-        let len_pos = begin_tagged_array(dst, field_num, elem_wt, items.len());
-        for item in items {
-            write_elem(dst, item)?;
+        let count = items.len();
+        let fixed_w = match elem_wt {
+            WIRE_BOOL_FALSE => 1usize,
+            WIRE_FIXED32 | WIRE_FLOAT32 | WIRE_SFIXED32 => 4,
+            WIRE_FIXED64 | WIRE_FLOAT64 | WIRE_SFIXED64 => 8,
+            _ => 0,
+        };
+        let min_body = if fixed_w > 0 {
+            1usize
+                .saturating_add(varint_len(count as u64))
+                .saturating_add(count.saturating_mul(fixed_w))
+        } else {
+            1usize
+                .saturating_add(varint_len(count as u64))
+                .saturating_add(count)
+        };
+        if min_body > 16_383 {
+            dst.reserve(min_body.saturating_add(24));
+            let len_pos = begin_tagged_array_4b(dst, field_num, elem_wt, count);
+            for item in items {
+                write_elem(dst, item)?;
+            }
+            backpatch_container_len_4b(dst, len_pos);
+        } else {
+            if fixed_w > 0 && count > 0 {
+                dst.reserve(min_body.saturating_add(16));
+            }
+            let len_pos = begin_tagged_array(dst, field_num, elem_wt, count);
+            for item in items {
+                write_elem(dst, item)?;
+            }
+            backpatch_container_len(dst, len_pos);
         }
-        backpatch_container_len(dst, len_pos);
         Ok(())
     }
 
@@ -978,6 +1307,7 @@ pub mod codec {
         if elem_wt != exp_elem_wt {
             return Err(cold_parse_err("WireArray element wire type mismatch"));
         }
+        super::charge_typed_alloc(count.saturating_mul(core::mem::size_of::<T>()))?;
         let base = items.len();
         let cap_add = count.min(4096);
         let total = base.saturating_add(cap_add);
@@ -1003,11 +1333,31 @@ pub mod codec {
         items: &[M],
         deterministic: bool,
     ) -> Result<()> {
-        let len_pos = begin_tagged_array(dst, field_num, WIRE_SUB_MSG, items.len());
-        for item in items {
-            write_sub_msg_elem(dst, item, deterministic)?;
+        let count = items.len();
+        let elems_min: usize = items
+            .iter()
+            .map(|m| {
+                let em = m.min_wire_size();
+                container_len_width(em).saturating_add(em)
+            })
+            .fold(0usize, usize::saturating_add);
+        let min_body = 1usize
+            .saturating_add(varint_len(count as u64))
+            .saturating_add(elems_min);
+        if min_body > 16_383 {
+            dst.reserve(min_body.saturating_add(24));
+            let len_pos = begin_tagged_array_4b(dst, field_num, WIRE_SUB_MSG, count);
+            for item in items {
+                write_sub_msg_elem(dst, item, deterministic)?;
+            }
+            backpatch_container_len_4b(dst, len_pos);
+        } else {
+            let len_pos = begin_tagged_array(dst, field_num, WIRE_SUB_MSG, count);
+            for item in items {
+                write_sub_msg_elem(dst, item, deterministic)?;
+            }
+            backpatch_container_len(dst, len_pos);
         }
-        backpatch_container_len(dst, len_pos);
         Ok(())
     }
 
@@ -1019,11 +1369,31 @@ pub mod codec {
         items: &[Box<M>],
         deterministic: bool,
     ) -> Result<()> {
-        let len_pos = begin_tagged_array(dst, field_num, WIRE_SUB_MSG, items.len());
-        for item in items {
-            write_sub_msg_elem(dst, item.as_ref(), deterministic)?;
+        let count = items.len();
+        let elems_min: usize = items
+            .iter()
+            .map(|m| {
+                let em = m.min_wire_size();
+                container_len_width(em).saturating_add(em)
+            })
+            .fold(0usize, usize::saturating_add);
+        let min_body = 1usize
+            .saturating_add(varint_len(count as u64))
+            .saturating_add(elems_min);
+        if min_body > 16_383 {
+            dst.reserve(min_body.saturating_add(24));
+            let len_pos = begin_tagged_array_4b(dst, field_num, WIRE_SUB_MSG, count);
+            for item in items {
+                write_sub_msg_elem(dst, item.as_ref(), deterministic)?;
+            }
+            backpatch_container_len_4b(dst, len_pos);
+        } else {
+            let len_pos = begin_tagged_array(dst, field_num, WIRE_SUB_MSG, count);
+            for item in items {
+                write_sub_msg_elem(dst, item.as_ref(), deterministic)?;
+            }
+            backpatch_container_len(dst, len_pos);
         }
-        backpatch_container_len(dst, len_pos);
         Ok(())
     }
 
@@ -1048,6 +1418,7 @@ pub mod codec {
         if elem_wt != WIRE_SUB_MSG {
             return Err(cold_parse_err("expected WireArray(WireSubMsg)"));
         }
+        super::charge_typed_alloc(count.saturating_mul(core::mem::size_of::<M>()))?;
         let base = items.len();
         let cap_add = count.min(4096);
         let total = base.saturating_add(cap_add);
@@ -1087,6 +1458,9 @@ pub mod codec {
         if elem_wt != WIRE_SUB_MSG {
             return Err(cold_parse_err("expected WireArray(WireSubMsg)"));
         }
+        super::charge_typed_alloc(count.saturating_mul(
+            core::mem::size_of::<Box<M>>().saturating_add(core::mem::size_of::<M>()),
+        ))?;
         let base = items.len();
         let cap_add = count.min(4096);
         let total = base.saturating_add(cap_add);
@@ -1113,10 +1487,19 @@ pub mod codec {
         msg: &M,
         deterministic: bool,
     ) -> Result<()> {
-        let elem_pos = dst.len();
-        dst.extend_from_slice(&[0, 0]);
-        msg.encode_omnibuf_append(dst, deterministic)?;
-        backpatch_container_len(dst, elem_pos);
+        let min_sub = msg.min_wire_size();
+        if min_sub > 16_383 {
+            dst.reserve(min_sub.saturating_add(8));
+            let elem_pos = dst.len();
+            dst.extend_from_slice(&[0, 0, 0, 0]);
+            msg.encode_omnibuf_append(dst, deterministic)?;
+            backpatch_container_len_4b(dst, elem_pos);
+        } else {
+            let elem_pos = dst.len();
+            dst.extend_from_slice(&[0, 0]);
+            msg.encode_omnibuf_append(dst, deterministic)?;
+            backpatch_container_len(dst, elem_pos);
+        }
         Ok(())
     }
 
@@ -1141,6 +1524,7 @@ pub mod codec {
         depth: usize,
     ) -> Result<(Box<M>, usize)> {
         let (elem_bytes, next_p) = read_len_slice(body, p, 0)?;
+        super::charge_typed_alloc(core::mem::size_of::<M>())?;
         let mut elem = Box::new(M::default());
         elem.decode_omnibuf_at_depth(elem_bytes, depth + 1, true)?;
         Ok((elem, next_p))
@@ -1159,11 +1543,23 @@ pub mod codec {
     where
         F: FnMut(&mut Vec<u8>, &T, bool) -> Result<()>,
     {
-        let len_pos = begin_tagged_array(dst, field_num, elem_wt, items.len());
-        for item in items {
-            write_elem(dst, item, deterministic)?;
+        let count = items.len();
+        let min_body = 1usize
+            .saturating_add(varint_len(count as u64))
+            .saturating_add(count.saturating_mul(2));
+        if min_body > 16_383 {
+            let len_pos = begin_tagged_array_4b(dst, field_num, elem_wt, count);
+            for item in items {
+                write_elem(dst, item, deterministic)?;
+            }
+            backpatch_container_len_4b(dst, len_pos);
+        } else {
+            let len_pos = begin_tagged_array(dst, field_num, elem_wt, count);
+            for item in items {
+                write_elem(dst, item, deterministic)?;
+            }
+            backpatch_container_len(dst, len_pos);
         }
-        backpatch_container_len(dst, len_pos);
         Ok(())
     }
 
@@ -1192,6 +1588,7 @@ pub mod codec {
         if elem_wt != exp_elem_wt {
             return Err(cold_parse_err("WireArray element wire type mismatch"));
         }
+        super::charge_typed_alloc(count.saturating_mul(core::mem::size_of::<T>()))?;
         let base = items.len();
         let cap_add = count.min(4096);
         let total = base.saturating_add(cap_add);
@@ -1250,6 +1647,7 @@ pub mod codec {
         if elem_wt != exp_elem_wt {
             return Err(cold_parse_err("WireArray element wire type mismatch"));
         }
+        super::charge_typed_alloc(count.saturating_mul(core::mem::size_of::<T>()))?;
         let mut items = Vec::with_capacity(count.min(4096));
         for _ in 0..count {
             let (val, next_p) = read_elem(body, p, depth + 1)?;
@@ -1345,6 +1743,188 @@ pub mod codec {
         Ok((b.to_vec(), next_p))
     }
 
+    #[inline(always)]
+    pub fn read_elem_str_borrowed(body: &[u8], p: usize) -> Result<(&str, usize)> {
+        read_str_slice(body, p)
+    }
+
+    #[inline(always)]
+    pub fn read_elem_bytes_borrowed(body: &[u8], p: usize) -> Result<(&[u8], usize)> {
+        read_len_slice(body, p, 0)
+    }
+
+    #[inline]
+    pub fn read_opt_sub_msg_borrowed_field<'de, M: DecodeBorrowed<'de>>(
+        slot: &mut Option<M>,
+        data: &'de [u8],
+        pos: usize,
+        depth: usize,
+        merge: bool,
+    ) -> Result<usize> {
+        let (sub_bytes, next_pos) = read_len_slice(data, pos, 0)?;
+        match slot {
+            Some(msg) => msg.decode_omnibuf_borrowed_at_depth(sub_bytes, depth + 1, merge)?,
+            None => {
+                let mut msg = M::default();
+                msg.decode_omnibuf_borrowed_at_depth(sub_bytes, depth + 1, true)?;
+                *slot = Some(msg);
+            }
+        }
+        Ok(next_pos)
+    }
+
+    #[inline]
+    pub fn read_opt_box_sub_msg_borrowed_field<'de, M: DecodeBorrowed<'de>>(
+        slot: &mut Option<Box<M>>,
+        data: &'de [u8],
+        pos: usize,
+        depth: usize,
+        merge: bool,
+    ) -> Result<usize> {
+        let (sub_bytes, next_pos) = read_len_slice(data, pos, 0)?;
+        match slot {
+            Some(msg) => msg.decode_omnibuf_borrowed_at_depth(sub_bytes, depth + 1, merge)?,
+            None => {
+                super::charge_typed_alloc(core::mem::size_of::<M>())?;
+                let mut msg = Box::new(M::default());
+                msg.decode_omnibuf_borrowed_at_depth(sub_bytes, depth + 1, true)?;
+                *slot = Some(msg);
+            }
+        }
+        Ok(next_pos)
+    }
+
+    #[inline]
+    pub fn read_scalar_vec_borrowed_field<'de, T, F>(
+        items: &mut Vec<T>,
+        data: &'de [u8],
+        pos: usize,
+        depth: usize,
+        exp_elem_wt: u8,
+        reset: bool,
+        mut read_elem: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&'de [u8], usize) -> Result<(T, usize)>,
+    {
+        if depth + 1 > MAX_NESTING_DEPTH {
+            return Err(Error::DepthLimitExceeded(depth + 1));
+        }
+        let (body, next_pos) = read_len_slice(data, pos, 2)?;
+        if reset {
+            items.clear();
+        }
+        let (elem_wt, count, mut p) =
+            parse_array_header(body).ok_or_else(|| cold_parse_err("invalid WireArray header"))?;
+        if elem_wt != exp_elem_wt {
+            return Err(cold_parse_err("WireArray element wire type mismatch"));
+        }
+        super::charge_typed_alloc(count.saturating_mul(core::mem::size_of::<T>()))?;
+        let base = items.len();
+        let cap_add = count.min(4096);
+        let total = base.saturating_add(cap_add);
+        if items.capacity() < total {
+            items.reserve(grow_capacity(items.capacity(), total) - base);
+        }
+        for _ in 0..count {
+            let (val, next_p) = read_elem(body, p)?;
+            items.push(val);
+            p = next_p;
+        }
+        if p != body.len() {
+            return Err(cold_parse_err("WireArray trailing bytes"));
+        }
+        Ok(next_pos)
+    }
+
+    #[inline]
+    pub fn read_sub_msg_borrowed_vec_field<'de, M: DecodeBorrowed<'de>>(
+        items: &mut Vec<M>,
+        data: &'de [u8],
+        pos: usize,
+        depth: usize,
+        reset: bool,
+    ) -> Result<usize> {
+        if depth + 1 > MAX_NESTING_DEPTH {
+            return Err(Error::DepthLimitExceeded(depth + 1));
+        }
+        let (body, next_pos) = read_len_slice(data, pos, 2)?;
+        if reset {
+            items.clear();
+        }
+        let (elem_wt, count, mut p) =
+            parse_array_header(body).ok_or_else(|| cold_parse_err("invalid WireArray header"))?;
+        if elem_wt != WIRE_SUB_MSG {
+            return Err(cold_parse_err("expected WireArray(WireSubMsg)"));
+        }
+        super::charge_typed_alloc(count.saturating_mul(core::mem::size_of::<M>()))?;
+        let base = items.len();
+        let cap_add = count.min(4096);
+        let total = base.saturating_add(cap_add);
+        if items.capacity() < total {
+            items.reserve(grow_capacity(items.capacity(), total) - base);
+        }
+        for _ in 0..count {
+            let (elem_bytes, next_p) = read_len_slice(body, p, 0)?;
+            let mut elem = M::default();
+            elem.decode_omnibuf_borrowed_at_depth(elem_bytes, depth + 2, true)?;
+            items.push(elem);
+            p = next_p;
+        }
+        if p != body.len() {
+            return Err(cold_parse_err("WireArray(WireSubMsg) trailing bytes"));
+        }
+        Ok(next_pos)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_hash_map_borrowed_field<'de, K, V, S, FK, FV>(
+        map: &mut HashMap<K, V, S>,
+        data: &'de [u8],
+        pos: usize,
+        depth: usize,
+        exp_key_wt: u8,
+        exp_val_wt: u8,
+        reset: bool,
+        mut read_key: FK,
+        mut read_val: FV,
+    ) -> Result<usize>
+    where
+        K: Eq + Hash,
+        S: Default + std::hash::BuildHasher,
+        FK: FnMut(&'de [u8], usize) -> Result<(K, usize)>,
+        FV: FnMut(&'de [u8], usize, usize) -> Result<(V, usize)>,
+    {
+        if depth + 1 > MAX_NESTING_DEPTH {
+            return Err(Error::DepthLimitExceeded(depth + 1));
+        }
+        let (body, next_pos) = read_len_slice(data, pos, 3)?;
+        let (key_wt, val_wt, count, mut p) =
+            parse_map_header(body).ok_or_else(|| Error::parse("invalid WireMap header"))?;
+        if key_wt != exp_key_wt || val_wt != exp_val_wt {
+            return Err(Error::parse(format!(
+                "WireMap header mismatch: expected ({exp_key_wt}, {exp_val_wt}), got ({key_wt}, {val_wt})"
+            )));
+        }
+        super::charge_typed_alloc(
+            count.saturating_mul(core::mem::size_of::<(K, V)>().saturating_add(16)),
+        )?;
+        if reset {
+            map.clear();
+        }
+        map.reserve(count.min(4096));
+        for _ in 0..count {
+            let (k, after_k) = read_key(body, p)?;
+            let (v, after_v) = read_val(body, after_k, depth + 1)?;
+            map.insert(k, v);
+            p = after_v;
+        }
+        if p != body.len() {
+            return Err(Error::parse("WireMap trailing bytes"));
+        }
+        Ok(next_pos)
+    }
+
     // ========================================================================
     // Generic WireMap Encoding & Decoding (HashMap & BTreeMap)
     // ========================================================================
@@ -1366,11 +1946,21 @@ pub mod codec {
         FK: FnMut(&mut Vec<u8>, &K) -> Result<()>,
         FV: FnMut(&mut Vec<u8>, &V, bool) -> Result<()>,
     {
+        let count = map.len();
+        let min_body = 2usize
+            .saturating_add(varint_len(count as u64))
+            .saturating_add(count.saturating_mul(2));
         append_tag(dst, field_num, WIRE_MAP);
         let len_pos = dst.len();
-        dst.extend_from_slice(&[0, 0, key_wt, val_wt]);
-        append_varint(dst, map.len() as u64);
-        if deterministic && map.len() > 1 {
+        let use_4b = min_body > 16_383;
+        if use_4b {
+            dst.reserve(min_body.saturating_add(24));
+            dst.extend_from_slice(&[0, 0, 0, 0, key_wt, val_wt]);
+        } else {
+            dst.extend_from_slice(&[0, 0, key_wt, val_wt]);
+        }
+        append_varint(dst, count as u64);
+        if deterministic && count > 1 {
             let mut entries: Vec<(&K, &V)> = map.iter().collect();
             entries.sort_unstable_by(|(ka, _), (kb, _)| ka.cmp(kb));
             for (k, v) in entries {
@@ -1383,7 +1973,11 @@ pub mod codec {
                 write_val(dst, v, deterministic)?;
             }
         }
-        backpatch_container_len(dst, len_pos);
+        if use_4b {
+            backpatch_container_len_4b(dst, len_pos);
+        } else {
+            backpatch_container_len(dst, len_pos);
+        }
         Ok(())
     }
 
@@ -1403,15 +1997,29 @@ pub mod codec {
         FK: FnMut(&mut Vec<u8>, &K) -> Result<()>,
         FV: FnMut(&mut Vec<u8>, &V, bool) -> Result<()>,
     {
+        let count = map.len();
+        let min_body = 2usize
+            .saturating_add(varint_len(count as u64))
+            .saturating_add(count.saturating_mul(2));
         append_tag(dst, field_num, WIRE_MAP);
         let len_pos = dst.len();
-        dst.extend_from_slice(&[0, 0, key_wt, val_wt]);
-        append_varint(dst, map.len() as u64);
+        let use_4b = min_body > 16_383;
+        if use_4b {
+            dst.reserve(min_body.saturating_add(24));
+            dst.extend_from_slice(&[0, 0, 0, 0, key_wt, val_wt]);
+        } else {
+            dst.extend_from_slice(&[0, 0, key_wt, val_wt]);
+        }
+        append_varint(dst, count as u64);
         for (k, v) in map {
             write_key(dst, k)?;
             write_val(dst, v, deterministic)?;
         }
-        backpatch_container_len(dst, len_pos);
+        if use_4b {
+            backpatch_container_len_4b(dst, len_pos);
+        } else {
+            backpatch_container_len(dst, len_pos);
+        }
         Ok(())
     }
 
@@ -1445,6 +2053,9 @@ pub mod codec {
                 "WireMap header mismatch: expected ({exp_key_wt}, {exp_val_wt}), got ({key_wt}, {val_wt})"
             )));
         }
+        super::charge_typed_alloc(
+            count.saturating_mul(core::mem::size_of::<(K, V)>().saturating_add(16)),
+        )?;
         if reset {
             map.clear();
         }
@@ -1490,6 +2101,9 @@ pub mod codec {
                 "WireMap header mismatch: expected ({exp_key_wt}, {exp_val_wt}), got ({key_wt}, {val_wt})"
             )));
         }
+        super::charge_typed_alloc(
+            count.saturating_mul(core::mem::size_of::<(K, V)>().saturating_add(16)),
+        )?;
         if reset {
             map.clear();
         }
@@ -1723,5 +2337,25 @@ pub mod codec {
         depth: usize,
     ) -> Option<SchemaMeta> {
         field.as_option()?.build_value_schema_meta(depth)
+    }
+
+    /// Computes a strict lower-bound encoded byte size for a `buffa::MessageField<M, P>`.
+    #[cfg(feature = "buffa")]
+    #[inline]
+    pub fn buffa_message_field_min_wire_size<M: Message, P: ::buffa::ProtoBox<M>>(
+        field_num: u32,
+        field: &::buffa::MessageField<M, P>,
+        depth_rem: usize,
+    ) -> usize {
+        let Some(m) = field.as_option() else {
+            return 0;
+        };
+        let tag_w = varint_len((u64::from(field_num) << 4) | u64::from(WIRE_SUB_MSG));
+        let sub = if depth_rem > 0 {
+            m.min_wire_size_bounded(depth_rem - 1)
+        } else {
+            0
+        };
+        tag_w + container_len_width(sub) + sub
     }
 }
