@@ -151,7 +151,10 @@ use buffa_descriptor::{
 
 use crate::error::{Error, Result};
 use crate::field0::{SchemaMeta, merge_schema_meta, validate_field0};
-use crate::message::{DecodeOptions, EncodeOptions, enforce_decode_options};
+use crate::message::{
+    AllocBudgetGuard, DecodeOptions, EncodeOptions, charge_typed_alloc,
+    enforce_decode_options_with_schema_alloc,
+};
 use crate::wire::{
     MAX_FIELD_NUMBER, MAX_NESTING_DEPTH, WIRE_ARRAY, WIRE_BOOL_FALSE, WIRE_BOOL_TRUE, WIRE_BYTES,
     WIRE_FIXED32, WIRE_FIXED64, WIRE_FLOAT32, WIRE_FLOAT64, WIRE_MAP, WIRE_SFIXED32, WIRE_SFIXED64,
@@ -406,7 +409,8 @@ pub fn decode_buffa_dynamic_with_options(
     msg: &mut DynamicMessage,
     opts: DecodeOptions,
 ) -> Result<()> {
-    enforce_decode_options(data, &opts)?;
+    let schema_alloc = enforce_decode_options_with_schema_alloc(data, &opts)?;
+    let _guard = AllocBudgetGuard::new(opts.max_alloc_bytes.saturating_sub(schema_alloc));
     decode_buffa_dynamic_at_depth(data, msg, 0, false)
 }
 
@@ -430,7 +434,8 @@ pub fn decode_buffa_with_options<M: BuffaMessage + MessageName + Default>(
     pool: &Arc<DescriptorPool>,
     opts: DecodeOptions,
 ) -> Result<M> {
-    enforce_decode_options(data, &opts)?;
+    let schema_alloc = enforce_decode_options_with_schema_alloc(data, &opts)?;
+    let _guard = AllocBudgetGuard::new(opts.max_alloc_bytes.saturating_sub(schema_alloc));
     decode_buffa(data, pool)
 }
 
@@ -832,10 +837,12 @@ fn decode_buffa_scalar_payload(
         }
         SingularKind::Scalar(ScalarType::String) => {
             let (s, next_pos) = read_str_slice(data, pos)?;
+            charge_typed_alloc(s.len())?;
             Ok((Value::String(s.to_owned()), next_pos))
         }
         SingularKind::Scalar(ScalarType::Bytes) => {
             let (b, next_pos) = read_len_slice(data, pos, 0)?;
+            charge_typed_alloc(b.len())?;
             Ok((Value::Bytes(b.to_vec()), next_pos))
         }
         SingularKind::Scalar(ScalarType::Float | ScalarType::Fixed32 | ScalarType::Sfixed32) => {
@@ -916,6 +923,8 @@ fn decode_buffa_dynamic_at_depth(
     type PendingMapEntry<'a> = (&'a FieldDescriptor, Vec<(MapKey, Value)>);
     let mut pending_maps: BTreeMap<u32, PendingMapEntry<'_>> = BTreeMap::new();
     let mut pending_lists: BTreeMap<u32, (&FieldDescriptor, Vec<Value>)> = BTreeMap::new();
+    let mut pending_submsgs: BTreeMap<u32, (&FieldDescriptor, DynamicMessage)> = BTreeMap::new();
+    let mut touched_oneofs: Vec<u16> = Vec::new();
 
     while pos < n {
         let (tag, tn) = decode_varint(&data[pos..])
@@ -964,6 +973,7 @@ fn decode_buffa_dynamic_at_depth(
                 if key_wt != exp_key_wt || val_wt != exp_val_wt {
                     return Err(Error::parse("WireMap key/value wire type mismatch"));
                 }
+                charge_typed_alloc(count.saturating_mul(core::mem::size_of::<(MapKey, Value)>()))?;
 
                 let (_, entries) = pending_maps.entry(fnum).or_insert_with(|| {
                     let seeded = if merge {
@@ -1019,6 +1029,7 @@ fn decode_buffa_dynamic_at_depth(
                 if elem_wt != exp_elem_wt {
                     return Err(Error::parse("WireArray element wire type mismatch"));
                 }
+                charge_typed_alloc(count.saturating_mul(core::mem::size_of::<Value>()))?;
 
                 let (_, items) = pending_lists.entry(fnum).or_insert_with(|| {
                     let seeded = if merge {
@@ -1061,6 +1072,12 @@ fn decode_buffa_dynamic_at_depth(
                         pos = validate_value(data, pos, wt, depth)?;
                         continue;
                     }
+                    if let Some(oneof_idx) = fd.oneof_index() {
+                        pending_submsgs.retain(|_, (pfd, _)| pfd.oneof_index() != Some(oneof_idx));
+                        if !touched_oneofs.contains(&oneof_idx) {
+                            touched_oneofs.push(oneof_idx);
+                        }
+                    }
                     msg.set(fd, Value::Bool(wt == WIRE_BOOL_TRUE));
                     continue;
                 }
@@ -1073,21 +1090,49 @@ fn decode_buffa_dynamic_at_depth(
 
                 if let SingularKind::Message(sub_idx) = sk {
                     let (sub_bytes, next_pos) = read_len_slice(data, pos, 0)?;
-                    if msg.has(fd) {
-                        let mut sub_msg = match msg.get(fd) {
-                            ValueRef::Message(cow) => cow.to_dynamic(),
-                            _ => DynamicMessage::new(Arc::clone(&pool), sub_idx),
-                        };
-                        decode_buffa_dynamic_at_depth(sub_bytes, &mut sub_msg, depth + 1, true)?;
-                        msg.set(fd, Value::Message(sub_msg));
+                    let oneof_idx = fd.oneof_index();
+                    if let Some(oidx) = oneof_idx {
+                        pending_submsgs.retain(|&pfnum, (pfd, _)| {
+                            pfnum == fnum || pfd.oneof_index() != Some(oidx)
+                        });
+                    }
+                    if let Some((_, sub_msg)) = pending_submsgs.get_mut(&fnum) {
+                        decode_buffa_dynamic_at_depth(sub_bytes, sub_msg, depth + 1, true)?;
                     } else {
-                        let mut sub_msg = DynamicMessage::new(Arc::clone(&pool), sub_idx);
-                        decode_buffa_dynamic_at_depth(sub_bytes, &mut sub_msg, depth + 1, false)?;
-                        msg.set(fd, Value::Message(sub_msg));
+                        charge_typed_alloc(core::mem::size_of::<DynamicMessage>())?;
+                        let merge_existing = merge
+                            && msg.has(fd)
+                            && oneof_idx.is_none_or(|oidx| !touched_oneofs.contains(&oidx));
+                        if let Some(oidx) = oneof_idx
+                            && !touched_oneofs.contains(&oidx)
+                        {
+                            touched_oneofs.push(oidx);
+                        }
+                        let mut sub_msg = if merge_existing {
+                            match msg.get(fd) {
+                                ValueRef::Message(cow) => cow.to_dynamic(),
+                                _ => DynamicMessage::new(Arc::clone(&pool), sub_idx),
+                            }
+                        } else {
+                            DynamicMessage::new(Arc::clone(&pool), sub_idx)
+                        };
+                        decode_buffa_dynamic_at_depth(
+                            sub_bytes,
+                            &mut sub_msg,
+                            depth + 1,
+                            merge_existing,
+                        )?;
+                        pending_submsgs.insert(fnum, (fd, sub_msg));
                     }
                     pos = next_pos;
                 } else {
                     let (sv, next_pos) = decode_buffa_scalar_payload(data, pos, sk)?;
+                    if let Some(oneof_idx) = fd.oneof_index() {
+                        pending_submsgs.retain(|_, (pfd, _)| pfd.oneof_index() != Some(oneof_idx));
+                        if !touched_oneofs.contains(&oneof_idx) {
+                            touched_oneofs.push(oneof_idx);
+                        }
+                    }
                     msg.set(fd, sv);
                     pos = next_pos;
                 }
@@ -1095,6 +1140,9 @@ fn decode_buffa_dynamic_at_depth(
         }
     }
 
+    for (_, (fd, sub_msg)) in pending_submsgs {
+        msg.set(fd, Value::Message(sub_msg));
+    }
     for (_, (fd, entries)) in pending_maps {
         msg.set(fd, Value::Map(MapValue::from_entries(entries)));
     }

@@ -160,12 +160,8 @@ impl BudgetTracker {
     }
 }
 
-/// Validates `data` against explicit [`DecodeOptions`] resource limits before materializing values.
-pub(crate) fn enforce_decode_options(data: &[u8], opts: &DecodeOptions) -> Result<()> {
-    let _ = enforce_decode_options_with_schema_alloc(data, opts)?;
-    Ok(())
-}
-
+/// Validates `data` against explicit [`DecodeOptions`] resource limits before materializing values,
+/// returning pre-charged schema allocation bytes.
 pub(crate) fn enforce_decode_options_with_schema_alloc(
     data: &[u8],
     opts: &DecodeOptions,
@@ -1693,22 +1689,28 @@ pub mod codec {
 
     #[inline(always)]
     pub fn read_elem_fixed32(body: &[u8], p: usize) -> Result<(u32, usize)> {
+        let end = p
+            .checked_add(4)
+            .ok_or_else(|| cold_parse_err("truncated fixed32 element"))?;
         let raw: [u8; 4] = body
-            .get(p..p + 4)
+            .get(p..end)
             .ok_or_else(|| cold_parse_err("truncated fixed32 element"))?
             .try_into()
             .unwrap();
-        Ok((u32::from_le_bytes(raw), p + 4))
+        Ok((u32::from_le_bytes(raw), end))
     }
 
     #[inline(always)]
     pub fn read_elem_fixed64(body: &[u8], p: usize) -> Result<(u64, usize)> {
+        let end = p
+            .checked_add(8)
+            .ok_or_else(|| cold_parse_err("truncated fixed64 element"))?;
         let raw: [u8; 8] = body
-            .get(p..p + 8)
+            .get(p..end)
             .ok_or_else(|| cold_parse_err("truncated fixed64 element"))?
             .try_into()
             .unwrap();
-        Ok((u64::from_le_bytes(raw), p + 8))
+        Ok((u64::from_le_bytes(raw), end))
     }
 
     #[inline(always)]

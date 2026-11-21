@@ -615,14 +615,23 @@ fn decode_blind_inner(
             resolved.to_owned()
         };
 
-        if let Some(&owner) = owners.get(&name)
-            && owner != field_num
-        {
-            return Err(Error::parse(format!(
-                "fields #{owner} and #{field_num} both decode to name {name:?}"
-            )));
+        let is_new_field = match owners.get(&name) {
+            Some(&owner) => {
+                if owner != field_num {
+                    return Err(Error::parse(format!(
+                        "fields #{owner} and #{field_num} both decode to name {name:?}"
+                    )));
+                }
+                false
+            }
+            None => true,
+        };
+        if is_new_field {
+            budget.add_alloc(
+                core::mem::size_of::<(String, BlindValue)>().saturating_add(name.len()),
+            )?;
+            owners.insert(name.clone(), field_num);
         }
-        owners.insert(name.clone(), field_num);
 
         let mut shape = parse_blind_field_shape(data, pos, wt, depth, budget.max_depth)?;
         if let Some(prev_shape) = shapes.get(&field_num) {
@@ -669,11 +678,17 @@ fn decode_blind_inner(
                 let (sub_bytes, next_pos) = read_len_slice(data, pos, 0)?;
                 match sub_packets.get_mut(&field_num) {
                     Some((_, existing)) => {
-                        if matches!(existing, Cow::Borrowed(_)) {
+                        let is_borrowed = matches!(existing, Cow::Borrowed(_));
+                        if is_borrowed {
                             validate_blind_message_slice(existing, depth + 1, budget.max_depth)?;
                         }
                         validate_blind_message_slice(sub_bytes, depth + 1, budget.max_depth)?;
-                        budget.add_alloc(sub_bytes.len())?;
+                        let alloc_charge = if is_borrowed {
+                            existing.len().saturating_add(sub_bytes.len())
+                        } else {
+                            sub_bytes.len()
+                        };
+                        budget.add_alloc(alloc_charge)?;
                         existing.to_mut().extend_from_slice(sub_bytes);
                     }
                     None => {

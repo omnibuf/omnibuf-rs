@@ -2031,26 +2031,34 @@ impl<'a> Decoder<'a> {
     /// Reads a 4-byte little-endian `u32`.
     #[inline]
     pub fn read_fixed32(&mut self) -> Result<u32> {
+        let end = self
+            .pos
+            .checked_add(4)
+            .ok_or_else(|| cold_parse_err("truncated fixed32"))?;
         let raw: [u8; 4] = self
             .data
-            .get(self.pos..self.pos + 4)
+            .get(self.pos..end)
             .ok_or_else(|| cold_parse_err("truncated fixed32"))?
             .try_into()
             .unwrap();
-        self.pos += 4;
+        self.pos = end;
         Ok(u32::from_le_bytes(raw))
     }
 
     /// Reads an 8-byte little-endian `u64`.
     #[inline]
     pub fn read_fixed64(&mut self) -> Result<u64> {
+        let end = self
+            .pos
+            .checked_add(8)
+            .ok_or_else(|| cold_parse_err("truncated fixed64"))?;
         let raw: [u8; 8] = self
             .data
-            .get(self.pos..self.pos + 8)
+            .get(self.pos..end)
             .ok_or_else(|| cold_parse_err("truncated fixed64"))?
             .try_into()
             .unwrap();
-        self.pos += 8;
+        self.pos = end;
         Ok(u64::from_le_bytes(raw))
     }
 

@@ -7,7 +7,10 @@ use prost_reflect::{
 
 use crate::error::{Error, Result};
 use crate::field0::{SchemaMeta, merge_schema_meta, validate_field0};
-use crate::message::{DecodeOptions, EncodeOptions, enforce_decode_options};
+use crate::message::{
+    AllocBudgetGuard, DecodeOptions, EncodeOptions, charge_typed_alloc,
+    enforce_decode_options_with_schema_alloc,
+};
 use crate::wire::{
     MAX_FIELD_NUMBER, MAX_NESTING_DEPTH, WIRE_ARRAY, WIRE_BOOL_FALSE, WIRE_BOOL_TRUE, WIRE_BYTES,
     WIRE_FIXED32, WIRE_FIXED64, WIRE_FLOAT32, WIRE_FLOAT64, WIRE_MAP, WIRE_SFIXED32, WIRE_SFIXED64,
@@ -188,7 +191,8 @@ pub fn decode_dynamic_with_options(
     msg: &mut DynamicMessage,
     opts: DecodeOptions,
 ) -> Result<()> {
-    enforce_decode_options(data, &opts)?;
+    let schema_alloc = enforce_decode_options_with_schema_alloc(data, &opts)?;
+    let _guard = AllocBudgetGuard::new(opts.max_alloc_bytes.saturating_sub(schema_alloc));
     decode_dynamic_at_depth(data, msg, 0, false)
 }
 
@@ -215,7 +219,8 @@ pub fn decode_prost_with_options<M: ReflectMessage + Default>(
     msg: &mut M,
     opts: DecodeOptions,
 ) -> Result<()> {
-    enforce_decode_options(data, &opts)?;
+    let schema_alloc = enforce_decode_options_with_schema_alloc(data, &opts)?;
+    let _guard = AllocBudgetGuard::new(opts.max_alloc_bytes.saturating_sub(schema_alloc));
     decode_prost(data, msg)
 }
 
@@ -383,7 +388,9 @@ fn encode_dynamic_body(dst: &mut Vec<u8>, msg: &DynamicMessage, deterministic: b
             )));
         }
     }
-    for fd in desc.fields() {
+    let mut ordered_fields: Vec<_> = desc.fields().collect();
+    ordered_fields.sort_by_key(|f| f.number());
+    for fd in ordered_fields {
         if fd.is_group() {
             return Err(Error::serialize(format!(
                 "proto2 groups are not supported by OmniBuf: {}",
@@ -534,10 +541,12 @@ fn decode_proto_scalar_payload(data: &[u8], pos: usize, kind: &Kind) -> Result<(
         }
         Kind::String => {
             let (s, next_pos) = read_str_slice(data, pos)?;
+            charge_typed_alloc(s.len())?;
             Ok((Value::String(s.to_owned()), next_pos))
         }
         Kind::Bytes => {
             let (b, next_pos) = read_len_slice(data, pos, 0)?;
+            charge_typed_alloc(b.len())?;
             Ok((Value::Bytes(Bytes::copy_from_slice(b)), next_pos))
         }
         Kind::Float | Kind::Fixed32 | Kind::Sfixed32 => {
@@ -666,6 +675,7 @@ fn decode_dynamic_at_depth(
             if key_wt != exp_key_wt || val_wt != exp_val_wt {
                 return Err(Error::parse("WireMap key/value wire type mismatch"));
             }
+            charge_typed_alloc(count.saturating_mul(core::mem::size_of::<(MapKey, Value)>()))?;
 
             let Value::Map(map) = msg.get_field_mut(&fd) else {
                 return Err(Error::parse("expected Value::Map"));
@@ -707,6 +717,7 @@ fn decode_dynamic_at_depth(
             if elem_wt != exp_elem_wt {
                 return Err(Error::parse("WireArray element wire type mismatch"));
             }
+            charge_typed_alloc(count.saturating_mul(core::mem::size_of::<Value>()))?;
 
             let Value::List(list) = msg.get_field_mut(&fd) else {
                 return Err(Error::parse("expected Value::List"));
@@ -750,6 +761,7 @@ fn decode_dynamic_at_depth(
         if let Kind::Message(sub_desc) = fd.kind() {
             let (sub_bytes, next_pos) = read_len_slice(data, pos, 0)?;
             if !msg.has_field(&fd) {
+                charge_typed_alloc(core::mem::size_of::<DynamicMessage>())?;
                 let mut sub_msg = DynamicMessage::new(sub_desc);
                 decode_dynamic_at_depth(sub_bytes, &mut sub_msg, depth + 1, false)?;
                 msg.set_field(&fd, Value::Message(sub_msg));

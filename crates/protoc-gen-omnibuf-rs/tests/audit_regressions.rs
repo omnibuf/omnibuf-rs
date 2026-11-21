@@ -430,3 +430,171 @@ fn rs_6_opaque_view_exposes_map_getter_and_presence_helpers() {
         "OpaqueServiceCfg is missing `pub fn has_sub` for singular message field `Sub sub`"
     );
 }
+
+/// Audit #4: `protoc-gen-omnibuf-rs` must reject `syntax = "editions"` and proto2 non-zero
+/// defaults, and preserve explicit presence (`Option<T>`) for proto2 optional scalar fields.
+#[test]
+fn audit_4_proto2_explicit_presence_defaults_and_editions_rejection() {
+    // 1. `syntax = "editions"` must return a clean error.
+    let editions_req = CodeGeneratorRequest {
+        file_to_generate: vec!["ed.proto".to_owned()],
+        parameter: None,
+        compiler_version: None,
+        proto_file: vec![FileDescriptorProto {
+            name: Some("ed.proto".to_owned()),
+            syntax: Some("editions".to_owned()),
+            message_type: vec![DescriptorProto {
+                name: Some("EdMsg".to_owned()),
+                field: vec![FieldDescriptorProto {
+                    name: Some("id".to_owned()),
+                    number: Some(1),
+                    label: Some(Label::Optional as i32),
+                    r#type: Some(Type::Uint32 as i32),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let ed_resp = generate(&editions_req);
+    assert!(
+        ed_resp.error.is_some(),
+        "expected `syntax = \"editions\"` to be rejected"
+    );
+
+    // 2. Proto2 field with non-zero default must return a clean error.
+    let nonzero_def_req = CodeGeneratorRequest {
+        file_to_generate: vec!["p2_def.proto".to_owned()],
+        parameter: None,
+        compiler_version: None,
+        proto_file: vec![FileDescriptorProto {
+            name: Some("p2_def.proto".to_owned()),
+            syntax: Some("proto2".to_owned()),
+            message_type: vec![DescriptorProto {
+                name: Some("DefMsg".to_owned()),
+                field: vec![FieldDescriptorProto {
+                    name: Some("retries".to_owned()),
+                    number: Some(1),
+                    label: Some(Label::Optional as i32),
+                    r#type: Some(Type::Uint32 as i32),
+                    default_value: Some("3".to_owned()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let def_resp = generate(&nonzero_def_req);
+    assert!(
+        def_resp.error.is_some(),
+        "expected proto2 non-zero default_value to be rejected"
+    );
+
+    // 3. Proto2 optional scalar without non-zero default preserves explicit presence (`Option<T>`).
+    let p2_opt_req = CodeGeneratorRequest {
+        file_to_generate: vec!["p2_opt.proto".to_owned()],
+        parameter: None,
+        compiler_version: None,
+        proto_file: vec![FileDescriptorProto {
+            name: Some("p2_opt.proto".to_owned()),
+            package: Some("p2.v1".to_owned()),
+            syntax: Some("proto2".to_owned()),
+            message_type: vec![DescriptorProto {
+                name: Some("P2Config".to_owned()),
+                field: vec![
+                    FieldDescriptorProto {
+                        name: Some("port".to_owned()),
+                        number: Some(1),
+                        label: Some(Label::Optional as i32),
+                        r#type: Some(Type::Uint32 as i32),
+                        ..Default::default()
+                    },
+                    FieldDescriptorProto {
+                        name: Some("enabled".to_owned()),
+                        number: Some(2),
+                        label: Some(Label::Optional as i32),
+                        r#type: Some(Type::Bool as i32),
+                        default_value: Some("false".to_owned()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let p2_resp = generate(&p2_opt_req);
+    assert!(
+        p2_resp.error.is_none(),
+        "unexpected error for proto2 optional scalars: {:?}",
+        p2_resp.error
+    );
+    let src = p2_resp.file[0].content.as_deref().unwrap();
+    assert!(
+        src.contains("pub port: ::core::option::Option<u32>"),
+        "expected proto2 optional uint32 to emit Option<u32>"
+    );
+    assert!(
+        src.contains("pub enabled: ::core::option::Option<bool>"),
+        "expected proto2 optional bool with zero default to emit Option<bool>"
+    );
+    assert!(
+        src.contains("pub fn has_port("),
+        "expected OpaqueP2Config to expose has_port for proto2 optional scalar"
+    );
+}
+
+/// Audit #5a: `tag_varint_width` must use Prefix-Varint thresholds (1/2/4/9), not LEB128 (1..5).
+#[test]
+fn audit_5a_tag_varint_width_uses_prefix_varint_thresholds() {
+    let req = CodeGeneratorRequest {
+        file_to_generate: vec!["tags.proto".to_owned()],
+        parameter: None,
+        compiler_version: None,
+        proto_file: vec![FileDescriptorProto {
+            name: Some("tags.proto".to_owned()),
+            syntax: Some("proto3".to_owned()),
+            message_type: vec![DescriptorProto {
+                name: Some("WideTags".to_owned()),
+                field: vec![
+                    // tag = (2000 << 4) | 2 = 32002 -> Prefix-Varint width 4 (LEB128 was 3)
+                    FieldDescriptorProto {
+                        name: Some("mid_flag".to_owned()),
+                        number: Some(2000),
+                        label: Some(Label::Optional as i32),
+                        r#type: Some(Type::Bool as i32),
+                        ..Default::default()
+                    },
+                    // tag = (50_000_000 << 4) | 2 = 800_000_002 -> Prefix-Varint width 9 (LEB128 was 5)
+                    FieldDescriptorProto {
+                        name: Some("high_flag".to_owned()),
+                        number: Some(50_000_000),
+                        label: Some(Label::Optional as i32),
+                        r#type: Some(Type::Bool as i32),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let resp = generate(&req);
+    assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+    let src = resp.file[0].content.as_deref().unwrap();
+    let min_fn = src
+        .split("fn min_wire_size_bounded(&self, depth_rem: usize) -> usize {")
+        .nth(1)
+        .and_then(|s| s.split("fn build_schema_meta").next())
+        .expect("missing min_wire_size_bounded");
+    assert!(
+        min_fn.contains("4usize"),
+        "expected 4-byte Prefix-Varint tag width for field #2000, got:\n{min_fn}"
+    );
+    assert!(
+        min_fn.contains("9usize"),
+        "expected 9-byte Prefix-Varint tag width for field #50_000_000, got:\n{min_fn}"
+    );
+}

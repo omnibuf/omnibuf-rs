@@ -89,6 +89,17 @@ fn build_registry(proto_files: &[FileDescriptorProto]) -> Result<GlobalRegistry,
     let mut reg = GlobalRegistry::default();
     for file in proto_files {
         let file_name = file.name.as_deref().unwrap_or("generated.proto");
+        let syntax = file.syntax.as_deref().unwrap_or("");
+        if syntax == "editions" {
+            return Err(format!(
+                "protobuf editions syntax is not supported by OmniBuf ({file_name})"
+            ));
+        }
+        if !matches!(syntax, "" | "proto2" | "proto3") {
+            return Err(format!(
+                "unsupported protobuf syntax {syntax:?} ({file_name})"
+            ));
+        }
         if !file.extension.is_empty() {
             let ext_name = file.extension[0].name.as_deref().unwrap_or("extension");
             return Err(format!(
@@ -432,11 +443,14 @@ fn generate_file(file: &FileDescriptorProto, reg: &GlobalRegistry) -> Result<Fil
         emit_enum(&mut code, &enum_rust_name, e);
     }
 
+    let is_proto2 = !matches!(file.syntax.as_deref(), Some("proto3"));
     let mut msg_list = Vec::new();
     flatten_messages(&pkg_prefix, &file.message_type, reg, &mut msg_list);
 
     for (fq_name, rust_name, desc) in &msg_list {
-        emit_message(&mut code, proto_name, fq_name, rust_name, desc, reg)?;
+        emit_message(
+            &mut code, proto_name, fq_name, rust_name, desc, is_proto2, reg,
+        )?;
     }
 
     Ok(File {
@@ -690,12 +704,32 @@ fn is_reserved_opaque_stem(stem: &str) -> bool {
     )
 }
 
+fn is_zero_default_value(ftype: Type, def: &str) -> bool {
+    match ftype {
+        Type::Bool => def == "false",
+        Type::String | Type::Bytes => def.is_empty(),
+        Type::Int32
+        | Type::Int64
+        | Type::Sint32
+        | Type::Sint64
+        | Type::Sfixed32
+        | Type::Sfixed64
+        | Type::Uint32
+        | Type::Uint64
+        | Type::Fixed32
+        | Type::Fixed64 => def == "0",
+        Type::Float | Type::Double => def == "0" || def == "0.0",
+        _ => false,
+    }
+}
+
 fn emit_message(
     code: &mut String,
     cur_file: &str,
     fq_msg: &str,
     rust_name: &str,
     desc: &DescriptorProto,
+    is_proto2: bool,
     reg: &GlobalRegistry,
 ) -> Result<(), String> {
     for e in &desc.enum_type {
@@ -726,6 +760,13 @@ fn emit_message(
         let label = f.label();
         let ftype = f.r#type();
         let is_proto3_opt = f.proto3_optional.unwrap_or(false);
+        if let Some(def) = f.default_value.as_deref()
+            && !is_zero_default_value(ftype, def)
+        {
+            return Err(format!(
+                "proto2 non-zero default values are not supported by OmniBuf ({rust_name}.{proto_name} = {def:?})"
+            ));
+        }
 
         if let Some(oneof_idx) = f.oneof_index
             && !is_proto3_opt
@@ -813,7 +854,7 @@ fn emit_message(
                 opaque_type,
                 boxed,
             }
-        } else if is_proto3_opt {
+        } else if is_proto3_opt || (is_proto2 && label == Label::Optional) {
             GenFieldKind::OptScalar(ProtoScalar::from_proto_type(ftype)?)
         } else {
             GenFieldKind::Scalar(ProtoScalar::from_proto_type(ftype)?)
@@ -1846,12 +1887,10 @@ fn tag_varint_width(fnum: u32, wt: u8) -> usize {
         1
     } else if tag <= 16_383 {
         2
-    } else if tag <= 2_097_151 {
-        3
-    } else if tag <= 268_435_455 {
+    } else if tag <= 536_870_911 {
         4
     } else {
-        5
+        9
     }
 }
 
