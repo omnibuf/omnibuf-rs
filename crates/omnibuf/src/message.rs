@@ -418,7 +418,8 @@ pub trait Message: Default + Sized + 'static {
     /// Returns a fast byte-length estimate used to pre-size encode buffers and container headers.
     #[inline]
     fn encoded_size_hint(&self) -> usize {
-        self.min_wire_size().max(64)
+        let min = self.min_wire_size();
+        min.saturating_add((min >> 4).clamp(128, 1024))
     }
 
     /// Encodes `self` into a newly allocated `Vec<u8>`.
@@ -1345,7 +1346,7 @@ pub mod codec {
             .saturating_add(varint_len(count as u64))
             .saturating_add(elems_min);
         if min_body > 16_383 {
-            dst.reserve(min_body.saturating_add(24));
+            dst.reserve(min_body.saturating_add(64));
             let len_pos = begin_tagged_array_4b(dst, field_num, WIRE_SUB_MSG, count);
             for item in items {
                 write_sub_msg_elem(dst, item, deterministic)?;
@@ -1354,7 +1355,10 @@ pub mod codec {
         } else {
             let len_pos = begin_tagged_array(dst, field_num, WIRE_SUB_MSG, count);
             for item in items {
-                write_sub_msg_elem(dst, item, deterministic)?;
+                let elem_pos = dst.len();
+                dst.extend_from_slice(&[0u8, 0u8]);
+                item.encode_omnibuf_append(dst, deterministic)?;
+                backpatch_container_len(dst, elem_pos);
             }
             backpatch_container_len(dst, len_pos);
         }

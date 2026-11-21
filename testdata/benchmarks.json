@@ -13,41 +13,41 @@
       "results": [
         {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 204,
-          "opsPerSec": 4903163,
+          "nsPerOp": 139,
+          "opsPerSec": 7176186,
           "wireBytes": 366,
           "highlight": true,
           "baseline": true
         },
         {
-          "name": "buffa (Protobuf)",
-          "nsPerOp": 207,
-          "opsPerSec": 4841756,
-          "wireBytes": 341
-        },
-        {
           "name": "OmniBuf (#[derive(OmniBuf)])",
-          "nsPerOp": 209,
-          "opsPerSec": 4795765,
+          "nsPerOp": 139,
+          "opsPerSec": 7215621,
           "wireBytes": 366,
           "highlight": true
         },
         {
+          "name": "buffa (Protobuf)",
+          "nsPerOp": 200,
+          "opsPerSec": 4997831,
+          "wireBytes": 341
+        },
+        {
           "name": "prost (Protobuf)",
-          "nsPerOp": 233,
-          "opsPerSec": 4288209,
+          "nsPerOp": 227,
+          "opsPerSec": 4401887,
           "wireBytes": 341
         },
         {
           "name": "rmp-serde (MessagePack)",
-          "nsPerOp": 644,
-          "opsPerSec": 1553248,
+          "nsPerOp": 628,
+          "opsPerSec": 1591822,
           "wireBytes": 626
         },
         {
           "name": "serde_json",
-          "nsPerOp": 801,
-          "opsPerSec": 1249195,
+          "nsPerOp": 783,
+          "opsPerSec": 1276874,
           "wireBytes": 803
         }
       ]
@@ -58,37 +58,37 @@
       "unit": "ns",
       "results": [
         {
-          "name": "OmniBuf (#[derive(OmniBuf)])",
-          "nsPerOp": 434,
-          "opsPerSec": 2302213,
-          "highlight": true
-        },
-        {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 455,
-          "opsPerSec": 2198540,
+          "nsPerOp": 425,
+          "opsPerSec": 2353137,
           "highlight": true,
           "baseline": true
         },
         {
+          "name": "OmniBuf (#[derive(OmniBuf)])",
+          "nsPerOp": 433,
+          "opsPerSec": 2307127,
+          "highlight": true
+        },
+        {
           "name": "buffa (Protobuf)",
-          "nsPerOp": 522,
-          "opsPerSec": 1915074
+          "nsPerOp": 525,
+          "opsPerSec": 1903652
         },
         {
           "name": "prost (Protobuf)",
-          "nsPerOp": 691,
-          "opsPerSec": 1447263
+          "nsPerOp": 666,
+          "opsPerSec": 1500409
         },
         {
           "name": "rmp-serde (MessagePack)",
-          "nsPerOp": 875,
-          "opsPerSec": 1142852
+          "nsPerOp": 862,
+          "opsPerSec": 1159831
         },
         {
           "name": "serde_json",
-          "nsPerOp": 1300,
-          "opsPerSec": 769459
+          "nsPerOp": 1311,
+          "opsPerSec": 762602
         }
       ]
     },
@@ -99,30 +99,30 @@
       "results": [
         {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 73,
-          "opsPerSec": 13624713,
+          "nsPerOp": 77,
+          "opsPerSec": 13019724,
           "highlight": true,
           "baseline": true
         },
         {
           "name": "buffa (Protobuf)",
-          "nsPerOp": 375,
-          "opsPerSec": 2668528
+          "nsPerOp": 366,
+          "opsPerSec": 2729723
         },
         {
           "name": "prost (Protobuf)",
-          "nsPerOp": 677,
-          "opsPerSec": 1477307
+          "nsPerOp": 653,
+          "opsPerSec": 1531640
         },
         {
           "name": "rmp-serde (MessagePack)",
-          "nsPerOp": 943,
-          "opsPerSec": 1060043
+          "nsPerOp": 853,
+          "opsPerSec": 1172556
         },
         {
           "name": "serde_json",
-          "nsPerOp": 1291,
-          "opsPerSec": 774424
+          "nsPerOp": 1270,
+          "opsPerSec": 787494
         }
       ]
     },
@@ -133,30 +133,30 @@
       "results": [
         {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 224,
-          "opsPerSec": 4466612,
+          "nsPerOp": 232,
+          "opsPerSec": 4316942,
           "highlight": true,
           "baseline": true
         },
         {
           "name": "buffa (Protobuf)",
-          "nsPerOp": 720,
-          "opsPerSec": 1389789
+          "nsPerOp": 725,
+          "opsPerSec": 1379034
         },
         {
           "name": "prost (Protobuf)",
-          "nsPerOp": 993,
-          "opsPerSec": 1006608
+          "nsPerOp": 937,
+          "opsPerSec": 1067135
         },
         {
           "name": "rmp-serde (MessagePack)",
-          "nsPerOp": 1524,
-          "opsPerSec": 656138
+          "nsPerOp": 1588,
+          "opsPerSec": 629710
         },
         {
           "name": "serde_json",
-          "nsPerOp": 2142,
-          "opsPerSec": 466922
+          "nsPerOp": 2151,
+          "opsPerSec": 464841
         }
       ]
     },
@@ -166,42 +166,42 @@
       "unit": "ns",
       "results": [
         {
-          "name": "prost (Protobuf)",
-          "nsPerOp": 1078,
-          "opsPerSec": 927235,
-          "wireBytes": 39227
-        },
-        {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 1167,
-          "opsPerSec": 856730,
+          "nsPerOp": 849,
+          "opsPerSec": 1178226,
           "wireBytes": 39256,
           "highlight": true,
           "baseline": true
         },
         {
-          "name": "rmp-serde (MessagePack)",
-          "nsPerOp": 1676,
-          "opsPerSec": 596527,
-          "wireBytes": 39508
+          "name": "buffa (Protobuf)",
+          "nsPerOp": 924,
+          "opsPerSec": 1082053,
+          "wireBytes": 39227
         },
         {
-          "name": "buffa (Protobuf)",
-          "nsPerOp": 1909,
-          "opsPerSec": 523812,
+          "name": "prost (Protobuf)",
+          "nsPerOp": 975,
+          "opsPerSec": 1025637,
           "wireBytes": 39227
         },
         {
           "name": "OmniBuf (#[derive(OmniBuf)])",
-          "nsPerOp": 1987,
-          "opsPerSec": 503361,
+          "nsPerOp": 1049,
+          "opsPerSec": 953438,
           "wireBytes": 39256,
           "highlight": true
         },
         {
+          "name": "rmp-serde (MessagePack)",
+          "nsPerOp": 1763,
+          "opsPerSec": 567164,
+          "wireBytes": 39508
+        },
+        {
           "name": "serde_json",
-          "nsPerOp": 14475,
-          "opsPerSec": 69084,
+          "nsPerOp": 14324,
+          "opsPerSec": 69811,
           "wireBytes": 39681
         }
       ]
@@ -213,30 +213,30 @@
       "results": [
         {
           "name": "OmniBuf (Generated)",
-          "nsPerOp": 1563,
-          "opsPerSec": 639932,
+          "nsPerOp": 1574,
+          "opsPerSec": 635155,
           "highlight": true,
           "baseline": true
         },
         {
           "name": "buffa (Protobuf)",
-          "nsPerOp": 3523,
-          "opsPerSec": 283816
+          "nsPerOp": 3679,
+          "opsPerSec": 271787
         },
         {
           "name": "prost (Protobuf)",
-          "nsPerOp": 4080,
-          "opsPerSec": 245074
+          "nsPerOp": 4134,
+          "opsPerSec": 241914
         },
         {
           "name": "rmp-serde (MessagePack)",
-          "nsPerOp": 6335,
-          "opsPerSec": 157861
+          "nsPerOp": 6487,
+          "opsPerSec": 154143
         },
         {
           "name": "serde_json",
-          "nsPerOp": 15400,
-          "opsPerSec": 64934
+          "nsPerOp": 15498,
+          "opsPerSec": 64525
         }
       ]
     }
