@@ -1968,7 +1968,7 @@ pub mod codec {
         append_varint(dst, count as u64);
         if deterministic && count > 1 {
             let mut entries: Vec<(&K, &V)> = map.iter().collect();
-            entries.sort_unstable_by(|(ka, _), (kb, _)| ka.cmp(kb));
+            entries.sort_unstable_by_key(|(ka, _)| *ka);
             for (k, v) in entries {
                 write_key(dst, k)?;
                 write_val(dst, v, deterministic)?;
@@ -2146,7 +2146,7 @@ pub mod codec {
         append_varint(dst, map.len() as u64);
         if deterministic && map.len() > 1 {
             let mut entries: Vec<(&K, &V)> = map.iter().collect();
-            entries.sort_unstable_by(|(ka, _), (kb, _)| ka.cmp(kb));
+            entries.sort_unstable_by_key(|(ka, _)| *ka);
             for (k, v) in entries {
                 write_key(dst, k)?;
                 write_val(dst, v, deterministic)?;
