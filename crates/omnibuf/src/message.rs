@@ -415,7 +415,7 @@ pub trait Message: Default + Sized + 'static {
     #[inline]
     fn encoded_size_hint(&self) -> usize {
         let min = self.min_wire_size();
-        min.saturating_add((min >> 4).clamp(128, 1024))
+        min.saturating_add((min >> 6).clamp(64, 512))
     }
 
     /// Encodes `self` into a newly allocated `Vec<u8>`.
@@ -801,10 +801,36 @@ pub mod codec {
 
     #[inline(always)]
     fn begin_tagged_container_4b(dst: &mut Vec<u8>, field_num: u32, wire_type: u8) -> usize {
-        append_tag(dst, field_num, wire_type);
-        let len_pos = dst.len();
-        dst.extend_from_slice(&[0, 0, 0, 0]);
-        len_pos
+        let tag = (u64::from(field_num) << 4) | u64::from(wire_type & 0x0F);
+        if tag <= 127 {
+            let b0 = ((tag as u8) << 1) | 1;
+            dst.reserve(5);
+            unsafe {
+                let len = dst.len();
+                let ptr = dst.as_mut_ptr().add(len);
+                *ptr = b0;
+                core::ptr::write_bytes(ptr.add(1), 0, 4);
+                dst.set_len(len + 5);
+                len + 1
+            }
+        } else if tag <= 16_383 {
+            let tb = (((tag as u16) << 2) | 2).to_le_bytes();
+            dst.reserve(6);
+            unsafe {
+                let len = dst.len();
+                let ptr = dst.as_mut_ptr().add(len);
+                *ptr = tb[0];
+                *ptr.add(1) = tb[1];
+                core::ptr::write_bytes(ptr.add(2), 0, 4);
+                dst.set_len(len + 6);
+                len + 2
+            }
+        } else {
+            append_tag(dst, field_num, wire_type);
+            let len_pos = dst.len();
+            dst.extend_from_slice(&[0, 0, 0, 0]);
+            len_pos
+        }
     }
 
     #[inline(always)]
@@ -1070,17 +1096,19 @@ pub mod codec {
         msg: &M,
         deterministic: bool,
     ) -> Result<()> {
-        let min_body = msg.min_wire_size();
-        if min_body > 16_383 {
-            dst.reserve(min_body.saturating_add(16));
-            let len_pos = begin_tagged_container_4b(dst, field_num, WIRE_SUB_MSG);
-            msg.encode_omnibuf_append(dst, deterministic)?;
-            backpatch_container_len_4b(dst, len_pos);
-        } else {
-            let len_pos = begin_tagged_container(dst, field_num, WIRE_SUB_MSG);
-            msg.encode_omnibuf_append(dst, deterministic)?;
-            backpatch_container_len(dst, len_pos);
+        if dst.capacity() > 16_383 {
+            let min_body = msg.min_wire_size();
+            if min_body > 16_383 {
+                dst.reserve(min_body.saturating_add(16));
+                let len_pos = begin_tagged_container_4b(dst, field_num, WIRE_SUB_MSG);
+                msg.encode_omnibuf_append(dst, deterministic)?;
+                backpatch_container_len_4b(dst, len_pos);
+                return Ok(());
+            }
         }
+        let len_pos = begin_tagged_container(dst, field_num, WIRE_SUB_MSG);
+        msg.encode_omnibuf_append(dst, deterministic)?;
+        backpatch_container_len(dst, len_pos);
         Ok(())
     }
 
@@ -1331,33 +1359,58 @@ pub mod codec {
         deterministic: bool,
     ) -> Result<()> {
         let count = items.len();
-        let elems_min: usize = items
-            .iter()
-            .map(|m| {
-                let em = m.min_wire_size();
-                container_len_width(em).saturating_add(em)
-            })
-            .fold(0usize, usize::saturating_add);
-        let min_body = 1usize
-            .saturating_add(varint_len(count as u64))
-            .saturating_add(elems_min);
-        if min_body > 16_383 {
-            dst.reserve(min_body.saturating_add(64));
-            let len_pos = begin_tagged_array_4b(dst, field_num, WIRE_SUB_MSG, count);
-            for item in items {
-                write_sub_msg_elem(dst, item, deterministic)?;
+        if dst.capacity() > 16_383 && count > 0 {
+            if count <= 32 {
+                let mut elem_mins = [0usize; 32];
+                let mut elems_min = 0usize;
+                for (slot, m) in elem_mins[..count].iter_mut().zip(items.iter()) {
+                    let em = m.min_wire_size();
+                    *slot = em;
+                    elems_min =
+                        elems_min.saturating_add(container_len_width(em).saturating_add(em));
+                }
+                let min_body = 1usize
+                    .saturating_add(varint_len(count as u64))
+                    .saturating_add(elems_min);
+                if min_body > 16_383 {
+                    dst.reserve(min_body.saturating_add(64));
+                    let len_pos = begin_tagged_array_4b(dst, field_num, WIRE_SUB_MSG, count);
+                    for (item, &em) in items.iter().zip(elem_mins[..count].iter()) {
+                        write_sub_msg_elem_with_min(dst, item, em, deterministic)?;
+                    }
+                    backpatch_container_len_4b(dst, len_pos);
+                    return Ok(());
+                }
+            } else {
+                let elems_min: usize = items
+                    .iter()
+                    .map(|m| {
+                        let em = m.min_wire_size();
+                        container_len_width(em).saturating_add(em)
+                    })
+                    .fold(0usize, usize::saturating_add);
+                let min_body = 1usize
+                    .saturating_add(varint_len(count as u64))
+                    .saturating_add(elems_min);
+                if min_body > 16_383 {
+                    dst.reserve(min_body.saturating_add(64));
+                    let len_pos = begin_tagged_array_4b(dst, field_num, WIRE_SUB_MSG, count);
+                    for item in items {
+                        write_sub_msg_elem(dst, item, deterministic)?;
+                    }
+                    backpatch_container_len_4b(dst, len_pos);
+                    return Ok(());
+                }
             }
-            backpatch_container_len_4b(dst, len_pos);
-        } else {
-            let len_pos = begin_tagged_array(dst, field_num, WIRE_SUB_MSG, count);
-            for item in items {
-                let elem_pos = dst.len();
-                dst.extend_from_slice(&[0u8, 0u8]);
-                item.encode_omnibuf_append(dst, deterministic)?;
-                backpatch_container_len(dst, elem_pos);
-            }
-            backpatch_container_len(dst, len_pos);
         }
+        let len_pos = begin_tagged_array(dst, field_num, WIRE_SUB_MSG, count);
+        for item in items {
+            let elem_pos = dst.len();
+            dst.extend_from_slice(&[0u8, 0u8]);
+            item.encode_omnibuf_append(dst, deterministic)?;
+            backpatch_container_len(dst, elem_pos);
+        }
+        backpatch_container_len(dst, len_pos);
         Ok(())
     }
 
@@ -1370,30 +1423,58 @@ pub mod codec {
         deterministic: bool,
     ) -> Result<()> {
         let count = items.len();
-        let elems_min: usize = items
-            .iter()
-            .map(|m| {
-                let em = m.min_wire_size();
-                container_len_width(em).saturating_add(em)
-            })
-            .fold(0usize, usize::saturating_add);
-        let min_body = 1usize
-            .saturating_add(varint_len(count as u64))
-            .saturating_add(elems_min);
-        if min_body > 16_383 {
-            dst.reserve(min_body.saturating_add(24));
-            let len_pos = begin_tagged_array_4b(dst, field_num, WIRE_SUB_MSG, count);
-            for item in items {
-                write_sub_msg_elem(dst, item.as_ref(), deterministic)?;
+        if dst.capacity() > 16_383 && count > 0 {
+            if count <= 32 {
+                let mut elem_mins = [0usize; 32];
+                let mut elems_min = 0usize;
+                for (slot, m) in elem_mins[..count].iter_mut().zip(items.iter()) {
+                    let em = m.min_wire_size();
+                    *slot = em;
+                    elems_min =
+                        elems_min.saturating_add(container_len_width(em).saturating_add(em));
+                }
+                let min_body = 1usize
+                    .saturating_add(varint_len(count as u64))
+                    .saturating_add(elems_min);
+                if min_body > 16_383 {
+                    dst.reserve(min_body.saturating_add(24));
+                    let len_pos = begin_tagged_array_4b(dst, field_num, WIRE_SUB_MSG, count);
+                    for (item, &em) in items.iter().zip(elem_mins[..count].iter()) {
+                        write_sub_msg_elem_with_min(dst, item.as_ref(), em, deterministic)?;
+                    }
+                    backpatch_container_len_4b(dst, len_pos);
+                    return Ok(());
+                }
+            } else {
+                let elems_min: usize = items
+                    .iter()
+                    .map(|m| {
+                        let em = m.min_wire_size();
+                        container_len_width(em).saturating_add(em)
+                    })
+                    .fold(0usize, usize::saturating_add);
+                let min_body = 1usize
+                    .saturating_add(varint_len(count as u64))
+                    .saturating_add(elems_min);
+                if min_body > 16_383 {
+                    dst.reserve(min_body.saturating_add(24));
+                    let len_pos = begin_tagged_array_4b(dst, field_num, WIRE_SUB_MSG, count);
+                    for item in items {
+                        write_sub_msg_elem(dst, item.as_ref(), deterministic)?;
+                    }
+                    backpatch_container_len_4b(dst, len_pos);
+                    return Ok(());
+                }
             }
-            backpatch_container_len_4b(dst, len_pos);
-        } else {
-            let len_pos = begin_tagged_array(dst, field_num, WIRE_SUB_MSG, count);
-            for item in items {
-                write_sub_msg_elem(dst, item.as_ref(), deterministic)?;
-            }
-            backpatch_container_len(dst, len_pos);
         }
+        let len_pos = begin_tagged_array(dst, field_num, WIRE_SUB_MSG, count);
+        for item in items {
+            let elem_pos = dst.len();
+            dst.extend_from_slice(&[0u8, 0u8]);
+            item.encode_omnibuf_append(dst, deterministic)?;
+            backpatch_container_len(dst, elem_pos);
+        }
+        backpatch_container_len(dst, len_pos);
         Ok(())
     }
 
@@ -1480,14 +1561,13 @@ pub mod codec {
         Ok(next_pos)
     }
 
-    /// Encodes an untagged `WireSubMsg` element inside a `WireArray` or `WireMap`.
     #[inline]
-    pub fn write_sub_msg_elem<M: Message>(
+    fn write_sub_msg_elem_with_min<M: Message>(
         dst: &mut Vec<u8>,
         msg: &M,
+        min_sub: usize,
         deterministic: bool,
     ) -> Result<()> {
-        let min_sub = msg.min_wire_size();
         if min_sub > 16_383 {
             dst.reserve(min_sub.saturating_add(8));
             let elem_pos = dst.len();
@@ -1501,6 +1581,21 @@ pub mod codec {
             backpatch_container_len(dst, elem_pos);
         }
         Ok(())
+    }
+
+    /// Encodes an untagged `WireSubMsg` element inside a `WireArray` or `WireMap`.
+    #[inline]
+    pub fn write_sub_msg_elem<M: Message>(
+        dst: &mut Vec<u8>,
+        msg: &M,
+        deterministic: bool,
+    ) -> Result<()> {
+        let min_sub = if dst.capacity() > 16_383 {
+            msg.min_wire_size()
+        } else {
+            0
+        };
+        write_sub_msg_elem_with_min(dst, msg, min_sub, deterministic)
     }
 
     /// Decodes an untagged `WireSubMsg` element inside a `WireArray` or `WireMap`.
