@@ -29,7 +29,7 @@ proc-macro2 = "1.0"
 prost = "0.13"
 prost-build = "0.13"
 prost-reflect = { version = "0.14", features = ["derive"] }
-prost-reflect-build = "0.14"
+prost-reflect-build = "0.16"
 prost-types = "0.13"
 quote = "1.0"
 rmp-serde = "1.3"
