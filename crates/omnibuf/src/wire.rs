@@ -592,6 +592,9 @@ pub fn parse_array_header(body: &[u8]) -> Option<(u8, usize, usize)> {
 /// Checking `body[0] == exp_elem_wt` up front allows constant-folding the element-width check.
 #[inline(always)]
 pub fn parse_array_header_typed(body: &[u8], exp_elem_wt: u8) -> Option<(usize, usize)> {
+    if exp_elem_wt > WIRE_EXTENDED || exp_elem_wt == WIRE_BOOL_TRUE {
+        return None;
+    }
     if body.len() < 2 {
         return None;
     }

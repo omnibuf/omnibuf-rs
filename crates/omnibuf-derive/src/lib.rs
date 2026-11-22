@@ -635,8 +635,7 @@ fn expand_oneof_enum(
                             if let ::core::option::Option::Some(Self::#v_ident(ref mut __existing)) = *slot {
                                 <#ty as #krate::Message>::decode_omnibuf_at_depth(&mut **__existing, __sb, depth + 1, true)?;
                             } else {
-                                let mut __sub: ::std::boxed::Box<#ty> = ::std::boxed::Box::new(::core::default::Default::default());
-                                <#ty as #krate::Message>::decode_omnibuf_at_depth(&mut *__sub, __sb, depth + 1, true)?;
+                                let __sub: ::std::boxed::Box<#ty> = #krate::codec::read_box_sub_msg_value::<#ty>(__sb, depth + 1)?;
                                 *slot = ::core::option::Option::Some(Self::#v_ident(__sub));
                             }
                             return ::core::result::Result::Ok(::core::option::Option::Some(__np));
@@ -2922,8 +2921,12 @@ fn gen_clear_field(krate: &syn::Path, cf: &CompiledField) -> TokenStream2 {
         | FieldShape::Oneof { .. } => {
             quote! { if self.#f_ident.is_some() { self.#f_ident = ::core::option::Option::None; } }
         }
-        FieldShape::SubMsg { .. } => {
-            quote! { #krate::Message::clear_omnibuf(&mut self.#f_ident); }
+        FieldShape::SubMsg { boxed, .. } => {
+            if *boxed {
+                quote! { #krate::Message::clear_omnibuf(&mut *self.#f_ident); }
+            } else {
+                quote! { #krate::Message::clear_omnibuf(&mut self.#f_ident); }
+            }
         }
     }
 }

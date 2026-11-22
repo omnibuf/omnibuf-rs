@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -18,9 +18,9 @@ repository = "https://github.com/omnibuf/omnibuf-rs"
 homepage = "https://omnibuf.com/rs"
 
 [workspace.dependencies]
-omnibuf = { path = "crates/omnibuf", version = "0.1.4" }
-omnibuf-derive = { path = "crates/omnibuf-derive", version = "0.1.4" }
-protoc-gen-omnibuf-rs = { path = "crates/protoc-gen-omnibuf-rs", version = "0.1.4" }
+omnibuf = { path = "crates/omnibuf", version = "0.1.5" }
+omnibuf-derive = { path = "crates/omnibuf-derive", version = "0.1.5" }
+protoc-gen-omnibuf-rs = { path = "crates/protoc-gen-omnibuf-rs", version = "0.1.5" }
 buffa = "0.9"
 buffa-build = "0.9"
 buffa-descriptor = { version = "0.9", features = ["reflect", "std"] }

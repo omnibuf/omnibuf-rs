@@ -1209,6 +1209,16 @@ pub mod codec {
         Ok(next_pos)
     }
 
+    /// Allocates and decodes a `Box<M>` from a `WireSubMsg` body, charging `size_of::<M>()`
+    /// against the active `DecodeOptions::max_alloc_bytes` budget.
+    #[inline]
+    pub fn read_box_sub_msg_value<M: Message>(sub_bytes: &[u8], depth: usize) -> Result<Box<M>> {
+        super::charge_typed_alloc(core::mem::size_of::<M>())?;
+        let mut msg = Box::new(M::default());
+        msg.decode_omnibuf_at_depth(sub_bytes, depth, true)?;
+        Ok(msg)
+    }
+
     /// Encodes a `WireArray` of varint-encoded scalar elements using exact size pre-computation.
     #[inline]
     pub fn write_varint_vec_field<T, F>(
@@ -2188,6 +2198,19 @@ pub mod codec {
         Ok(next_pos)
     }
 
+    /// Allocates and decodes a borrowed `Box<M>` from a `WireSubMsg` body, charging `size_of::<M>()`
+    /// against the active `DecodeOptions::max_alloc_bytes` budget.
+    #[inline]
+    pub fn read_box_sub_msg_borrowed_value<'de, M: DecodeBorrowed<'de>>(
+        sub_bytes: &'de [u8],
+        depth: usize,
+    ) -> Result<Box<M>> {
+        super::charge_typed_alloc(core::mem::size_of::<M>())?;
+        let mut msg = Box::new(M::default());
+        msg.decode_omnibuf_borrowed_at_depth(sub_bytes, depth, true)?;
+        Ok(msg)
+    }
+
     #[inline]
     pub fn read_scalar_vec_borrowed_field<'de, T, F>(
         items: &mut Vec<T>,
@@ -2678,6 +2701,7 @@ pub mod codec {
     ) -> Result<usize> {
         let (sub_bytes, next_pos) = read_len_slice(data, pos, 0)?;
         if !merge || !slot.is_set() {
+            super::charge_typed_alloc(core::mem::size_of::<M>())?;
             let mut m = M::default();
             m.decode_omnibuf_at_depth(sub_bytes, depth + 1, false)?;
             *slot = ::buffa::MessageField::some(m);

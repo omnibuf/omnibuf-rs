@@ -1509,11 +1509,7 @@ fn emit_decode_oneof_arm(code: &mut String, go: &GenOneof, arm: &GenOneofArm) {
             if *boxed {
                 let _ = writeln!(
                     code,
-                    "                        let mut __sub = ::std::boxed::Box::new({rust_type}::default());"
-                );
-                let _ = writeln!(
-                    code,
-                    "                        <{rust_type} as ::omnibuf::Message>::decode_omnibuf_at_depth(&mut *__sub, __sb, depth + 1, true)?;"
+                    "                        let __sub = ::omnibuf::codec::read_box_sub_msg_value::<{rust_type}>(__sb, depth + 1)?;"
                 );
             } else {
                 let _ = writeln!(
@@ -2658,11 +2654,7 @@ fn emit_borrowed_decode_oneof_arm(code: &mut String, go: &GenOneof, arm: &GenOne
             if *boxed {
                 let _ = writeln!(
                     code,
-                    "                        let mut __sub = ::std::boxed::Box::new({borrowed_type}::default());"
-                );
-                let _ = writeln!(
-                    code,
-                    "                        <{borrowed_type}<'a> as ::omnibuf::DecodeBorrowed<'a>>::decode_omnibuf_borrowed_at_depth(&mut *__sub, __sb, depth + 1, true)?;"
+                    "                        let __sub = ::omnibuf::codec::read_box_sub_msg_borrowed_value::<{borrowed_type}<'a>>(__sb, depth + 1)?;"
                 );
             } else {
                 let _ = writeln!(

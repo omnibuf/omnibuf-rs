@@ -837,12 +837,10 @@ fn decode_buffa_scalar_payload(
         }
         SingularKind::Scalar(ScalarType::String) => {
             let (s, next_pos) = read_str_slice(data, pos)?;
-            charge_typed_alloc(s.len())?;
             Ok((Value::String(s.to_owned()), next_pos))
         }
         SingularKind::Scalar(ScalarType::Bytes) => {
             let (b, next_pos) = read_len_slice(data, pos, 0)?;
-            charge_typed_alloc(b.len())?;
             Ok((Value::Bytes(b.to_vec()), next_pos))
         }
         SingularKind::Scalar(ScalarType::Float | ScalarType::Fixed32 | ScalarType::Sfixed32) => {

@@ -598,3 +598,64 @@ fn audit_5a_tag_varint_width_uses_prefix_varint_thresholds() {
         "expected 9-byte Prefix-Varint tag width for field #50_000_000, got:\n{min_fn}"
     );
 }
+
+/// Regression #2 (codegen): boxed oneof sub-messages must route through
+/// `::omnibuf::codec::read_box_sub_msg_value` / `read_box_sub_msg_borrowed_value`
+/// so `DecodeOptions::max_alloc_bytes` charges `size_of::<M>()`.
+#[test]
+fn audit_r2_2_codegen_boxed_oneof_uses_codec_box_helpers() {
+    let req = CodeGeneratorRequest {
+        file_to_generate: vec!["rec_oneof.proto".to_owned()],
+        parameter: None,
+        compiler_version: None,
+        proto_file: vec![FileDescriptorProto {
+            name: Some("rec_oneof.proto".to_owned()),
+            package: Some("ro.v1".to_owned()),
+            syntax: Some("proto3".to_owned()),
+            message_type: vec![DescriptorProto {
+                name: Some("Node".to_owned()),
+                oneof_decl: vec![OneofDescriptorProto {
+                    name: Some("next".to_owned()),
+                    ..Default::default()
+                }],
+                field: vec![
+                    FieldDescriptorProto {
+                        name: Some("val".to_owned()),
+                        number: Some(1),
+                        label: Some(Label::Optional as i32),
+                        r#type: Some(Type::Uint32 as i32),
+                        ..Default::default()
+                    },
+                    FieldDescriptorProto {
+                        name: Some("child".to_owned()),
+                        number: Some(2),
+                        label: Some(Label::Optional as i32),
+                        r#type: Some(Type::Message as i32),
+                        type_name: Some(".ro.v1.Node".to_owned()),
+                        oneof_index: Some(0),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let resp = generate(&req);
+    assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+    let src = resp.file[0].content.as_deref().unwrap();
+    assert!(
+        src.contains("::omnibuf::codec::read_box_sub_msg_value::<Node>(__sb, depth + 1)?"),
+        "expected owned boxed oneof to use read_box_sub_msg_value, got:\n{src}"
+    );
+    assert!(
+        src.contains(
+            "::omnibuf::codec::read_box_sub_msg_borrowed_value::<NodeBorrowed<'a>>(__sb, depth + 1)?"
+        ),
+        "expected borrowed boxed oneof to use read_box_sub_msg_borrowed_value, got:\n{src}"
+    );
+    assert!(
+        !src.contains("Box::new("),
+        "generated code should not bypass codec alloc charging with raw Box::new:\n{src}"
+    );
+}

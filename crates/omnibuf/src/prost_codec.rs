@@ -541,12 +541,10 @@ fn decode_proto_scalar_payload(data: &[u8], pos: usize, kind: &Kind) -> Result<(
         }
         Kind::String => {
             let (s, next_pos) = read_str_slice(data, pos)?;
-            charge_typed_alloc(s.len())?;
             Ok((Value::String(s.to_owned()), next_pos))
         }
         Kind::Bytes => {
             let (b, next_pos) = read_len_slice(data, pos, 0)?;
-            charge_typed_alloc(b.len())?;
             Ok((Value::Bytes(Bytes::copy_from_slice(b)), next_pos))
         }
         Kind::Float | Kind::Fixed32 | Kind::Sfixed32 => {

@@ -578,6 +578,260 @@ fn audit_5c_fixed_readers_use_checked_add() {
     assert!(omnibuf::codec::read_elem_fixed64(&[0; 8], usize::MAX - 4).is_err());
 }
 
+/// Regression #1 (prost): `WIRE_STRING` and `WIRE_BYTES` payloads must not be double-charged
+/// against `DecodeOptions::max_alloc_bytes` (once in pre-validation and again in scalar decode).
+#[test]
+fn audit_r2_1_prost_string_and_bytes_not_double_charged() {
+    let fds = FileDescriptorSet {
+        file: vec![FileDescriptorProto {
+            name: Some("str_budget.proto".to_owned()),
+            package: Some("sb.v1".to_owned()),
+            syntax: Some("proto3".to_owned()),
+            message_type: vec![DescriptorProto {
+                name: Some("Payload".to_owned()),
+                field: vec![
+                    FieldDescriptorProto {
+                        name: Some("text".to_owned()),
+                        number: Some(1),
+                        label: Some(Label::Optional as i32),
+                        r#type: Some(Type::String as i32),
+                        ..Default::default()
+                    },
+                    FieldDescriptorProto {
+                        name: Some("raw".to_owned()),
+                        number: Some(2),
+                        label: Some(Label::Optional as i32),
+                        r#type: Some(Type::Bytes as i32),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let pool = DescriptorPool::from_file_descriptor_set(fds).unwrap();
+    let desc = pool.get_message_by_name("sb.v1.Payload").unwrap();
+
+    let mut enc_str = Encoder::default();
+    enc_str.write_string(1, &"a".repeat(1000));
+    let wire_str = enc_str.into_vec();
+
+    let mut msg = DynamicMessage::new(desc.clone());
+    decode_dynamic_with_options(
+        &wire_str,
+        &mut msg,
+        DecodeOptions {
+            max_alloc_bytes: 1500,
+            ..DecodeOptions::default()
+        },
+    )
+    .expect("1000-byte string must fit within 1500-byte alloc budget");
+    assert_eq!(
+        msg.get_field_by_name("text").unwrap().as_str(),
+        Some("a".repeat(1000).as_str())
+    );
+
+    let mut msg_tight = DynamicMessage::new(desc.clone());
+    assert!(
+        decode_dynamic_with_options(
+            &wire_str,
+            &mut msg_tight,
+            DecodeOptions {
+                max_alloc_bytes: 999,
+                ..DecodeOptions::default()
+            },
+        )
+        .is_err(),
+        "1000-byte string must still fail under 999-byte alloc budget"
+    );
+
+    let mut enc_bytes = Encoder::default();
+    enc_bytes.write_bytes(2, &vec![0x5Au8; 1000]);
+    let wire_bytes = enc_bytes.into_vec();
+
+    let mut msg_b = DynamicMessage::new(desc.clone());
+    decode_dynamic_with_options(
+        &wire_bytes,
+        &mut msg_b,
+        DecodeOptions {
+            max_alloc_bytes: 1500,
+            ..DecodeOptions::default()
+        },
+    )
+    .expect("1000-byte bytes field must fit within 1500-byte alloc budget");
+    assert_eq!(
+        msg_b
+            .get_field_by_name("raw")
+            .unwrap()
+            .as_bytes()
+            .map(|b| b.len()),
+        Some(1000)
+    );
+
+    let mut msg_b_tight = DynamicMessage::new(desc);
+    assert!(
+        decode_dynamic_with_options(
+            &wire_bytes,
+            &mut msg_b_tight,
+            DecodeOptions {
+                max_alloc_bytes: 999,
+                ..DecodeOptions::default()
+            },
+        )
+        .is_err(),
+        "1000-byte bytes field must still fail under 999-byte alloc budget"
+    );
+}
+
+#[derive(OmniBuf, Default, PartialEq, Debug)]
+struct LargeBudgetLeaf {
+    #[omnibuf(id = 1)]
+    a: u64,
+    #[omnibuf(id = 2)]
+    b: u64,
+    #[omnibuf(id = 3)]
+    c: u64,
+    #[omnibuf(id = 4)]
+    d: u64,
+    #[omnibuf(id = 5)]
+    e: u64,
+    #[omnibuf(id = 6)]
+    f: u64,
+    #[omnibuf(id = 7)]
+    g: u64,
+    #[omnibuf(id = 8)]
+    h: u64,
+    #[omnibuf(id = 9)]
+    s1: String,
+    #[omnibuf(id = 10)]
+    s2: String,
+    #[omnibuf(id = 11)]
+    s3: String,
+    #[omnibuf(id = 12)]
+    s4: String,
+}
+
+#[derive(OmniBuf, PartialEq, Debug)]
+enum BoxedOneofPayload {
+    #[omnibuf(id = 1)]
+    Leaf(Box<LargeBudgetLeaf>),
+}
+
+#[derive(OmniBuf, Default, PartialEq, Debug)]
+struct BoxedOneofHolder {
+    #[omnibuf(oneof)]
+    payload: Option<BoxedOneofPayload>,
+}
+
+/// Regression #2 (derive): boxed oneof sub-message decoding must charge `size_of::<M>()`
+/// against `DecodeOptions::max_alloc_bytes`.
+#[test]
+fn audit_r2_2_derive_boxed_oneof_charges_alloc_budget() {
+    let orig = BoxedOneofHolder {
+        payload: Some(BoxedOneofPayload::Leaf(Box::new(LargeBudgetLeaf {
+            a: 42,
+            ..Default::default()
+        }))),
+    };
+    let wire = omnibuf::to_vec(&orig).unwrap();
+    let leaf_size = core::mem::size_of::<LargeBudgetLeaf>();
+    assert!(leaf_size >= 128);
+
+    let err = from_slice_with_options::<BoxedOneofHolder>(
+        &wire,
+        DecodeOptions {
+            max_alloc_bytes: leaf_size - 1,
+            ..DecodeOptions::default()
+        },
+    );
+    assert!(
+        err.is_err(),
+        "expected boxed oneof decode to fail when max_alloc_bytes ({}) < size_of::<LargeBudgetLeaf>() ({leaf_size})",
+        leaf_size - 1
+    );
+
+    let decoded = from_slice_with_options::<BoxedOneofHolder>(
+        &wire,
+        DecodeOptions {
+            max_alloc_bytes: leaf_size + 64,
+            ..DecodeOptions::default()
+        },
+    )
+    .expect("boxed oneof decode should succeed with sufficient alloc budget");
+    assert_eq!(decoded, orig);
+}
+
+#[derive(OmniBuf, Default, PartialEq, Debug)]
+struct ClearableLeaf {
+    #[omnibuf(id = 1)]
+    x: u32,
+    #[omnibuf(id = 2)]
+    label: String,
+}
+
+#[derive(OmniBuf, Default, PartialEq, Debug)]
+struct NonOptBoxHolder {
+    #[omnibuf(id = 1)]
+    leaf: Box<ClearableLeaf>,
+}
+
+/// Regression #3: `#[derive(OmniBuf)]` must dereference non-optional `Box<SubMsg>` in `clear_omnibuf`.
+#[test]
+fn audit_r2_3_derive_non_optional_boxed_submsg_clear_omnibuf() {
+    let mut holder = NonOptBoxHolder {
+        leaf: Box::new(ClearableLeaf {
+            x: 99,
+            label: "populated".to_owned(),
+        }),
+    };
+    holder.clear_omnibuf();
+    assert_eq!(holder.leaf.x, 0);
+    assert!(holder.leaf.label.is_empty());
+
+    // Roundtrip and non-merging decode into a dirty holder also clears prior boxed sub-message state.
+    let populated = NonOptBoxHolder {
+        leaf: Box::new(ClearableLeaf {
+            x: 7,
+            label: "fresh".to_owned(),
+        }),
+    };
+    let wire = omnibuf::to_vec(&populated).unwrap();
+    let mut dirty = NonOptBoxHolder {
+        leaf: Box::new(ClearableLeaf {
+            x: 1234,
+            label: "stale".to_owned(),
+        }),
+    };
+    dirty.decode_omnibuf(&wire).unwrap();
+    assert_eq!(dirty, populated);
+
+    // Decoding an empty packet clears the boxed sub-message.
+    dirty.decode_omnibuf(&[]).unwrap();
+    assert_eq!(dirty, NonOptBoxHolder::default());
+}
+
+/// Regression #4: public `parse_array_header_typed` must reject invalid `exp_elem_wt` values
+/// (`WIRE_BOOL_TRUE` or `> WIRE_EXTENDED`).
+#[test]
+fn audit_r2_4_parse_array_header_typed_rejects_invalid_exp_elem_wt() {
+    use omnibuf::wire::{WIRE_BOOL_TRUE, WIRE_EXTENDED, parse_array_header_typed};
+
+    assert_eq!(
+        parse_array_header_typed(&[WIRE_BOOL_TRUE, 0x01], WIRE_BOOL_TRUE),
+        None
+    );
+    assert_eq!(
+        parse_array_header_typed(&[WIRE_EXTENDED + 1, 0x01], WIRE_EXTENDED + 1),
+        None
+    );
+    assert_eq!(parse_array_header_typed(&[255, 0x01], 255), None);
+    assert_eq!(
+        parse_array_header_typed(&[WIRE_BOOL_FALSE, 0x01], WIRE_BOOL_FALSE),
+        Some((0, 2))
+    );
+}
+
 #[cfg(feature = "buffa")]
 mod buffa_audit_tests {
     use std::sync::Arc;
@@ -814,5 +1068,153 @@ mod buffa_audit_tests {
             res.is_err(),
             "expected buffa decode_buffa_dynamic_with_options to reject 50k DynamicMessage array under 512 KiB budget"
         );
+    }
+
+    /// Regression #1 (buffa): `WIRE_STRING` and `WIRE_BYTES` payloads must not be double-charged
+    /// against `DecodeOptions::max_alloc_bytes`.
+    #[test]
+    fn audit_r2_1_buffa_string_and_bytes_not_double_charged() {
+        let fds = FileDescriptorSet {
+            file: vec![FileDescriptorProto {
+                name: Some("buffa_str_budget.proto".to_owned()),
+                package: Some("bsb.v1".to_owned()),
+                syntax: Some("proto3".to_owned()),
+                message_type: vec![DescriptorProto {
+                    name: Some("Payload".to_owned()),
+                    field: vec![
+                        FieldDescriptorProto {
+                            name: Some("text".to_owned()),
+                            number: Some(1),
+                            label: Some(Label::Optional as i32),
+                            r#type: Some(Type::String as i32),
+                            ..Default::default()
+                        },
+                        FieldDescriptorProto {
+                            name: Some("raw".to_owned()),
+                            number: Some(2),
+                            label: Some(Label::Optional as i32),
+                            r#type: Some(Type::Bytes as i32),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let pool = build_buffa_pool(&fds);
+        let msg_idx = pool.message_index("bsb.v1.Payload").unwrap();
+        let md = pool.message(msg_idx);
+
+        let mut enc_str = Encoder::default();
+        enc_str.write_string(1, &"a".repeat(1000));
+        let wire_str = enc_str.into_vec();
+
+        let mut msg = buffa_descriptor::DynamicMessage::new(Arc::clone(&pool), msg_idx);
+        decode_buffa_dynamic_with_options(
+            &wire_str,
+            &mut msg,
+            DecodeOptions {
+                max_alloc_bytes: 1500,
+                ..DecodeOptions::default()
+            },
+        )
+        .expect("1000-byte string must fit within 1500-byte alloc budget in buffa");
+        assert!(matches!(
+            msg.get(md.field(1).unwrap()),
+            ValueRef::String(s) if s.len() == 1000
+        ));
+
+        let mut msg_tight = buffa_descriptor::DynamicMessage::new(Arc::clone(&pool), msg_idx);
+        assert!(
+            decode_buffa_dynamic_with_options(
+                &wire_str,
+                &mut msg_tight,
+                DecodeOptions {
+                    max_alloc_bytes: 999,
+                    ..DecodeOptions::default()
+                },
+            )
+            .is_err(),
+            "1000-byte string must still fail under 999-byte alloc budget in buffa"
+        );
+
+        let mut enc_bytes = Encoder::default();
+        enc_bytes.write_bytes(2, &vec![0x5Au8; 1000]);
+        let wire_bytes = enc_bytes.into_vec();
+
+        let mut msg_b = buffa_descriptor::DynamicMessage::new(Arc::clone(&pool), msg_idx);
+        decode_buffa_dynamic_with_options(
+            &wire_bytes,
+            &mut msg_b,
+            DecodeOptions {
+                max_alloc_bytes: 1500,
+                ..DecodeOptions::default()
+            },
+        )
+        .expect("1000-byte bytes field must fit within 1500-byte alloc budget in buffa");
+        assert!(matches!(
+            msg_b.get(md.field(2).unwrap()),
+            ValueRef::Bytes(b) if b.len() == 1000
+        ));
+
+        let mut msg_b_tight = buffa_descriptor::DynamicMessage::new(pool, msg_idx);
+        assert!(
+            decode_buffa_dynamic_with_options(
+                &wire_bytes,
+                &mut msg_b_tight,
+                DecodeOptions {
+                    max_alloc_bytes: 999,
+                    ..DecodeOptions::default()
+                },
+            )
+            .is_err(),
+            "1000-byte bytes field must still fail under 999-byte alloc budget in buffa"
+        );
+    }
+
+    #[derive(omnibuf::OmniBuf, Default, Debug)]
+    struct BuffaMessageFieldHolder {
+        #[omnibuf(id = 1)]
+        child: ::buffa::MessageField<super::LargeBudgetLeaf>,
+    }
+
+    /// Regression #2 (buffa): `codec::read_buffa_message_field` must charge `size_of::<M>()`
+    /// against `DecodeOptions::max_alloc_bytes` before boxing.
+    #[test]
+    fn audit_r2_2_buffa_message_field_charges_alloc_budget() {
+        use omnibuf::from_slice_with_options;
+
+        let orig = BuffaMessageFieldHolder {
+            child: ::buffa::MessageField::some(super::LargeBudgetLeaf {
+                a: 7,
+                ..Default::default()
+            }),
+        };
+        let wire = omnibuf::to_vec(&orig).unwrap();
+        let leaf_size = core::mem::size_of::<super::LargeBudgetLeaf>();
+
+        let err = from_slice_with_options::<BuffaMessageFieldHolder>(
+            &wire,
+            DecodeOptions {
+                max_alloc_bytes: leaf_size - 1,
+                ..DecodeOptions::default()
+            },
+        );
+        assert!(
+            err.is_err(),
+            "expected buffa MessageField decode to fail when max_alloc_bytes ({}) < size_of::<LargeBudgetLeaf>() ({leaf_size})",
+            leaf_size - 1
+        );
+
+        let decoded = from_slice_with_options::<BuffaMessageFieldHolder>(
+            &wire,
+            DecodeOptions {
+                max_alloc_bytes: leaf_size + 64,
+                ..DecodeOptions::default()
+            },
+        )
+        .expect("buffa MessageField decode should succeed with sufficient alloc budget");
+        assert_eq!(decoded.child.as_option(), orig.child.as_option());
     }
 }
