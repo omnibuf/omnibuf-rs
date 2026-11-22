@@ -369,49 +369,125 @@ pub fn grow_capacity(current: usize, required: usize) -> usize {
     required
 }
 
-/// Checks whether `b` is valid UTF-8 with an unrestricted word-scan fast path for ASCII strings.
-#[inline(always)]
-pub fn validate_utf8(b: &[u8]) -> Result<&str> {
+/// Fast UTF-8 validator returning `bool` (single register, no 32-byte `Result` `sret`).
+#[inline]
+pub(crate) fn is_valid_utf8(b: &[u8]) -> bool {
     let n = b.len();
-    if n == 0 {
-        return Ok("");
-    }
+    let ptr = b.as_ptr();
     if n <= 16 {
         if n >= 8 {
-            let lo = u64::from_le_bytes(b[..8].try_into().unwrap());
-            let hi = u64::from_le_bytes(b[n - 8..n].try_into().unwrap());
+            // SAFETY: `n >= 8`, so both 0..8 and (n-8)..n are in bounds.
+            let lo = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) };
+            let hi = unsafe { core::ptr::read_unaligned(ptr.add(n - 8).cast::<u64>()) };
             if ((lo | hi) & 0x8080_8080_8080_8080) == 0 {
-                // SAFETY: Every byte has its high bit clear (0x00..=0x7F), which is valid ASCII/UTF-8.
-                return Ok(unsafe { core::str::from_utf8_unchecked(b) });
+                return true;
             }
         } else if n >= 4 {
-            let lo = u32::from_le_bytes(b[..4].try_into().unwrap());
-            let hi = u32::from_le_bytes(b[n - 4..n].try_into().unwrap());
+            // SAFETY: `n >= 4`, so both 0..4 and (n-4)..n are in bounds.
+            let lo = unsafe { core::ptr::read_unaligned(ptr.cast::<u32>()) };
+            let hi = unsafe { core::ptr::read_unaligned(ptr.add(n - 4).cast::<u32>()) };
             if ((lo | hi) & 0x8080_8080) == 0 {
-                // SAFETY: Every byte has its high bit clear (0x00..=0x7F).
-                return Ok(unsafe { core::str::from_utf8_unchecked(b) });
+                return true;
+            }
+        } else if n > 0 {
+            // SAFETY: `1 <= n <= 3`, so indices `0`, `n >> 1`, and `n - 1` are in bounds.
+            let bits = unsafe { *ptr | *ptr.add(n >> 1) | *ptr.add(n - 1) };
+            if bits < 0x80 {
+                return true;
             }
         } else {
-            let bits = b[0] | b[n >> 1] | b[n - 1];
-            if bits < 0x80 {
-                // SAFETY: Every byte is ASCII (< 0x80).
-                return Ok(unsafe { core::str::from_utf8_unchecked(b) });
+            return true;
+        }
+        return is_valid_utf8_from(b, 0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::arch::aarch64::{vld1q_u8, vmaxvq_u8, vorrq_u8};
+        if n <= 32 {
+            // SAFETY: n >= 17, so both 0..16 and (n-16)..n are within `b`.
+            let max = unsafe {
+                let v0 = vld1q_u8(ptr);
+                let v1 = vld1q_u8(ptr.add(n - 16));
+                vmaxvq_u8(vorrq_u8(v0, v1))
+            };
+            if max < 0x80 {
+                return true;
             }
+            return is_valid_utf8_from(b, 0);
         }
-        return validate_utf8_from(b, 0);
-    }
-    if n <= 32 {
-        let w0 = u64::from_le_bytes(b[..8].try_into().unwrap());
-        let w1 = u64::from_le_bytes(b[8..16].try_into().unwrap());
-        let w2 = u64::from_le_bytes(b[n - 16..n - 8].try_into().unwrap());
-        let w3 = u64::from_le_bytes(b[n - 8..n].try_into().unwrap());
-        if ((w0 | w1 | w2 | w3) & 0x8080_8080_8080_8080) == 0 {
-            // SAFETY: Every byte in 0..n has its high bit clear (0x00..=0x7F).
-            return Ok(unsafe { core::str::from_utf8_unchecked(b) });
+        if n <= 64 {
+            // SAFETY: n >= 33, so 0..16, 16..32, (n-32)..(n-16), (n-16)..n are within `b`.
+            let max = unsafe {
+                let v0 = vld1q_u8(ptr);
+                let v1 = vld1q_u8(ptr.add(16));
+                let v2 = vld1q_u8(ptr.add(n - 32));
+                let v3 = vld1q_u8(ptr.add(n - 16));
+                vmaxvq_u8(vorrq_u8(vorrq_u8(v0, v1), vorrq_u8(v2, v3)))
+            };
+            if max < 0x80 {
+                return true;
+            }
+            return is_valid_utf8_from(b, 0);
         }
-        return validate_utf8_from(b, 0);
+        is_valid_utf8_long_neon(b)
     }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        if n <= 32 {
+            let w0 = u64::from_le_bytes(b[..8].try_into().unwrap());
+            let w1 = u64::from_le_bytes(b[8..16].try_into().unwrap());
+            let w2 = u64::from_le_bytes(b[n - 16..n - 8].try_into().unwrap());
+            let w3 = u64::from_le_bytes(b[n - 8..n].try_into().unwrap());
+            if ((w0 | w1 | w2 | w3) & 0x8080_8080_8080_8080) == 0 {
+                return true;
+            }
+            return is_valid_utf8_from(b, 0);
+        }
+        is_valid_utf8_long_swar(b)
+    }
+}
 
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn is_valid_utf8_long_neon(b: &[u8]) -> bool {
+    use core::arch::aarch64::{vld1q_u8, vmaxvq_u8, vorrq_u8};
+    let n = b.len();
+    let ptr = b.as_ptr();
+    let mut i = 0usize;
+    while i + 64 <= n {
+        // SAFETY: `i + 64 <= n`, so all four 16-byte loads are in bounds.
+        let max = unsafe {
+            let v0 = vld1q_u8(ptr.add(i));
+            let v1 = vld1q_u8(ptr.add(i + 16));
+            let v2 = vld1q_u8(ptr.add(i + 32));
+            let v3 = vld1q_u8(ptr.add(i + 48));
+            vmaxvq_u8(vorrq_u8(vorrq_u8(v0, v1), vorrq_u8(v2, v3)))
+        };
+        if max >= 0x80 {
+            return is_valid_utf8_from(b, i);
+        }
+        i += 64;
+    }
+    if i < n {
+        // SAFETY: `n > 64`, so the trailing 64-byte overlapping window is in bounds.
+        let max = unsafe {
+            let v0 = vld1q_u8(ptr.add(n - 64));
+            let v1 = vld1q_u8(ptr.add(n - 48));
+            let v2 = vld1q_u8(ptr.add(n - 32));
+            let v3 = vld1q_u8(ptr.add(n - 16));
+            vmaxvq_u8(vorrq_u8(vorrq_u8(v0, v1), vorrq_u8(v2, v3)))
+        };
+        if max >= 0x80 {
+            return is_valid_utf8_from(b, i);
+        }
+    }
+    true
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(never)]
+fn is_valid_utf8_long_swar(b: &[u8]) -> bool {
+    let n = b.len();
     let mut i = 0usize;
     while i + 32 <= n {
         let w0 = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
@@ -419,7 +495,7 @@ pub fn validate_utf8(b: &[u8]) -> Result<&str> {
         let w2 = u64::from_le_bytes(b[i + 16..i + 24].try_into().unwrap());
         let w3 = u64::from_le_bytes(b[i + 24..i + 32].try_into().unwrap());
         if ((w0 | w1 | w2 | w3) & 0x8080_8080_8080_8080) != 0 {
-            return validate_utf8_from(b, i);
+            return is_valid_utf8_from(b, i);
         }
         i += 32;
     }
@@ -429,19 +505,27 @@ pub fn validate_utf8(b: &[u8]) -> Result<&str> {
         let t2 = u64::from_le_bytes(b[n - 16..n - 8].try_into().unwrap());
         let t3 = u64::from_le_bytes(b[n - 8..n].try_into().unwrap());
         if ((t0 | t1 | t2 | t3) & 0x8080_8080_8080_8080) != 0 {
-            return validate_utf8_from(b, i);
+            return is_valid_utf8_from(b, i);
         }
     }
-    // SAFETY: Every byte in 0..n has its high bit clear (0x00..=0x7F).
-    Ok(unsafe { core::str::from_utf8_unchecked(b) })
+    true
 }
 
 #[cold]
 #[inline(never)]
-fn validate_utf8_from(b: &[u8], ascii_prefix_len: usize) -> Result<&str> {
-    core::str::from_utf8(&b[ascii_prefix_len..]).map_err(|_| Error::InvalidUtf8)?;
-    // SAFETY: `b[..ascii_prefix_len]` is verified pure ASCII (< 0x80) and `b[ascii_prefix_len..]` is valid UTF-8.
-    Ok(unsafe { core::str::from_utf8_unchecked(b) })
+fn is_valid_utf8_from(b: &[u8], ascii_prefix_len: usize) -> bool {
+    core::str::from_utf8(&b[ascii_prefix_len..]).is_ok()
+}
+
+/// Checks whether `b` is valid UTF-8 with an unrestricted word-scan / SIMD fast path for ASCII strings.
+#[inline(always)]
+pub fn validate_utf8(b: &[u8]) -> Result<&str> {
+    if is_valid_utf8(b) {
+        // SAFETY: `is_valid_utf8(b)` verified every byte sequence is valid UTF-8.
+        Ok(unsafe { core::str::from_utf8_unchecked(b) })
+    } else {
+        Err(Error::InvalidUtf8)
+    }
 }
 
 /// Reports whether `wt` is a valid 1-byte `KeyType` in a `WireMap` header.
@@ -494,13 +578,51 @@ pub fn parse_array_header(body: &[u8]) -> Option<(u8, usize, usize)> {
         _ => 0,
     };
     if width > 0 {
-        if remaining % width != 0 || count != remaining / width {
+        if !remaining.is_multiple_of(width) || count != remaining / width {
             return None;
         }
     } else if (count == 0 && remaining != 0) || count > remaining {
         return None;
     }
     Some((elem, count, pos))
+}
+
+/// Parses and validates `[ElementType: 1B][Count: Prefix-Varint]` when `exp_elem_wt` is known.
+///
+/// Checking `body[0] == exp_elem_wt` up front allows constant-folding the element-width check.
+#[inline(always)]
+pub fn parse_array_header_typed(body: &[u8], exp_elem_wt: u8) -> Option<(usize, usize)> {
+    if body.len() < 2 {
+        return None;
+    }
+    // SAFETY: `body.len() >= 2`.
+    let elem = unsafe { *body.get_unchecked(0) };
+    if elem != exp_elem_wt {
+        return None;
+    }
+    // SAFETY: `body.len() >= 2`.
+    let b1 = unsafe { *body.get_unchecked(1) };
+    let (count_u64, pos) = if (b1 & 1) != 0 {
+        (u64::from(b1 >> 1), 2)
+    } else {
+        read_varint_at_opt(body, 1)?
+    };
+    let remaining = body.len() - pos;
+    let count = usize::try_from(count_u64).ok()?;
+    let width = match exp_elem_wt {
+        WIRE_BOOL_FALSE => 1,
+        WIRE_FIXED32 | WIRE_FLOAT32 | WIRE_SFIXED32 => 4,
+        WIRE_FIXED64 | WIRE_FLOAT64 | WIRE_SFIXED64 => 8,
+        _ => 0,
+    };
+    if width > 0 {
+        if !remaining.is_multiple_of(width) || count != remaining / width {
+            return None;
+        }
+    } else if (count == 0 && remaining != 0) || count > remaining {
+        return None;
+    }
+    Some((count, pos))
 }
 
 /// Parses and validates `[KeyType: 1B][ValueType: 1B][Count: Prefix-Varint]` at the start of a `WireMap` body.
@@ -535,86 +657,115 @@ pub(crate) fn cold_parse_err(msg: &'static str) -> Error {
     Error::parse(msg)
 }
 
+/// Decodes a Prefix-Varint starting at `data[pos]`, returning `Some((value, next_pos))` on valid input.
+#[inline(always)]
+pub(crate) fn read_varint_at_opt(data: &[u8], pos: usize) -> Option<(u64, usize)> {
+    let n = data.len();
+    if n.saturating_sub(pos) >= 4 {
+        // SAFETY: `n - pos >= 4`, so 4 bytes at `data.as_ptr().add(pos)` are in bounds.
+        let word =
+            unsafe { core::ptr::read_unaligned(data.as_ptr().add(pos).cast::<u32>()) }.to_le();
+        if (word & 7) != 0 {
+            let tz = word.trailing_zeros();
+            let width = 1usize << tz;
+            let shift_hi = 32 - ((width as u32) << 3);
+            let val = u64::from((word << shift_hi) >> (shift_hi + tz + 1));
+            return Some((val, pos + width));
+        }
+        if (word & 0xFF) == 0 && n - pos >= 9 {
+            // SAFETY: `n - pos >= 9`, so 8 bytes at `pos + 1` are in bounds.
+            let val =
+                unsafe { core::ptr::read_unaligned(data.as_ptr().add(pos + 1).cast::<u64>()) }
+                    .to_le();
+            return Some((val, pos + 9));
+        }
+        return None;
+    }
+    read_varint_at_tail_opt(data, pos)
+}
+
 /// Decodes a Prefix-Varint starting at `data[pos]`, returning `(value, next_pos)`.
 #[inline(always)]
 pub fn read_varint_at(data: &[u8], pos: usize) -> Result<(u64, usize)> {
+    read_varint_at_opt(data, pos).ok_or_else(|| cold_parse_err("truncated or invalid varint"))
+}
+
+#[inline(always)]
+fn read_varint_at_tail_opt(data: &[u8], pos: usize) -> Option<(u64, usize)> {
     let n = data.len();
     if pos >= n {
-        return Err(cold_parse_err("truncated varint"));
+        return None;
     }
-    let b0 = data[pos];
+    // SAFETY: `pos < n`.
+    let b0 = unsafe { *data.get_unchecked(pos) };
     if (b0 & 1) != 0 {
-        return Ok((u64::from(b0 >> 1), pos + 1));
+        return Some((u64::from(b0 >> 1), pos + 1));
     }
-    if (b0 & 2) != 0 {
-        if pos + 2 <= n {
-            let raw: [u8; 2] = data[pos..pos + 2].try_into().unwrap();
-            return Ok((u64::from(u16::from_le_bytes(raw) >> 2), pos + 2));
-        }
-        return Err(cold_parse_err("truncated 2-byte varint"));
+    if (b0 & 2) != 0 && n - pos >= 2 {
+        // SAFETY: `n - pos >= 2`.
+        let u = unsafe { core::ptr::read_unaligned(data.as_ptr().add(pos).cast::<u16>()) }.to_le();
+        return Some((u64::from(u >> 2), pos + 2));
     }
-    if (b0 & 4) != 0 {
-        if pos + 4 <= n {
-            let raw: [u8; 4] = data[pos..pos + 4].try_into().unwrap();
-            return Ok((u64::from(u32::from_le_bytes(raw) >> 3), pos + 4));
-        }
-        return Err(cold_parse_err("truncated 4-byte varint"));
-    }
-    if b0 == 0 {
-        if pos + 9 <= n {
-            let raw: [u8; 8] = data[pos + 1..pos + 9].try_into().unwrap();
-            return Ok((u64::from_le_bytes(raw), pos + 9));
-        }
-        return Err(cold_parse_err("truncated 9-byte varint"));
-    }
-    Err(cold_parse_err("invalid varint marker"))
+    None
 }
 
 /// Reads a length-prefixed sub-slice starting at `data[pos]` with `byte_len >= min_len`.
 #[inline(always)]
-pub fn read_len_slice(data: &[u8], pos: usize, min_len: usize) -> Result<(&[u8], usize)> {
+pub(crate) fn read_len_slice_opt(
+    data: &[u8],
+    pos: usize,
+    min_len: usize,
+) -> Option<(&[u8], usize)> {
     let n = data.len();
     if pos >= n {
-        return Err(cold_parse_err("position out of bounds"));
+        return None;
     }
-    let b0 = data[pos];
+    // SAFETY: `pos < n`.
+    let b0 = unsafe { *data.get_unchecked(pos) };
     if (b0 & 1) != 0 {
         let len = usize::from(b0 >> 1);
         let start = pos + 1;
         if len >= min_len && len <= n - start {
             let end = start + len;
-            return Ok((&data[start..end], end));
+            // SAFETY: `start <= end <= n`.
+            return Some((unsafe { data.get_unchecked(start..end) }, end));
         }
-        return Err(cold_parse_err("invalid container byteLen"));
+        return None;
     }
-    if (b0 & 2) != 0 && pos + 2 <= n {
-        let raw: [u8; 2] = data[pos..pos + 2].try_into().unwrap();
-        let len = usize::from(u16::from_le_bytes(raw) >> 2);
+    if (b0 & 2) != 0 && n - pos >= 2 {
+        // SAFETY: `n - pos >= 2`.
+        let u = unsafe { core::ptr::read_unaligned(data.as_ptr().add(pos).cast::<u16>()) }.to_le();
+        let len = usize::from(u >> 2);
         let start = pos + 2;
         if len >= min_len && len <= n - start {
             let end = start + len;
-            return Ok((&data[start..end], end));
+            // SAFETY: `start <= end <= n`.
+            return Some((unsafe { data.get_unchecked(start..end) }, end));
         }
-        return Err(cold_parse_err("invalid container byteLen"));
+        return None;
     }
-    read_len_slice_slow(data, pos, min_len)
+    read_len_slice_slow_opt(data, pos, min_len)
+}
+
+/// Reads a length-prefixed sub-slice starting at `data[pos]` with `byte_len >= min_len`.
+#[inline(always)]
+pub fn read_len_slice(data: &[u8], pos: usize, min_len: usize) -> Result<(&[u8], usize)> {
+    read_len_slice_opt(data, pos, min_len)
+        .ok_or_else(|| cold_parse_err("invalid container byteLen"))
 }
 
 #[cold]
 #[inline(never)]
-fn read_len_slice_slow(data: &[u8], pos: usize, min_len: usize) -> Result<(&[u8], usize)> {
-    let rem = data
-        .get(pos..)
-        .ok_or_else(|| cold_parse_err("position out of bounds"))?;
-    let (b_len, bn) =
-        decode_varint(rem).ok_or_else(|| cold_parse_err("truncated or invalid length varint"))?;
+fn read_len_slice_slow_opt(data: &[u8], pos: usize, min_len: usize) -> Option<(&[u8], usize)> {
+    let rem = data.get(pos..)?;
+    let (b_len, bn) = decode_varint(rem)?;
     let start = pos + bn;
-    let len = usize::try_from(b_len).map_err(|_| cold_parse_err("byteLen overflows usize"))?;
+    let len = usize::try_from(b_len).ok()?;
     if len < min_len || len > data.len() - start {
-        return Err(cold_parse_err("invalid container byteLen"));
+        return None;
     }
     let end = start + len;
-    Ok((&data[start..end], end))
+    Some((&data[start..end], end))
 }
 
 /// Reads a `WireString` length-prefixed UTF-8 slice starting at `data[pos]`.
@@ -1958,8 +2109,71 @@ impl<'a> Decoder<'a> {
         self.data
     }
 
+    /// If the next byte equals the pre-encoded 1-byte Prefix-Varint tag `b`, consumes it and returns `true`.
+    #[inline(always)]
+    pub fn consume_tag1(&mut self, b: u8) -> bool {
+        if self.pos < self.data.len() {
+            // SAFETY: `self.pos < self.data.len()`.
+            if unsafe { *self.data.get_unchecked(self.pos) } == b {
+                self.pos += 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// If the next 2 bytes equal the pre-encoded 2-byte Prefix-Varint tag `tag_le`, consumes them and returns `true`.
+    #[inline(always)]
+    pub fn consume_tag2(&mut self, tag_le: u16) -> bool {
+        let n = self.data.len();
+        if n.saturating_sub(self.pos) >= 2 {
+            // SAFETY: `n - self.pos >= 2`.
+            let u = unsafe {
+                core::ptr::read_unaligned(self.data.as_ptr().add(self.pos).cast::<u16>())
+            }
+            .to_le();
+            if u == tag_le {
+                self.pos += 2;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// If the next byte equals `b_false` or `b_true`, consumes it and returns `Some(is_true)`.
+    #[inline(always)]
+    pub fn consume_bool_tag1(&mut self, b_false: u8, b_true: u8) -> Option<bool> {
+        if self.pos < self.data.len() {
+            // SAFETY: `self.pos < self.data.len()`.
+            let b = unsafe { *self.data.get_unchecked(self.pos) };
+            if b == b_false || b == b_true {
+                self.pos += 1;
+                return Some(b == b_true);
+            }
+        }
+        None
+    }
+
+    /// If the next 2 bytes equal `t_false` or `t_true`, consumes them and returns `Some(is_true)`.
+    #[inline(always)]
+    pub fn consume_bool_tag2(&mut self, t_false: u16, t_true: u16) -> Option<bool> {
+        let n = self.data.len();
+        if n.saturating_sub(self.pos) >= 2 {
+            // SAFETY: `n - self.pos >= 2`.
+            let u = unsafe {
+                core::ptr::read_unaligned(self.data.as_ptr().add(self.pos).cast::<u16>())
+            }
+            .to_le();
+            if u == t_false || u == t_true {
+                self.pos += 2;
+                return Some(u == t_true);
+            }
+        }
+        None
+    }
+
     /// Reads the next raw tag `(field_num << 4) | wire_type`, or `Ok(None)` at clean EOF.
-    #[inline]
+    #[inline(always)]
     pub fn next_raw_tag(&mut self) -> Result<Option<u64>> {
         let n = self.data.len();
         if self.pos >= n {
@@ -1970,7 +2184,7 @@ impl<'a> Decoder<'a> {
             self.pos += 1;
             return Ok(Some(u64::from(b0 >> 1)));
         }
-        if (b0 & 2) != 0 && self.pos + 2 <= n {
+        if (b0 & 2) != 0 && n - self.pos >= 2 {
             let raw: [u8; 2] = self.data[self.pos..self.pos + 2].try_into().unwrap();
             self.pos += 2;
             return Ok(Some(u64::from(u16::from_le_bytes(raw) >> 2)));
@@ -2023,71 +2237,63 @@ impl<'a> Decoder<'a> {
     }
 
     /// Reads a ZigZag-encoded signed `Prefix-Varint` payload.
-    #[inline]
+    #[inline(always)]
     pub fn read_sint(&mut self) -> Result<i64> {
         self.read_uint().map(decode_zigzag)
     }
 
     /// Reads a 4-byte little-endian `u32`.
-    #[inline]
+    #[inline(always)]
     pub fn read_fixed32(&mut self) -> Result<u32> {
-        let end = self
-            .pos
-            .checked_add(4)
-            .ok_or_else(|| cold_parse_err("truncated fixed32"))?;
-        let raw: [u8; 4] = self
-            .data
-            .get(self.pos..end)
-            .ok_or_else(|| cold_parse_err("truncated fixed32"))?
-            .try_into()
-            .unwrap();
+        let n = self.data.len();
+        if n.saturating_sub(self.pos) < 4 {
+            return Err(cold_parse_err("truncated fixed32"));
+        }
+        let end = self.pos + 4;
+        let raw: [u8; 4] = self.data[self.pos..end].try_into().unwrap();
         self.pos = end;
         Ok(u32::from_le_bytes(raw))
     }
 
     /// Reads an 8-byte little-endian `u64`.
-    #[inline]
+    #[inline(always)]
     pub fn read_fixed64(&mut self) -> Result<u64> {
-        let end = self
-            .pos
-            .checked_add(8)
-            .ok_or_else(|| cold_parse_err("truncated fixed64"))?;
-        let raw: [u8; 8] = self
-            .data
-            .get(self.pos..end)
-            .ok_or_else(|| cold_parse_err("truncated fixed64"))?
-            .try_into()
-            .unwrap();
+        let n = self.data.len();
+        if n.saturating_sub(self.pos) < 8 {
+            return Err(cold_parse_err("truncated fixed64"));
+        }
+        let end = self.pos + 8;
+        let raw: [u8; 8] = self.data[self.pos..end].try_into().unwrap();
         self.pos = end;
         Ok(u64::from_le_bytes(raw))
     }
 
     /// Reads a 4-byte little-endian `i32`.
-    #[inline]
+    #[inline(always)]
     pub fn read_sfixed32(&mut self) -> Result<i32> {
         self.read_fixed32().map(|v| v as i32)
     }
 
     /// Reads an 8-byte little-endian `i64`.
-    #[inline]
+    #[inline(always)]
     pub fn read_sfixed64(&mut self) -> Result<i64> {
         self.read_fixed64().map(|v| v as i64)
     }
 
     /// Reads a 4-byte IEEE-754 `f32`.
-    #[inline]
+    #[inline(always)]
     pub fn read_float32(&mut self) -> Result<f32> {
         self.read_fixed32().map(f32::from_bits)
     }
 
     /// Reads an 8-byte IEEE-754 `f64`.
-    #[inline]
+    #[inline(always)]
     pub fn read_float64(&mut self) -> Result<f64> {
         self.read_fixed64().map(f64::from_bits)
     }
 
     /// Reads a zero-copy UTF-8 `&'a str` slice directly from the input buffer.
-    #[inline]
+    #[inline(always)]
     pub fn read_str(&mut self) -> Result<&'a str> {
         let (s, next_pos) = read_str_slice(self.data, self.pos)?;
         self.pos = next_pos;
@@ -2095,7 +2301,7 @@ impl<'a> Decoder<'a> {
     }
 
     /// Reads a zero-copy `&'a [u8]` byte slice directly from the input buffer.
-    #[inline]
+    #[inline(always)]
     pub fn read_bytes(&mut self) -> Result<&'a [u8]> {
         let (b, next_pos) = read_len_slice(self.data, self.pos, 0)?;
         self.pos = next_pos;

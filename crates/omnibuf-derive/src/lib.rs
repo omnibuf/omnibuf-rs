@@ -304,6 +304,69 @@ fn expand_struct(
         }
     }
 
+    let has_oneof = compiled
+        .iter()
+        .any(|cf| matches!(cf.shape, FieldShape::Oneof { .. }));
+    let mut fast_decode_stmts = Vec::new();
+    let use_fast_decode = !has_oneof && num_fields > 0 && num_fields <= 24;
+    if use_fast_decode {
+        for cf in &compiled {
+            if let Some(stmt) = gen_fast_decode_stmt(krate, cf) {
+                fast_decode_stmts.push(stmt);
+            }
+        }
+    }
+
+    let decode_body = if use_fast_decode {
+        quote! {
+            let mut dec = #krate::Decoder::with_depth(data, depth)?;
+            if !merge {
+                self.clear_omnibuf();
+            }
+            #(#fast_decode_stmts)*
+            if dec.is_empty() {
+                return ::core::result::Result::Ok(());
+            }
+            let __pos = dec.position();
+            #krate::codec::cold_decode_fallback(|| {
+                let mut dec = #krate::Decoder::with_depth(data, depth)?;
+                dec.set_position(__pos);
+                while let ::core::option::Option::Some((fnum, wt)) = dec.next_tag()? {
+                    match fnum {
+                        #(#decode_arms)*
+                        _ => {
+                            dec.skip_unknown(fnum, wt)?;
+                        }
+                    }
+                }
+                ::core::result::Result::Ok(())
+            })
+        }
+    } else {
+        quote! {
+            let mut dec = #krate::Decoder::with_depth(data, depth)?;
+            if !merge {
+                self.clear_omnibuf();
+            }
+            while let ::core::option::Option::Some((fnum, wt)) = dec.next_tag()? {
+                match fnum {
+                    #(#decode_arms)*
+                    _ => {
+                        #(#fallback_oneof_tries)*
+                        dec.skip_unknown(fnum, wt)?;
+                    }
+                }
+            }
+            ::core::result::Result::Ok(())
+        }
+    };
+
+    let decode_inline_attr = if !has_oneof && num_fields > 0 && num_fields <= 8 {
+        quote!(#[inline(always)])
+    } else {
+        quote!(#[inline])
+    };
+
     Ok(quote! {
         impl #impl_generics #krate::codec::IsEmpty for #ident #ty_generics #where_clause {
             #[inline]
@@ -333,27 +396,14 @@ fn expand_struct(
                 ::core::result::Result::Ok(())
             }
 
-            #[inline]
+            #decode_inline_attr
             fn decode_omnibuf_at_depth(
                 &mut self,
                 data: &[u8],
                 depth: usize,
                 merge: bool,
             ) -> #krate::Result<()> {
-                let mut dec = #krate::Decoder::with_depth(data, depth)?;
-                if !merge {
-                    self.clear_omnibuf();
-                }
-                while let ::core::option::Option::Some((fnum, wt)) = dec.next_tag()? {
-                    match fnum {
-                        #(#decode_arms)*
-                        _ => {
-                            #(#fallback_oneof_tries)*
-                            dec.skip_unknown(fnum, wt)?;
-                        }
-                    }
-                }
-                ::core::result::Result::Ok(())
+                #decode_body
             }
 
             #[inline]
@@ -2246,6 +2296,346 @@ fn gen_decode_scalar_value_expr(
         (_, WIRE_SFIXED32) => gen_convert_decoded_int(krate, scalar, quote!(dec.read_sfixed32()?)),
         (_, WIRE_SFIXED64) => gen_convert_decoded_int(krate, scalar, quote!(dec.read_sfixed64()?)),
         _ => unreachable!(),
+    }
+}
+
+fn gen_fast_decode_stmt(krate: &syn::Path, cf: &CompiledField) -> Option<TokenStream2> {
+    let f_ident = &cf.ident;
+    let f_id = cf.id;
+
+    let wrap_tag = |wt: u8, body: TokenStream2| -> Option<TokenStream2> {
+        let tag = (u64::from(f_id) << 4) | u64::from(wt);
+        if tag <= 127 {
+            let b = ((tag as u8) << 1) | 1;
+            Some(quote! {
+                if dec.consume_tag1(#b) {
+                    #body
+                }
+            })
+        } else if tag <= 16_383 {
+            let u = ((tag as u16) << 2) | 2;
+            Some(quote! {
+                if dec.consume_tag2(#u) {
+                    #body
+                }
+            })
+        } else {
+            None
+        }
+    };
+
+    match &cf.shape {
+        FieldShape::Scalar {
+            scalar: ScalarType::Bool,
+            ..
+        } => {
+            let tf = (u64::from(f_id) << 4) | u64::from(WIRE_BOOL_FALSE);
+            let tt = (u64::from(f_id) << 4) | 3u64;
+            if tt <= 127 {
+                let bf = ((tf as u8) << 1) | 1;
+                let bt = ((tt as u8) << 1) | 1;
+                Some(quote! {
+                    if let ::core::option::Option::Some(__b) = dec.consume_bool_tag1(#bf, #bt) {
+                        self.#f_ident = __b;
+                    }
+                })
+            } else if tt <= 16_383 {
+                let uf = ((tf as u16) << 2) | 2;
+                let ut = ((tt as u16) << 2) | 2;
+                Some(quote! {
+                    if let ::core::option::Option::Some(__b) = dec.consume_bool_tag2(#uf, #ut) {
+                        self.#f_ident = __b;
+                    }
+                })
+            } else {
+                None
+            }
+        }
+        FieldShape::OptScalar {
+            scalar: ScalarType::Bool,
+            ..
+        } => {
+            let tf = (u64::from(f_id) << 4) | u64::from(WIRE_BOOL_FALSE);
+            let tt = (u64::from(f_id) << 4) | 3u64;
+            if tt <= 127 {
+                let bf = ((tf as u8) << 1) | 1;
+                let bt = ((tt as u8) << 1) | 1;
+                Some(quote! {
+                    if let ::core::option::Option::Some(__b) = dec.consume_bool_tag1(#bf, #bt) {
+                        self.#f_ident = ::core::option::Option::Some(__b);
+                    }
+                })
+            } else if tt <= 16_383 {
+                let uf = ((tf as u16) << 2) | 2;
+                let ut = ((tt as u16) << 2) | 2;
+                Some(quote! {
+                    if let ::core::option::Option::Some(__b) = dec.consume_bool_tag2(#uf, #ut) {
+                        self.#f_ident = ::core::option::Option::Some(__b);
+                    }
+                })
+            } else {
+                None
+            }
+        }
+        FieldShape::Scalar {
+            scalar: ScalarType::String,
+            wire_wt,
+        } => wrap_tag(
+            *wire_wt,
+            quote! {
+                let s = dec.read_str()?;
+                #krate::codec::assign_str(&mut self.#f_ident, s);
+            },
+        ),
+        FieldShape::Scalar {
+            scalar: ScalarType::Bytes,
+            wire_wt,
+        } => wrap_tag(
+            *wire_wt,
+            quote! {
+                let b = dec.read_bytes()?;
+                #krate::codec::assign_bytes(&mut self.#f_ident, b);
+            },
+        ),
+        FieldShape::Scalar { scalar, wire_wt } => {
+            let read_val = gen_decode_scalar_value_expr(krate, *scalar, *wire_wt);
+            wrap_tag(*wire_wt, quote! { self.#f_ident = #read_val; })
+        }
+        FieldShape::OptScalar { scalar, wire_wt } => {
+            let read_val = gen_decode_scalar_value_expr(krate, *scalar, *wire_wt);
+            wrap_tag(
+                *wire_wt,
+                quote! { self.#f_ident = ::core::option::Option::Some(#read_val); },
+            )
+        }
+        FieldShape::BuffaEnum { enum_ty } => wrap_tag(
+            WIRE_SINT,
+            quote! {
+                let pos = dec.position();
+                let (v, next_pos) = #krate::codec::read_buffa_enum_elem::<#enum_ty>(dec.data(), pos)?;
+                self.#f_ident = v;
+                dec.set_position(next_pos);
+            },
+        ),
+        FieldShape::OptBuffaEnum { enum_ty } => wrap_tag(
+            WIRE_SINT,
+            quote! {
+                let pos = dec.position();
+                let (v, next_pos) = #krate::codec::read_buffa_enum_elem::<#enum_ty>(dec.data(), pos)?;
+                self.#f_ident = ::core::option::Option::Some(v);
+                dec.set_position(next_pos);
+            },
+        ),
+        FieldShape::SubMsg { boxed, .. } => {
+            let target = if *boxed {
+                quote!(&mut *self.#f_ident)
+            } else {
+                quote!(&mut self.#f_ident)
+            };
+            wrap_tag(
+                WIRE_SUB_MSG,
+                quote! {
+                    let sub_bytes = dec.read_container(0)?;
+                    (#target).decode_omnibuf_at_depth(sub_bytes, depth + 1, true)?;
+                },
+            )
+        }
+        FieldShape::OptSubMsg { boxed, .. } => {
+            let fn_ident = if *boxed {
+                quote!(read_opt_box_sub_msg_field)
+            } else {
+                quote!(read_opt_sub_msg_field)
+            };
+            wrap_tag(
+                WIRE_SUB_MSG,
+                quote! {
+                    let pos = dec.position();
+                    let next_pos = #krate::codec::#fn_ident(
+                        &mut self.#f_ident,
+                        dec.data(),
+                        pos,
+                        depth,
+                        true,
+                    )?;
+                    dec.set_position(next_pos);
+                },
+            )
+        }
+        FieldShape::BuffaMessageField { .. } => wrap_tag(
+            WIRE_SUB_MSG,
+            quote! {
+                let pos = dec.position();
+                let next_pos = #krate::codec::read_buffa_message_field(
+                    &mut self.#f_ident,
+                    dec.data(),
+                    pos,
+                    depth,
+                    true,
+                )?;
+                dec.set_position(next_pos);
+            },
+        ),
+        FieldShape::ScalarVec {
+            scalar: ScalarType::U32,
+            elem_wt: WIRE_UINT,
+        } => wrap_tag(
+            WIRE_ARRAY,
+            quote! {
+                let pos = dec.position();
+                let next_pos = #krate::codec::read_uint32_vec_field(
+                    &mut self.#f_ident,
+                    dec.data(),
+                    pos,
+                    depth,
+                    false,
+                )?;
+                dec.set_position(next_pos);
+            },
+        ),
+        FieldShape::ScalarVec {
+            scalar: ScalarType::U64,
+            elem_wt: WIRE_UINT,
+        } => wrap_tag(
+            WIRE_ARRAY,
+            quote! {
+                let pos = dec.position();
+                let next_pos = #krate::codec::read_uint64_vec_field(
+                    &mut self.#f_ident,
+                    dec.data(),
+                    pos,
+                    depth,
+                    false,
+                )?;
+                dec.set_position(next_pos);
+            },
+        ),
+        FieldShape::ScalarVec {
+            scalar: ScalarType::String,
+            ..
+        } => wrap_tag(
+            WIRE_ARRAY,
+            quote! {
+                let pos = dec.position();
+                let next_pos = #krate::codec::read_string_vec_field(
+                    &mut self.#f_ident,
+                    dec.data(),
+                    pos,
+                    depth,
+                    false,
+                )?;
+                dec.set_position(next_pos);
+            },
+        ),
+        FieldShape::ScalarVec { scalar, elem_wt } => {
+            let read_elem = gen_read_elem_payload_expr(krate, *scalar, *elem_wt);
+            wrap_tag(
+                WIRE_ARRAY,
+                quote! {
+                    let pos = dec.position();
+                    let next_pos = #krate::codec::read_scalar_vec_field(
+                        &mut self.#f_ident,
+                        dec.data(),
+                        pos,
+                        depth,
+                        #elem_wt,
+                        false,
+                        |b, p| #read_elem,
+                    )?;
+                    dec.set_position(next_pos);
+                },
+            )
+        }
+        FieldShape::BuffaEnumVec { enum_ty } => wrap_tag(
+            WIRE_ARRAY,
+            quote! {
+                let pos = dec.position();
+                let next_pos = #krate::codec::read_scalar_vec_field(
+                    &mut self.#f_ident,
+                    dec.data(),
+                    pos,
+                    depth,
+                    #WIRE_SINT,
+                    false,
+                    |b, p| #krate::codec::read_buffa_enum_elem::<#enum_ty>(b, p),
+                )?;
+                dec.set_position(next_pos);
+            },
+        ),
+        FieldShape::SubMsgVec { boxed, .. } => {
+            let fn_ident = if *boxed {
+                quote!(read_box_sub_msg_vec_field)
+            } else {
+                quote!(read_sub_msg_vec_field)
+            };
+            wrap_tag(
+                WIRE_ARRAY,
+                quote! {
+                    let pos = dec.position();
+                    let next_pos = #krate::codec::#fn_ident(
+                        &mut self.#f_ident,
+                        dec.data(),
+                        pos,
+                        depth,
+                        false,
+                    )?;
+                    dec.set_position(next_pos);
+                },
+            )
+        }
+        FieldShape::NestedVec { elem } => {
+            let elem_wt = elem.wire_type();
+            let elem_reader = gen_elem_reader_closure(krate, elem);
+            wrap_tag(
+                WIRE_ARRAY,
+                quote! {
+                    let pos = dec.position();
+                    let next_pos = #krate::codec::read_vec_field(
+                        &mut self.#f_ident,
+                        dec.data(),
+                        pos,
+                        depth,
+                        #elem_wt,
+                        false,
+                        #elem_reader,
+                    )?;
+                    dec.set_position(next_pos);
+                },
+            )
+        }
+        FieldShape::Map {
+            is_btree,
+            key_scalar,
+            key_wt,
+            val,
+        } => {
+            let read_key = gen_read_elem_payload_expr(krate, *key_scalar, *key_wt);
+            let val_wt = val.wire_type();
+            let val_reader = gen_elem_reader_closure(krate, val);
+            let fn_ident = if *is_btree {
+                quote!(read_btree_map_field)
+            } else {
+                quote!(read_hash_map_field)
+            };
+            wrap_tag(
+                WIRE_MAP,
+                quote! {
+                    let pos = dec.position();
+                    let next_pos = #krate::codec::#fn_ident(
+                        &mut self.#f_ident,
+                        dec.data(),
+                        pos,
+                        depth,
+                        #key_wt,
+                        #val_wt,
+                        false,
+                        |b, p| #read_key,
+                        #val_reader,
+                    )?;
+                    dec.set_position(next_pos);
+                },
+            )
+        }
+        FieldShape::Oneof { .. } => None,
     }
 }
 

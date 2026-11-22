@@ -88,49 +88,99 @@ impl ::omnibuf::Message for ConformanceRequest {
         if !merge {
             self.clear_omnibuf();
         }
-        while let ::core::option::Option::Some((fnum, wt)) = dec.next_tag()? {
-            match fnum {
-                1 if wt == 10 => {
-                    let s = dec.read_str()?;
-                    ::omnibuf::codec::assign_str(&mut self.test_name, s);
-                }
-                2 if wt == 10 => {
-                    let s = dec.read_str()?;
-                    ::omnibuf::codec::assign_str(&mut self.message_type, s);
-                }
-                3 if wt == 1 => {
-                    self.tier = dec.read_sint()? as i32;
-                }
-                4 if wt == 1 => {
-                    self.requested_output_format = dec.read_sint()? as i32;
-                }
-                5 if wt == 11 => {
-                    let b = dec.read_bytes()?;
-                    ::omnibuf::codec::assign_bytes(&mut self.omnibuf_payload, b);
-                }
-                6 if wt == 10 => {
-                    let s = dec.read_str()?;
-                    ::omnibuf::codec::assign_str(&mut self.json_payload, s);
-                }
-                7 if wt == ::omnibuf::wire::WIRE_BOOL_FALSE
-                    || wt == ::omnibuf::wire::WIRE_BOOL_TRUE =>
-                {
-                    self.self_describing = wt == ::omnibuf::wire::WIRE_BOOL_TRUE;
-                }
-                8 if wt == ::omnibuf::wire::WIRE_BOOL_FALSE
-                    || wt == ::omnibuf::wire::WIRE_BOOL_TRUE =>
-                {
-                    self.test_opaque_splice = wt == ::omnibuf::wire::WIRE_BOOL_TRUE;
-                }
-                9 if wt == ::omnibuf::wire::WIRE_BOOL_FALSE
-                    || wt == ::omnibuf::wire::WIRE_BOOL_TRUE =>
-                {
-                    self.test_opaque_splice_shrink = wt == ::omnibuf::wire::WIRE_BOOL_TRUE;
-                }
-                _ => dec.skip_unknown(fnum, wt)?,
-            }
+        if dec.consume_tag1(53) {
+            let s = dec.read_str()?;
+            ::omnibuf::codec::assign_str(&mut self.test_name, s);
         }
-        ::core::result::Result::Ok(())
+        if dec.consume_tag1(85) {
+            let s = dec.read_str()?;
+            ::omnibuf::codec::assign_str(&mut self.message_type, s);
+        }
+        if dec.consume_tag1(99) {
+            self.tier = dec.read_sint()? as i32;
+        }
+        if dec.consume_tag1(131) {
+            self.requested_output_format = dec.read_sint()? as i32;
+        }
+        if dec.consume_tag1(183) {
+            let b = dec.read_bytes()?;
+            ::omnibuf::codec::assign_bytes(&mut self.omnibuf_payload, b);
+        }
+        if dec.consume_tag1(213) {
+            let s = dec.read_str()?;
+            ::omnibuf::codec::assign_str(&mut self.json_payload, s);
+        }
+        if let ::core::option::Option::Some(__b) = dec.consume_bool_tag1(229, 231) {
+            self.self_describing = __b;
+        }
+        if let ::core::option::Option::Some(__b) = dec.consume_bool_tag2(522, 526) {
+            self.test_opaque_splice = __b;
+        }
+        if let ::core::option::Option::Some(__b) = dec.consume_bool_tag2(586, 590) {
+            self.test_opaque_splice_shrink = __b;
+        }
+        if dec.is_empty() {
+            return ::core::result::Result::Ok(());
+        }
+        #[cold]
+        #[inline(never)]
+        fn decode_slow(
+            this: &mut ConformanceRequest,
+            data: &[u8],
+            pos: usize,
+            depth: usize,
+        ) -> ::omnibuf::Result<()> {
+            let _ = depth;
+            let mut dec = ::omnibuf::Decoder::with_depth(data, depth)?;
+            dec.set_position(pos);
+            while let ::core::option::Option::Some(raw_tag) = dec.next_raw_tag()? {
+                match raw_tag {
+                    26 => {
+                        let s = dec.read_str()?;
+                        ::omnibuf::codec::assign_str(&mut this.test_name, s);
+                    }
+                    42 => {
+                        let s = dec.read_str()?;
+                        ::omnibuf::codec::assign_str(&mut this.message_type, s);
+                    }
+                    49 => {
+                        this.tier = dec.read_sint()? as i32;
+                    }
+                    65 => {
+                        this.requested_output_format = dec.read_sint()? as i32;
+                    }
+                    91 => {
+                        let b = dec.read_bytes()?;
+                        ::omnibuf::codec::assign_bytes(&mut this.omnibuf_payload, b);
+                    }
+                    106 => {
+                        let s = dec.read_str()?;
+                        ::omnibuf::codec::assign_str(&mut this.json_payload, s);
+                    }
+                    114 => {
+                        this.self_describing = false;
+                    }
+                    115 => {
+                        this.self_describing = true;
+                    }
+                    130 => {
+                        this.test_opaque_splice = false;
+                    }
+                    131 => {
+                        this.test_opaque_splice = true;
+                    }
+                    146 => {
+                        this.test_opaque_splice_shrink = false;
+                    }
+                    147 => {
+                        this.test_opaque_splice_shrink = true;
+                    }
+                    _ => dec.skip_unknown((raw_tag >> 4) as u32, (raw_tag & 0x0F) as u8)?,
+                }
+            }
+            ::core::result::Result::Ok(())
+        }
+        decode_slow(self, dec.data(), dec.position(), depth)
     }
 
     #[inline]
@@ -840,7 +890,7 @@ impl ::omnibuf::Message for ConformanceResponse {
         ::core::result::Result::Ok(())
     }
 
-    #[inline]
+    #[inline(always)]
     fn decode_omnibuf_at_depth(
         &mut self,
         data: &[u8],
@@ -851,36 +901,76 @@ impl ::omnibuf::Message for ConformanceResponse {
         if !merge {
             self.clear_omnibuf();
         }
-        while let ::core::option::Option::Some((fnum, wt)) = dec.next_tag()? {
-            match fnum {
-                1 if wt == 10 => {
-                    let s = dec.read_str()?;
-                    ::omnibuf::codec::assign_str(&mut self.parse_error, s);
-                }
-                2 if wt == 10 => {
-                    let s = dec.read_str()?;
-                    ::omnibuf::codec::assign_str(&mut self.serialize_error, s);
-                }
-                3 if wt == 10 => {
-                    let s = dec.read_str()?;
-                    ::omnibuf::codec::assign_str(&mut self.runtime_error, s);
-                }
-                4 if wt == 10 => {
-                    let s = dec.read_str()?;
-                    ::omnibuf::codec::assign_str(&mut self.skipped, s);
-                }
-                5 if wt == 11 => {
-                    let b = dec.read_bytes()?;
-                    ::omnibuf::codec::assign_bytes(&mut self.omnibuf_payload, b);
-                }
-                6 if wt == 10 => {
-                    let s = dec.read_str()?;
-                    ::omnibuf::codec::assign_str(&mut self.json_payload, s);
-                }
-                _ => dec.skip_unknown(fnum, wt)?,
-            }
+        if dec.consume_tag1(53) {
+            let s = dec.read_str()?;
+            ::omnibuf::codec::assign_str(&mut self.parse_error, s);
         }
-        ::core::result::Result::Ok(())
+        if dec.consume_tag1(85) {
+            let s = dec.read_str()?;
+            ::omnibuf::codec::assign_str(&mut self.serialize_error, s);
+        }
+        if dec.consume_tag1(117) {
+            let s = dec.read_str()?;
+            ::omnibuf::codec::assign_str(&mut self.runtime_error, s);
+        }
+        if dec.consume_tag1(149) {
+            let s = dec.read_str()?;
+            ::omnibuf::codec::assign_str(&mut self.skipped, s);
+        }
+        if dec.consume_tag1(183) {
+            let b = dec.read_bytes()?;
+            ::omnibuf::codec::assign_bytes(&mut self.omnibuf_payload, b);
+        }
+        if dec.consume_tag1(213) {
+            let s = dec.read_str()?;
+            ::omnibuf::codec::assign_str(&mut self.json_payload, s);
+        }
+        if dec.is_empty() {
+            return ::core::result::Result::Ok(());
+        }
+        #[cold]
+        #[inline(never)]
+        fn decode_slow(
+            this: &mut ConformanceResponse,
+            data: &[u8],
+            pos: usize,
+            depth: usize,
+        ) -> ::omnibuf::Result<()> {
+            let _ = depth;
+            let mut dec = ::omnibuf::Decoder::with_depth(data, depth)?;
+            dec.set_position(pos);
+            while let ::core::option::Option::Some(raw_tag) = dec.next_raw_tag()? {
+                match raw_tag {
+                    26 => {
+                        let s = dec.read_str()?;
+                        ::omnibuf::codec::assign_str(&mut this.parse_error, s);
+                    }
+                    42 => {
+                        let s = dec.read_str()?;
+                        ::omnibuf::codec::assign_str(&mut this.serialize_error, s);
+                    }
+                    58 => {
+                        let s = dec.read_str()?;
+                        ::omnibuf::codec::assign_str(&mut this.runtime_error, s);
+                    }
+                    74 => {
+                        let s = dec.read_str()?;
+                        ::omnibuf::codec::assign_str(&mut this.skipped, s);
+                    }
+                    91 => {
+                        let b = dec.read_bytes()?;
+                        ::omnibuf::codec::assign_bytes(&mut this.omnibuf_payload, b);
+                    }
+                    106 => {
+                        let s = dec.read_str()?;
+                        ::omnibuf::codec::assign_str(&mut this.json_payload, s);
+                    }
+                    _ => dec.skip_unknown((raw_tag >> 4) as u32, (raw_tag & 0x0F) as u8)?,
+                }
+            }
+            ::core::result::Result::Ok(())
+        }
+        decode_slow(self, dec.data(), dec.position(), depth)
     }
 
     #[inline]
@@ -1456,7 +1546,7 @@ impl ::omnibuf::Message for AllTypesSubMsg {
         ::core::result::Result::Ok(())
     }
 
-    #[inline]
+    #[inline(always)]
     fn decode_omnibuf_at_depth(
         &mut self,
         data: &[u8],
@@ -1467,27 +1557,57 @@ impl ::omnibuf::Message for AllTypesSubMsg {
         if !merge {
             self.clear_omnibuf();
         }
-        while let ::core::option::Option::Some((fnum, wt)) = dec.next_tag()? {
-            match fnum {
-                1 if wt == 0 => {
-                    self.id = dec.read_uint()? as u32;
-                }
-                2 if wt == 10 => {
-                    let s = dec.read_str()?;
-                    ::omnibuf::codec::assign_str(&mut self.label, s);
-                }
-                3 if wt == ::omnibuf::wire::WIRE_BOOL_FALSE
-                    || wt == ::omnibuf::wire::WIRE_BOOL_TRUE =>
-                {
-                    self.flag = wt == ::omnibuf::wire::WIRE_BOOL_TRUE;
-                }
-                4 if wt == 1 => {
-                    self.score = dec.read_sint()?;
-                }
-                _ => dec.skip_unknown(fnum, wt)?,
-            }
+        if dec.consume_tag1(33) {
+            self.id = dec.read_uint()? as u32;
         }
-        ::core::result::Result::Ok(())
+        if dec.consume_tag1(85) {
+            let s = dec.read_str()?;
+            ::omnibuf::codec::assign_str(&mut self.label, s);
+        }
+        if let ::core::option::Option::Some(__b) = dec.consume_bool_tag1(101, 103) {
+            self.flag = __b;
+        }
+        if dec.consume_tag1(131) {
+            self.score = dec.read_sint()?;
+        }
+        if dec.is_empty() {
+            return ::core::result::Result::Ok(());
+        }
+        #[cold]
+        #[inline(never)]
+        fn decode_slow(
+            this: &mut AllTypesSubMsg,
+            data: &[u8],
+            pos: usize,
+            depth: usize,
+        ) -> ::omnibuf::Result<()> {
+            let _ = depth;
+            let mut dec = ::omnibuf::Decoder::with_depth(data, depth)?;
+            dec.set_position(pos);
+            while let ::core::option::Option::Some(raw_tag) = dec.next_raw_tag()? {
+                match raw_tag {
+                    16 => {
+                        this.id = dec.read_uint()? as u32;
+                    }
+                    42 => {
+                        let s = dec.read_str()?;
+                        ::omnibuf::codec::assign_str(&mut this.label, s);
+                    }
+                    50 => {
+                        this.flag = false;
+                    }
+                    51 => {
+                        this.flag = true;
+                    }
+                    65 => {
+                        this.score = dec.read_sint()?;
+                    }
+                    _ => dec.skip_unknown((raw_tag >> 4) as u32, (raw_tag & 0x0F) as u8)?,
+                }
+            }
+            ::core::result::Result::Ok(())
+        }
+        decode_slow(self, dec.data(), dec.position(), depth)
     }
 
     #[inline]
@@ -1994,116 +2114,227 @@ impl ::omnibuf::Message for TestAllTypes {
         if !merge {
             self.clear_omnibuf();
         }
-        while let ::core::option::Option::Some((fnum, wt)) = dec.next_tag()? {
-            match fnum {
-                1 if wt == 0 => {
-                    self.f1_uint32 = dec.read_uint()? as u32;
-                }
-                2 if wt == 0 => {
-                    self.f2_uint64 = dec.read_uint()?;
-                }
-                3 if wt == 1 => {
-                    self.f3_sint32 = dec.read_sint()? as i32;
-                }
-                4 if wt == 1 => {
-                    self.f4_sint64 = dec.read_sint()?;
-                }
-                5 if wt == ::omnibuf::wire::WIRE_BOOL_FALSE
-                    || wt == ::omnibuf::wire::WIRE_BOOL_TRUE =>
-                {
-                    self.f5_bool = wt == ::omnibuf::wire::WIRE_BOOL_TRUE;
-                }
-                6 if wt == 10 => {
-                    let s = dec.read_str()?;
-                    ::omnibuf::codec::assign_str(&mut self.f6_string, s);
-                }
-                7 if wt == 11 => {
-                    let b = dec.read_bytes()?;
-                    ::omnibuf::codec::assign_bytes(&mut self.f7_bytes, b);
-                }
-                8 if wt == 12 => {
-                    let pos = dec.position();
-                    let next_pos = ::omnibuf::codec::read_opt_sub_msg_field(
-                        &mut self.f8_sub_msg,
-                        dec.data(),
-                        pos,
-                        depth,
-                        true,
-                    )?;
-                    dec.set_position(next_pos);
-                }
-                9 if wt == 13 => {
-                    let pos = dec.position();
-                    let next_pos = ::omnibuf::codec::read_scalar_vec_field(
-                        &mut self.f9_string_arr,
-                        dec.data(),
-                        pos,
-                        depth,
-                        10,
-                        false,
-                        ::omnibuf::codec::read_elem_string,
-                    )?;
-                    dec.set_position(next_pos);
-                }
-                10 if wt == 13 => {
-                    let pos = dec.position();
-                    let next_pos = ::omnibuf::codec::read_scalar_vec_field(
-                        &mut self.f10_uint32_arr,
-                        dec.data(),
-                        pos,
-                        depth,
-                        0,
-                        false,
-                        |b, p| ::omnibuf::codec::read_elem_uint(b, p).map(|(v, np)| (v as u32, np)),
-                    )?;
-                    dec.set_position(next_pos);
-                }
-                11 if wt == 13 => {
-                    let pos = dec.position();
-                    let next_pos = ::omnibuf::codec::read_sub_msg_vec_field(
-                        &mut self.f11_sub_msg_arr,
-                        dec.data(),
-                        pos,
-                        depth,
-                        false,
-                    )?;
-                    dec.set_position(next_pos);
-                }
-                12 if wt == 14 => {
-                    let pos = dec.position();
-                    let next_pos = ::omnibuf::codec::read_hash_map_field(
-                        &mut self.f12_map_str_uint,
-                        dec.data(),
-                        pos,
-                        depth,
-                        10,
-                        0,
-                        false,
-                        ::omnibuf::codec::read_elem_string,
-                        |b, p, _d| ::omnibuf::codec::read_elem_uint(b, p),
-                    )?;
-                    dec.set_position(next_pos);
-                }
-                13 if wt == 8 => {
-                    self.f13_float32 = dec.read_float32()?;
-                }
-                14 if wt == 9 => {
-                    self.f14_float64 = dec.read_float64()?;
-                }
-                15 if wt == 4 => {
-                    self.f15_fixed32 = dec.read_fixed32()?;
-                }
-                16 if wt == 5 => {
-                    self.f16_fixed64 = dec.read_fixed64()?;
-                }
-                20 if wt == 10 => {
-                    let s = dec.read_str()?;
-                    ::omnibuf::codec::assign_str(&mut self.f20_overflow_str, s);
-                }
-                _ => dec.skip_unknown(fnum, wt)?,
-            }
+        if dec.consume_tag1(33) {
+            self.f1_uint32 = dec.read_uint()? as u32;
         }
-        ::core::result::Result::Ok(())
+        if dec.consume_tag1(65) {
+            self.f2_uint64 = dec.read_uint()?;
+        }
+        if dec.consume_tag1(99) {
+            self.f3_sint32 = dec.read_sint()? as i32;
+        }
+        if dec.consume_tag1(131) {
+            self.f4_sint64 = dec.read_sint()?;
+        }
+        if let ::core::option::Option::Some(__b) = dec.consume_bool_tag1(165, 167) {
+            self.f5_bool = __b;
+        }
+        if dec.consume_tag1(213) {
+            let s = dec.read_str()?;
+            ::omnibuf::codec::assign_str(&mut self.f6_string, s);
+        }
+        if dec.consume_tag1(247) {
+            let b = dec.read_bytes()?;
+            ::omnibuf::codec::assign_bytes(&mut self.f7_bytes, b);
+        }
+        if dec.consume_tag2(562) {
+            let pos = dec.position();
+            let next_pos = ::omnibuf::codec::read_opt_sub_msg_field(
+                &mut self.f8_sub_msg,
+                dec.data(),
+                pos,
+                depth,
+                true,
+            )?;
+            dec.set_position(next_pos);
+        }
+        if dec.consume_tag2(630) {
+            let pos = dec.position();
+            let next_pos = ::omnibuf::codec::read_string_vec_field(
+                &mut self.f9_string_arr,
+                dec.data(),
+                pos,
+                depth,
+                false,
+            )?;
+            dec.set_position(next_pos);
+        }
+        if dec.consume_tag2(694) {
+            let pos = dec.position();
+            let next_pos = ::omnibuf::codec::read_uint32_vec_field(
+                &mut self.f10_uint32_arr,
+                dec.data(),
+                pos,
+                depth,
+                false,
+            )?;
+            dec.set_position(next_pos);
+        }
+        if dec.consume_tag2(758) {
+            let pos = dec.position();
+            let next_pos = ::omnibuf::codec::read_sub_msg_vec_field(
+                &mut self.f11_sub_msg_arr,
+                dec.data(),
+                pos,
+                depth,
+                false,
+            )?;
+            dec.set_position(next_pos);
+        }
+        if dec.consume_tag2(826) {
+            let pos = dec.position();
+            let next_pos = ::omnibuf::codec::read_hash_map_field(
+                &mut self.f12_map_str_uint,
+                dec.data(),
+                pos,
+                depth,
+                10,
+                0,
+                false,
+                ::omnibuf::codec::read_elem_string,
+                |b, p, _d| ::omnibuf::codec::read_elem_uint(b, p),
+            )?;
+            dec.set_position(next_pos);
+        }
+        if dec.consume_tag2(866) {
+            self.f13_float32 = dec.read_float32()?;
+        }
+        if dec.consume_tag2(934) {
+            self.f14_float64 = dec.read_float64()?;
+        }
+        if dec.consume_tag2(978) {
+            self.f15_fixed32 = dec.read_fixed32()?;
+        }
+        if dec.consume_tag2(1046) {
+            self.f16_fixed64 = dec.read_fixed64()?;
+        }
+        if dec.consume_tag2(1322) {
+            let s = dec.read_str()?;
+            ::omnibuf::codec::assign_str(&mut self.f20_overflow_str, s);
+        }
+        if dec.is_empty() {
+            return ::core::result::Result::Ok(());
+        }
+        #[cold]
+        #[inline(never)]
+        fn decode_slow(
+            this: &mut TestAllTypes,
+            data: &[u8],
+            pos: usize,
+            depth: usize,
+        ) -> ::omnibuf::Result<()> {
+            let _ = depth;
+            let mut dec = ::omnibuf::Decoder::with_depth(data, depth)?;
+            dec.set_position(pos);
+            while let ::core::option::Option::Some(raw_tag) = dec.next_raw_tag()? {
+                match raw_tag {
+                    16 => {
+                        this.f1_uint32 = dec.read_uint()? as u32;
+                    }
+                    32 => {
+                        this.f2_uint64 = dec.read_uint()?;
+                    }
+                    49 => {
+                        this.f3_sint32 = dec.read_sint()? as i32;
+                    }
+                    65 => {
+                        this.f4_sint64 = dec.read_sint()?;
+                    }
+                    82 => {
+                        this.f5_bool = false;
+                    }
+                    83 => {
+                        this.f5_bool = true;
+                    }
+                    106 => {
+                        let s = dec.read_str()?;
+                        ::omnibuf::codec::assign_str(&mut this.f6_string, s);
+                    }
+                    123 => {
+                        let b = dec.read_bytes()?;
+                        ::omnibuf::codec::assign_bytes(&mut this.f7_bytes, b);
+                    }
+                    140 => {
+                        let pos = dec.position();
+                        let next_pos = ::omnibuf::codec::read_opt_sub_msg_field(
+                            &mut this.f8_sub_msg,
+                            dec.data(),
+                            pos,
+                            depth,
+                            true,
+                        )?;
+                        dec.set_position(next_pos);
+                    }
+                    157 => {
+                        let pos = dec.position();
+                        let next_pos = ::omnibuf::codec::read_string_vec_field(
+                            &mut this.f9_string_arr,
+                            dec.data(),
+                            pos,
+                            depth,
+                            false,
+                        )?;
+                        dec.set_position(next_pos);
+                    }
+                    173 => {
+                        let pos = dec.position();
+                        let next_pos = ::omnibuf::codec::read_uint32_vec_field(
+                            &mut this.f10_uint32_arr,
+                            dec.data(),
+                            pos,
+                            depth,
+                            false,
+                        )?;
+                        dec.set_position(next_pos);
+                    }
+                    189 => {
+                        let pos = dec.position();
+                        let next_pos = ::omnibuf::codec::read_sub_msg_vec_field(
+                            &mut this.f11_sub_msg_arr,
+                            dec.data(),
+                            pos,
+                            depth,
+                            false,
+                        )?;
+                        dec.set_position(next_pos);
+                    }
+                    206 => {
+                        let pos = dec.position();
+                        let next_pos = ::omnibuf::codec::read_hash_map_field(
+                            &mut this.f12_map_str_uint,
+                            dec.data(),
+                            pos,
+                            depth,
+                            10,
+                            0,
+                            false,
+                            ::omnibuf::codec::read_elem_string,
+                            |b, p, _d| ::omnibuf::codec::read_elem_uint(b, p),
+                        )?;
+                        dec.set_position(next_pos);
+                    }
+                    216 => {
+                        this.f13_float32 = dec.read_float32()?;
+                    }
+                    233 => {
+                        this.f14_float64 = dec.read_float64()?;
+                    }
+                    244 => {
+                        this.f15_fixed32 = dec.read_fixed32()?;
+                    }
+                    261 => {
+                        this.f16_fixed64 = dec.read_fixed64()?;
+                    }
+                    330 => {
+                        let s = dec.read_str()?;
+                        ::omnibuf::codec::assign_str(&mut this.f20_overflow_str, s);
+                    }
+                    _ => dec.skip_unknown((raw_tag >> 4) as u32, (raw_tag & 0x0F) as u8)?,
+                }
+            }
+            ::core::result::Result::Ok(())
+        }
+        decode_slow(self, dec.data(), dec.position(), depth)
     }
 
     #[inline]

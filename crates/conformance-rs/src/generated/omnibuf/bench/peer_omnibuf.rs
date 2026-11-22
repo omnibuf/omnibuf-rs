@@ -49,7 +49,7 @@ impl ::omnibuf::Message for Location {
         ::core::result::Result::Ok(())
     }
 
-    #[inline]
+    #[inline(always)]
     fn decode_omnibuf_at_depth(
         &mut self,
         data: &[u8],
@@ -60,33 +60,70 @@ impl ::omnibuf::Message for Location {
         if !merge {
             self.clear_omnibuf();
         }
-        while let ::core::option::Option::Some((fnum, wt)) = dec.next_tag()? {
-            match fnum {
-                1 if wt == 10 => {
-                    let s = dec.read_str()?;
-                    ::omnibuf::codec::assign_str(&mut self.region, s);
-                }
-                2 if wt == 10 => {
-                    let s = dec.read_str()?;
-                    ::omnibuf::codec::assign_str(&mut self.datacenter, s);
-                }
-                3 if wt == 10 => {
-                    let s = dec.read_str()?;
-                    ::omnibuf::codec::assign_str(&mut self.city, s);
-                }
-                4 if wt == 0 => {
-                    self.rack = dec.read_uint()? as u32;
-                }
-                5 if wt == 8 => {
-                    self.latitude = dec.read_float32()?;
-                }
-                6 if wt == 8 => {
-                    self.longitude = dec.read_float32()?;
-                }
-                _ => dec.skip_unknown(fnum, wt)?,
-            }
+        if dec.consume_tag1(53) {
+            let s = dec.read_str()?;
+            ::omnibuf::codec::assign_str(&mut self.region, s);
         }
-        ::core::result::Result::Ok(())
+        if dec.consume_tag1(85) {
+            let s = dec.read_str()?;
+            ::omnibuf::codec::assign_str(&mut self.datacenter, s);
+        }
+        if dec.consume_tag1(117) {
+            let s = dec.read_str()?;
+            ::omnibuf::codec::assign_str(&mut self.city, s);
+        }
+        if dec.consume_tag1(129) {
+            self.rack = dec.read_uint()? as u32;
+        }
+        if dec.consume_tag1(177) {
+            self.latitude = dec.read_float32()?;
+        }
+        if dec.consume_tag1(209) {
+            self.longitude = dec.read_float32()?;
+        }
+        if dec.is_empty() {
+            return ::core::result::Result::Ok(());
+        }
+        #[cold]
+        #[inline(never)]
+        fn decode_slow(
+            this: &mut Location,
+            data: &[u8],
+            pos: usize,
+            depth: usize,
+        ) -> ::omnibuf::Result<()> {
+            let _ = depth;
+            let mut dec = ::omnibuf::Decoder::with_depth(data, depth)?;
+            dec.set_position(pos);
+            while let ::core::option::Option::Some(raw_tag) = dec.next_raw_tag()? {
+                match raw_tag {
+                    26 => {
+                        let s = dec.read_str()?;
+                        ::omnibuf::codec::assign_str(&mut this.region, s);
+                    }
+                    42 => {
+                        let s = dec.read_str()?;
+                        ::omnibuf::codec::assign_str(&mut this.datacenter, s);
+                    }
+                    58 => {
+                        let s = dec.read_str()?;
+                        ::omnibuf::codec::assign_str(&mut this.city, s);
+                    }
+                    64 => {
+                        this.rack = dec.read_uint()? as u32;
+                    }
+                    88 => {
+                        this.latitude = dec.read_float32()?;
+                    }
+                    104 => {
+                        this.longitude = dec.read_float32()?;
+                    }
+                    _ => dec.skip_unknown((raw_tag >> 4) as u32, (raw_tag & 0x0F) as u8)?,
+                }
+            }
+            ::core::result::Result::Ok(())
+        }
+        decode_slow(self, dec.data(), dec.position(), depth)
     }
 
     #[inline]
@@ -621,7 +658,7 @@ impl ::omnibuf::Message for Neighbor {
         ::core::result::Result::Ok(())
     }
 
-    #[inline]
+    #[inline(always)]
     fn decode_omnibuf_at_depth(
         &mut self,
         data: &[u8],
@@ -632,27 +669,57 @@ impl ::omnibuf::Message for Neighbor {
         if !merge {
             self.clear_omnibuf();
         }
-        while let ::core::option::Option::Some((fnum, wt)) = dec.next_tag()? {
-            match fnum {
-                1 if wt == 0 => {
-                    self.peer_asn = dec.read_uint()? as u32;
-                }
-                2 if wt == 10 => {
-                    let s = dec.read_str()?;
-                    ::omnibuf::codec::assign_str(&mut self.router, s);
-                }
-                3 if wt == 0 => {
-                    self.latency_us = dec.read_uint()? as u32;
-                }
-                4 if wt == ::omnibuf::wire::WIRE_BOOL_FALSE
-                    || wt == ::omnibuf::wire::WIRE_BOOL_TRUE =>
-                {
-                    self.established = wt == ::omnibuf::wire::WIRE_BOOL_TRUE;
-                }
-                _ => dec.skip_unknown(fnum, wt)?,
-            }
+        if dec.consume_tag1(33) {
+            self.peer_asn = dec.read_uint()? as u32;
         }
-        ::core::result::Result::Ok(())
+        if dec.consume_tag1(85) {
+            let s = dec.read_str()?;
+            ::omnibuf::codec::assign_str(&mut self.router, s);
+        }
+        if dec.consume_tag1(97) {
+            self.latency_us = dec.read_uint()? as u32;
+        }
+        if let ::core::option::Option::Some(__b) = dec.consume_bool_tag1(133, 135) {
+            self.established = __b;
+        }
+        if dec.is_empty() {
+            return ::core::result::Result::Ok(());
+        }
+        #[cold]
+        #[inline(never)]
+        fn decode_slow(
+            this: &mut Neighbor,
+            data: &[u8],
+            pos: usize,
+            depth: usize,
+        ) -> ::omnibuf::Result<()> {
+            let _ = depth;
+            let mut dec = ::omnibuf::Decoder::with_depth(data, depth)?;
+            dec.set_position(pos);
+            while let ::core::option::Option::Some(raw_tag) = dec.next_raw_tag()? {
+                match raw_tag {
+                    16 => {
+                        this.peer_asn = dec.read_uint()? as u32;
+                    }
+                    42 => {
+                        let s = dec.read_str()?;
+                        ::omnibuf::codec::assign_str(&mut this.router, s);
+                    }
+                    48 => {
+                        this.latency_us = dec.read_uint()? as u32;
+                    }
+                    66 => {
+                        this.established = false;
+                    }
+                    67 => {
+                        this.established = true;
+                    }
+                    _ => dec.skip_unknown((raw_tag >> 4) as u32, (raw_tag & 0x0F) as u8)?,
+                }
+            }
+            ::core::result::Result::Ok(())
+        }
+        decode_slow(self, dec.data(), dec.position(), depth)
     }
 
     #[inline]
@@ -1135,84 +1202,163 @@ impl ::omnibuf::Message for PeerUpdate {
         if !merge {
             self.clear_omnibuf();
         }
-        while let ::core::option::Option::Some((fnum, wt)) = dec.next_tag()? {
-            match fnum {
-                1 if wt == 0 => {
-                    self.asn = dec.read_uint()? as u32;
-                }
-                2 if wt == 10 => {
-                    let s = dec.read_str()?;
-                    ::omnibuf::codec::assign_str(&mut self.router_id, s);
-                }
-                3 if wt == ::omnibuf::wire::WIRE_BOOL_FALSE
-                    || wt == ::omnibuf::wire::WIRE_BOOL_TRUE =>
-                {
-                    self.active = wt == ::omnibuf::wire::WIRE_BOOL_TRUE;
-                }
-                4 if wt == 0 => {
-                    self.uptime_sec = dec.read_uint()?;
-                }
-                5 if wt == 1 => {
-                    self.rssi_dbm = dec.read_sint()? as i32;
-                }
-                6 if wt == 9 => {
-                    self.cpu_load = dec.read_float64()?;
-                }
-                7 if wt == 13 => {
-                    let pos = dec.position();
-                    let next_pos = ::omnibuf::codec::read_scalar_vec_field(
-                        &mut self.tags,
-                        dec.data(),
-                        pos,
-                        depth,
-                        10,
-                        false,
-                        ::omnibuf::codec::read_elem_string,
-                    )?;
-                    dec.set_position(next_pos);
-                }
-                8 if wt == 13 => {
-                    let pos = dec.position();
-                    let next_pos = ::omnibuf::codec::read_scalar_vec_field(
-                        &mut self.prefixes,
-                        dec.data(),
-                        pos,
-                        depth,
-                        0,
-                        false,
-                        |b, p| ::omnibuf::codec::read_elem_uint(b, p).map(|(v, np)| (v as u32, np)),
-                    )?;
-                    dec.set_position(next_pos);
-                }
-                9 if wt == 12 => {
-                    let pos = dec.position();
-                    let next_pos = ::omnibuf::codec::read_opt_sub_msg_field(
-                        &mut self.location,
-                        dec.data(),
-                        pos,
-                        depth,
-                        true,
-                    )?;
-                    dec.set_position(next_pos);
-                }
-                10 if wt == 13 => {
-                    let pos = dec.position();
-                    let next_pos = ::omnibuf::codec::read_sub_msg_vec_field(
-                        &mut self.neighbors,
-                        dec.data(),
-                        pos,
-                        depth,
-                        false,
-                    )?;
-                    dec.set_position(next_pos);
-                }
-                11 if wt == 0 => {
-                    self.sequence = dec.read_uint()?;
-                }
-                _ => dec.skip_unknown(fnum, wt)?,
-            }
+        if dec.consume_tag1(33) {
+            self.asn = dec.read_uint()? as u32;
         }
-        ::core::result::Result::Ok(())
+        if dec.consume_tag1(85) {
+            let s = dec.read_str()?;
+            ::omnibuf::codec::assign_str(&mut self.router_id, s);
+        }
+        if let ::core::option::Option::Some(__b) = dec.consume_bool_tag1(101, 103) {
+            self.active = __b;
+        }
+        if dec.consume_tag1(129) {
+            self.uptime_sec = dec.read_uint()?;
+        }
+        if dec.consume_tag1(163) {
+            self.rssi_dbm = dec.read_sint()? as i32;
+        }
+        if dec.consume_tag1(211) {
+            self.cpu_load = dec.read_float64()?;
+        }
+        if dec.consume_tag1(251) {
+            let pos = dec.position();
+            let next_pos = ::omnibuf::codec::read_string_vec_field(
+                &mut self.tags,
+                dec.data(),
+                pos,
+                depth,
+                false,
+            )?;
+            dec.set_position(next_pos);
+        }
+        if dec.consume_tag2(566) {
+            let pos = dec.position();
+            let next_pos = ::omnibuf::codec::read_uint32_vec_field(
+                &mut self.prefixes,
+                dec.data(),
+                pos,
+                depth,
+                false,
+            )?;
+            dec.set_position(next_pos);
+        }
+        if dec.consume_tag2(626) {
+            let pos = dec.position();
+            let next_pos = ::omnibuf::codec::read_opt_sub_msg_field(
+                &mut self.location,
+                dec.data(),
+                pos,
+                depth,
+                true,
+            )?;
+            dec.set_position(next_pos);
+        }
+        if dec.consume_tag2(694) {
+            let pos = dec.position();
+            let next_pos = ::omnibuf::codec::read_sub_msg_vec_field(
+                &mut self.neighbors,
+                dec.data(),
+                pos,
+                depth,
+                false,
+            )?;
+            dec.set_position(next_pos);
+        }
+        if dec.consume_tag2(706) {
+            self.sequence = dec.read_uint()?;
+        }
+        if dec.is_empty() {
+            return ::core::result::Result::Ok(());
+        }
+        #[cold]
+        #[inline(never)]
+        fn decode_slow(
+            this: &mut PeerUpdate,
+            data: &[u8],
+            pos: usize,
+            depth: usize,
+        ) -> ::omnibuf::Result<()> {
+            let _ = depth;
+            let mut dec = ::omnibuf::Decoder::with_depth(data, depth)?;
+            dec.set_position(pos);
+            while let ::core::option::Option::Some(raw_tag) = dec.next_raw_tag()? {
+                match raw_tag {
+                    16 => {
+                        this.asn = dec.read_uint()? as u32;
+                    }
+                    42 => {
+                        let s = dec.read_str()?;
+                        ::omnibuf::codec::assign_str(&mut this.router_id, s);
+                    }
+                    50 => {
+                        this.active = false;
+                    }
+                    51 => {
+                        this.active = true;
+                    }
+                    64 => {
+                        this.uptime_sec = dec.read_uint()?;
+                    }
+                    81 => {
+                        this.rssi_dbm = dec.read_sint()? as i32;
+                    }
+                    105 => {
+                        this.cpu_load = dec.read_float64()?;
+                    }
+                    125 => {
+                        let pos = dec.position();
+                        let next_pos = ::omnibuf::codec::read_string_vec_field(
+                            &mut this.tags,
+                            dec.data(),
+                            pos,
+                            depth,
+                            false,
+                        )?;
+                        dec.set_position(next_pos);
+                    }
+                    141 => {
+                        let pos = dec.position();
+                        let next_pos = ::omnibuf::codec::read_uint32_vec_field(
+                            &mut this.prefixes,
+                            dec.data(),
+                            pos,
+                            depth,
+                            false,
+                        )?;
+                        dec.set_position(next_pos);
+                    }
+                    156 => {
+                        let pos = dec.position();
+                        let next_pos = ::omnibuf::codec::read_opt_sub_msg_field(
+                            &mut this.location,
+                            dec.data(),
+                            pos,
+                            depth,
+                            true,
+                        )?;
+                        dec.set_position(next_pos);
+                    }
+                    173 => {
+                        let pos = dec.position();
+                        let next_pos = ::omnibuf::codec::read_sub_msg_vec_field(
+                            &mut this.neighbors,
+                            dec.data(),
+                            pos,
+                            depth,
+                            false,
+                        )?;
+                        dec.set_position(next_pos);
+                    }
+                    176 => {
+                        this.sequence = dec.read_uint()?;
+                    }
+                    _ => dec.skip_unknown((raw_tag >> 4) as u32, (raw_tag & 0x0F) as u8)?,
+                }
+            }
+            ::core::result::Result::Ok(())
+        }
+        decode_slow(self, dec.data(), dec.position(), depth)
     }
 
     #[inline]

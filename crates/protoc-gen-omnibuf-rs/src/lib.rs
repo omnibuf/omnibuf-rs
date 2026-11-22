@@ -1054,7 +1054,11 @@ fn emit_message_trait_impl(
     let _ = writeln!(code, "        ::core::result::Result::Ok(())");
     let _ = writeln!(code, "    }}\n");
 
-    let _ = writeln!(code, "    #[inline]");
+    if oneofs.is_empty() && !fields.is_empty() && fields.len() <= 8 {
+        let _ = writeln!(code, "    #[inline(always)]");
+    } else {
+        let _ = writeln!(code, "    #[inline]");
+    }
     let _ = writeln!(
         code,
         "    fn decode_omnibuf_at_depth(&mut self, data: &[u8], depth: usize, merge: bool) -> ::omnibuf::Result<()> {{"
@@ -1072,6 +1076,50 @@ fn emit_message_trait_impl(
         let _ = writeln!(code, "            dec.skip_unknown(fnum, wt)?;");
         let _ = writeln!(code, "        }}");
         let _ = writeln!(code, "        ::core::result::Result::Ok(())");
+    } else if oneofs.is_empty() && fields.len() <= 24 {
+        let _ = writeln!(
+            code,
+            "        let mut dec = ::omnibuf::Decoder::with_depth(data, depth)?;"
+        );
+        let _ = writeln!(code, "        if !merge {{ self.clear_omnibuf(); }}");
+        for gf in fields {
+            emit_fast_decode_stmt(code, gf);
+        }
+        let _ = writeln!(code, "        if dec.is_empty() {{");
+        let _ = writeln!(code, "            return ::core::result::Result::Ok(());");
+        let _ = writeln!(code, "        }}");
+        let _ = writeln!(code, "        #[cold]");
+        let _ = writeln!(code, "        #[inline(never)]");
+        let _ = writeln!(
+            code,
+            "        fn decode_slow(this: &mut {rust_name}, data: &[u8], pos: usize, depth: usize) -> ::omnibuf::Result<()> {{"
+        );
+        let _ = writeln!(code, "            let _ = depth;");
+        let _ = writeln!(
+            code,
+            "            let mut dec = ::omnibuf::Decoder::with_depth(data, depth)?;"
+        );
+        let _ = writeln!(code, "            dec.set_position(pos);");
+        let _ = writeln!(
+            code,
+            "            while let ::core::option::Option::Some(raw_tag) = dec.next_raw_tag()? {{"
+        );
+        let _ = writeln!(code, "                match raw_tag {{");
+        for gf in fields {
+            emit_raw_tag_decode_arm(code, gf, "this");
+        }
+        let _ = writeln!(
+            code,
+            "                    _ => dec.skip_unknown((raw_tag >> 4) as u32, (raw_tag & 0x0F) as u8)?,"
+        );
+        let _ = writeln!(code, "                }}");
+        let _ = writeln!(code, "            }}");
+        let _ = writeln!(code, "            ::core::result::Result::Ok(())");
+        let _ = writeln!(code, "        }}");
+        let _ = writeln!(
+            code,
+            "        decode_slow(self, dec.data(), dec.position(), depth)"
+        );
     } else {
         let _ = writeln!(
             code,
@@ -1765,6 +1813,196 @@ fn scalar_decode_expr(scalar: ProtoScalar) -> &'static str {
         ProtoScalar::String => "dec.read_str()?.to_owned()",
         ProtoScalar::Bytes => "dec.read_bytes()?.to_vec()",
         ProtoScalar::Bool => "wt == ::omnibuf::wire::WIRE_BOOL_TRUE",
+    }
+}
+
+fn decode_field_body(gf: &GenField, recv: &str) -> (u8, String) {
+    let fident = &gf.rust_ident;
+    match &gf.kind {
+        GenFieldKind::Scalar(ProtoScalar::String) => (
+            ProtoScalar::String.wire_type(),
+            format!(
+                "let s = dec.read_str()?; ::omnibuf::codec::assign_str(&mut {recv}.{fident}, s);"
+            ),
+        ),
+        GenFieldKind::Scalar(ProtoScalar::Bytes) => (
+            ProtoScalar::Bytes.wire_type(),
+            format!(
+                "let b = dec.read_bytes()?; ::omnibuf::codec::assign_bytes(&mut {recv}.{fident}, b);"
+            ),
+        ),
+        GenFieldKind::Scalar(s) => (
+            s.wire_type(),
+            format!("{recv}.{fident} = {};", scalar_decode_expr(*s)),
+        ),
+        GenFieldKind::OptScalar(s) => (
+            s.wire_type(),
+            format!(
+                "{recv}.{fident} = ::core::option::Option::Some({});",
+                scalar_decode_expr(*s)
+            ),
+        ),
+        GenFieldKind::SubMsg { boxed, .. } => {
+            let fn_name = if *boxed {
+                "read_opt_box_sub_msg_field"
+            } else {
+                "read_opt_sub_msg_field"
+            };
+            (
+                WIRE_SUB_MSG,
+                format!(
+                    "let pos = dec.position(); let next_pos = ::omnibuf::codec::{fn_name}(&mut {recv}.{fident}, dec.data(), pos, depth, true)?; dec.set_position(next_pos);"
+                ),
+            )
+        }
+        GenFieldKind::ScalarArr(ProtoScalar::Uint32) => (
+            WIRE_ARRAY,
+            format!(
+                "let pos = dec.position(); let next_pos = ::omnibuf::codec::read_uint32_vec_field(&mut {recv}.{fident}, dec.data(), pos, depth, false)?; dec.set_position(next_pos);"
+            ),
+        ),
+        GenFieldKind::ScalarArr(ProtoScalar::Uint64) => (
+            WIRE_ARRAY,
+            format!(
+                "let pos = dec.position(); let next_pos = ::omnibuf::codec::read_uint64_vec_field(&mut {recv}.{fident}, dec.data(), pos, depth, false)?; dec.set_position(next_pos);"
+            ),
+        ),
+        GenFieldKind::ScalarArr(ProtoScalar::String) => (
+            WIRE_ARRAY,
+            format!(
+                "let pos = dec.position(); let next_pos = ::omnibuf::codec::read_string_vec_field(&mut {recv}.{fident}, dec.data(), pos, depth, false)?; dec.set_position(next_pos);"
+            ),
+        ),
+        GenFieldKind::ScalarArr(s) => {
+            let ewt = s.wire_type();
+            let rs_arg = scalar_elem_read_arg(*s);
+            (
+                WIRE_ARRAY,
+                format!(
+                    "let pos = dec.position(); let next_pos = ::omnibuf::codec::read_scalar_vec_field(&mut {recv}.{fident}, dec.data(), pos, depth, {ewt}, false, {rs_arg})?; dec.set_position(next_pos);"
+                ),
+            )
+        }
+        GenFieldKind::SubMsgArr { .. } => (
+            WIRE_ARRAY,
+            format!(
+                "let pos = dec.position(); let next_pos = ::omnibuf::codec::read_sub_msg_vec_field(&mut {recv}.{fident}, dec.data(), pos, depth, false)?; dec.set_position(next_pos);"
+            ),
+        ),
+        GenFieldKind::Map { key, val } => {
+            let kwt = key.wire_type();
+            let rk_arg = scalar_elem_read_arg(*key);
+            let (vwt, rv) = match val {
+                MapValKind::Scalar(vs) => (
+                    vs.wire_type(),
+                    format!("|b, p, _d| {}", scalar_elem_read_snippet(*vs)),
+                ),
+                MapValKind::SubMsg { rust_type, .. } => (
+                    WIRE_SUB_MSG,
+                    format!(
+                        "|b, p, d| {{ let (sb, np) = ::omnibuf::wire::read_len_slice(b, p, 0)?; let mut sub = {rust_type}::default(); <{rust_type} as ::omnibuf::Message>::decode_omnibuf_at_depth(&mut sub, sb, d + 1, true)?; ::core::result::Result::Ok((sub, np)) }}"
+                    ),
+                ),
+            };
+            (
+                WIRE_MAP,
+                format!(
+                    "let pos = dec.position(); let next_pos = ::omnibuf::codec::read_hash_map_field(&mut {recv}.{fident}, dec.data(), pos, depth, {kwt}, {vwt}, false, {rk_arg}, {rv})?; dec.set_position(next_pos);"
+                ),
+            )
+        }
+    }
+}
+
+fn emit_fast_decode_stmt(code: &mut String, gf: &GenField) {
+    let fnum = gf.number;
+    let fident = &gf.rust_ident;
+    match &gf.kind {
+        GenFieldKind::Scalar(ProtoScalar::Bool) => {
+            let tf = (u64::from(fnum) << 4) | u64::from(WIRE_BOOL_FALSE);
+            let tt = (u64::from(fnum) << 4) | 3u64;
+            if tt <= 127 {
+                let bf = ((tf as u8) << 1) | 1;
+                let bt = ((tt as u8) << 1) | 1;
+                let _ = writeln!(
+                    code,
+                    "        if let ::core::option::Option::Some(__b) = dec.consume_bool_tag1({bf}, {bt}) {{ self.{fident} = __b; }}"
+                );
+            } else if tt <= 16_383 {
+                let uf = ((tf as u16) << 2) | 2;
+                let ut = ((tt as u16) << 2) | 2;
+                let _ = writeln!(
+                    code,
+                    "        if let ::core::option::Option::Some(__b) = dec.consume_bool_tag2({uf}, {ut}) {{ self.{fident} = __b; }}"
+                );
+            }
+        }
+        GenFieldKind::OptScalar(ProtoScalar::Bool) => {
+            let tf = (u64::from(fnum) << 4) | u64::from(WIRE_BOOL_FALSE);
+            let tt = (u64::from(fnum) << 4) | 3u64;
+            if tt <= 127 {
+                let bf = ((tf as u8) << 1) | 1;
+                let bt = ((tt as u8) << 1) | 1;
+                let _ = writeln!(
+                    code,
+                    "        if let ::core::option::Option::Some(__b) = dec.consume_bool_tag1({bf}, {bt}) {{ self.{fident} = ::core::option::Option::Some(__b); }}"
+                );
+            } else if tt <= 16_383 {
+                let uf = ((tf as u16) << 2) | 2;
+                let ut = ((tt as u16) << 2) | 2;
+                let _ = writeln!(
+                    code,
+                    "        if let ::core::option::Option::Some(__b) = dec.consume_bool_tag2({uf}, {ut}) {{ self.{fident} = ::core::option::Option::Some(__b); }}"
+                );
+            }
+        }
+        _ => {
+            let (wt, body) = decode_field_body(gf, "self");
+            let tag = (u64::from(fnum) << 4) | u64::from(wt);
+            if tag <= 127 {
+                let b = ((tag as u8) << 1) | 1;
+                let _ = writeln!(code, "        if dec.consume_tag1({b}) {{ {body} }}");
+            } else if tag <= 16_383 {
+                let u = ((tag as u16) << 2) | 2;
+                let _ = writeln!(code, "        if dec.consume_tag2({u}) {{ {body} }}");
+            }
+        }
+    }
+}
+
+fn emit_raw_tag_decode_arm(code: &mut String, gf: &GenField, recv: &str) {
+    let fnum = gf.number;
+    let fident = &gf.rust_ident;
+    match &gf.kind {
+        GenFieldKind::Scalar(ProtoScalar::Bool) => {
+            let tf = (u64::from(fnum) << 4) | u64::from(WIRE_BOOL_FALSE);
+            let tt = (u64::from(fnum) << 4) | 3u64;
+            let _ = writeln!(
+                code,
+                "                    {tf} => {{ {recv}.{fident} = false; }}"
+            );
+            let _ = writeln!(
+                code,
+                "                    {tt} => {{ {recv}.{fident} = true; }}"
+            );
+        }
+        GenFieldKind::OptScalar(ProtoScalar::Bool) => {
+            let tf = (u64::from(fnum) << 4) | u64::from(WIRE_BOOL_FALSE);
+            let tt = (u64::from(fnum) << 4) | 3u64;
+            let _ = writeln!(
+                code,
+                "                    {tf} => {{ {recv}.{fident} = ::core::option::Option::Some(false); }}"
+            );
+            let _ = writeln!(
+                code,
+                "                    {tt} => {{ {recv}.{fident} = ::core::option::Option::Some(true); }}"
+            );
+        }
+        _ => {
+            let (wt, body) = decode_field_body(gf, recv);
+            let raw_tag = (u64::from(fnum) << 4) | u64::from(wt);
+            let _ = writeln!(code, "                    {raw_tag} => {{ {body} }}");
+        }
     }
 }
 

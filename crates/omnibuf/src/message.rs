@@ -1,5 +1,6 @@
 use core::any::TypeId;
 use core::cell::Cell;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 
@@ -11,10 +12,13 @@ use crate::wire::{
     WIRE_SFIXED64, WIRE_SINT, WIRE_STRING, WIRE_SUB_MSG, WIRE_UINT, append_bytes_elem, append_tag,
     append_varint, backpatch_container_len, backpatch_container_len_4b, cold_parse_err,
     container_len_width, decode_varint, decode_zigzag, encode_zigzag, fast_skip_value,
-    grow_capacity, parse_array_header, parse_map_header, put_varint_raw, read_len_slice,
-    read_str_slice, read_varint_at, varint_len, write_bool_tagged, write_bytes_tagged,
-    write_fixed_tagged, write_varint_tagged,
+    grow_capacity, is_valid_utf8, parse_array_header, parse_array_header_typed, parse_map_header,
+    put_varint_raw, read_len_slice, read_len_slice_opt, read_str_slice, read_varint_at,
+    read_varint_at_opt, varint_len, write_bool_tagged, write_bytes_tagged, write_fixed_tagged,
+    write_varint_tagged,
 };
+
+static ACTIVE_BUDGET_GUARDS: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static ACTIVE_TYPED_ALLOC_REM: Cell<usize> = const { Cell::new(usize::MAX) };
@@ -27,6 +31,7 @@ pub(crate) struct AllocBudgetGuard {
 impl AllocBudgetGuard {
     #[inline]
     pub(crate) fn new(limit: usize) -> Self {
+        ACTIVE_BUDGET_GUARDS.fetch_add(1, Ordering::Relaxed);
         let prev = ACTIVE_TYPED_ALLOC_REM.with(|c| c.replace(limit));
         Self { prev }
     }
@@ -36,14 +41,21 @@ impl Drop for AllocBudgetGuard {
     #[inline]
     fn drop(&mut self) {
         ACTIVE_TYPED_ALLOC_REM.with(|c| c.set(self.prev));
+        ACTIVE_BUDGET_GUARDS.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-#[inline]
+#[inline(always)]
 pub(crate) fn charge_typed_alloc(bytes: usize) -> Result<()> {
-    if bytes == 0 {
+    if bytes == 0 || ACTIVE_BUDGET_GUARDS.load(Ordering::Relaxed) == 0 {
         return Ok(());
     }
+    charge_typed_alloc_slow(bytes)
+}
+
+#[cold]
+#[inline(never)]
+fn charge_typed_alloc_slow(bytes: usize) -> Result<()> {
     ACTIVE_TYPED_ALLOC_REM.with(|c| {
         let rem = c.get();
         if rem == usize::MAX {
@@ -460,7 +472,7 @@ pub trait Message: Default + Sized + 'static {
     }
 
     /// Decodes `data` into `self`, resetting any unseen fields.
-    #[inline]
+    #[inline(always)]
     fn decode_omnibuf(&mut self, data: &[u8]) -> Result<()> {
         self.decode_omnibuf_at_depth(data, 0, false)
     }
@@ -474,7 +486,7 @@ pub trait Message: Default + Sized + 'static {
     }
 
     /// Allocates a default instance of `Self` and decodes `data` into it.
-    #[inline]
+    #[inline(always)]
     fn from_omnibuf(data: &[u8]) -> Result<Self> {
         let mut msg = Self::default();
         msg.decode_omnibuf_at_depth(data, 0, true)?;
@@ -566,7 +578,7 @@ pub fn to_vec_with_options<M: Message>(msg: &M, opts: EncodeOptions) -> Result<V
 }
 
 /// Decodes an OmniBuf byte slice into a newly allocated `M`.
-#[inline]
+#[inline(always)]
 pub fn from_slice<M: Message>(data: &[u8]) -> Result<M> {
     M::from_omnibuf(data)
 }
@@ -903,6 +915,16 @@ pub mod codec {
         }
     }
 
+    /// Invokes `f` on a cold, non-inlined path so fallback decode loops never bloat hot functions.
+    #[cold]
+    #[inline(never)]
+    pub fn cold_decode_fallback<F, R>(f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        f()
+    }
+
     #[inline(always)]
     pub fn assign_str(slot: &mut String, s: &str) {
         if slot.capacity() == 0 {
@@ -910,9 +932,14 @@ pub mod codec {
                 *slot = s.to_owned();
             }
         } else {
-            slot.clear();
-            slot.push_str(s);
+            assign_str_reuse(slot, s);
         }
+    }
+
+    #[inline(never)]
+    fn assign_str_reuse(slot: &mut String, s: &str) {
+        slot.clear();
+        slot.push_str(s);
     }
 
     #[inline(always)]
@@ -922,9 +949,14 @@ pub mod codec {
                 *slot = b.to_vec();
             }
         } else {
-            slot.clear();
-            slot.extend_from_slice(b);
+            assign_bytes_reuse(slot, b);
         }
+    }
+
+    #[inline(never)]
+    fn assign_bytes_reuse(slot: &mut Vec<u8>, b: &[u8]) {
+        slot.clear();
+        slot.extend_from_slice(b);
     }
 
     #[inline(always)]
@@ -1125,7 +1157,17 @@ pub mod codec {
         Ok(next_pos)
     }
 
-    #[inline]
+    #[inline(never)]
+    fn decode_existing_sub_msg<M: Message>(
+        msg: &mut M,
+        sub_bytes: &[u8],
+        depth: usize,
+        merge: bool,
+    ) -> Result<()> {
+        msg.decode_omnibuf_at_depth(sub_bytes, depth, merge)
+    }
+
+    #[inline(always)]
     pub fn read_opt_sub_msg_field<M: Message>(
         slot: &mut Option<M>,
         data: &[u8],
@@ -1135,11 +1177,12 @@ pub mod codec {
     ) -> Result<usize> {
         let (sub_bytes, next_pos) = read_len_slice(data, pos, 0)?;
         match slot {
-            Some(msg) => msg.decode_omnibuf_at_depth(sub_bytes, depth + 1, merge)?,
             None => {
-                let mut msg = M::default();
+                let msg = slot.insert(M::default());
                 msg.decode_omnibuf_at_depth(sub_bytes, depth + 1, true)?;
-                *slot = Some(msg);
+            }
+            Some(msg) => {
+                decode_existing_sub_msg(msg, sub_bytes, depth + 1, merge)?;
             }
         }
         Ok(next_pos)
@@ -1306,8 +1349,207 @@ pub mod codec {
         Ok(())
     }
 
+    struct SetLenOnDrop<'a, T> {
+        vec: &'a mut Vec<T>,
+        len: usize,
+    }
+
+    impl<T> Drop for SetLenOnDrop<'_, T> {
+        #[inline(always)]
+        fn drop(&mut self) {
+            // SAFETY: `self.len` elements have been initialized within `self.vec`'s capacity.
+            unsafe {
+                self.vec.set_len(self.len);
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn read_scalar_vec_large<T, F>(
+        items: &mut Vec<T>,
+        body: &[u8],
+        mut p: usize,
+        count: usize,
+        mut read_elem: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8], usize) -> Result<(T, usize)>,
+    {
+        let base = items.len();
+        let total = base.saturating_add(4096);
+        if items.capacity() < total {
+            items.reserve(grow_capacity(items.capacity(), total) - base);
+        }
+        for _ in 0..count {
+            let (val, next_p) = read_elem(body, p)?;
+            items.push(val);
+            p = next_p;
+        }
+        if p != body.len() {
+            return Err(cold_parse_err("WireArray trailing bytes"));
+        }
+        Ok(())
+    }
+
+    /// Decodes a `WireArray(WireUint)` directly into `Vec<u32>` with zero closure overhead.
+    #[inline(always)]
+    pub fn read_uint32_vec_field(
+        items: &mut Vec<u32>,
+        data: &[u8],
+        pos: usize,
+        depth: usize,
+        reset: bool,
+    ) -> Result<usize> {
+        if depth + 1 > MAX_NESTING_DEPTH {
+            return Err(Error::DepthLimitExceeded(depth + 1));
+        }
+        let (body, next_pos) = read_len_slice(data, pos, 2)?;
+        if reset {
+            items.clear();
+        }
+        let (count, mut p) = parse_array_header_typed(body, WIRE_UINT)
+            .ok_or_else(|| cold_parse_err("invalid WireArray(WireUint) header"))?;
+        super::charge_typed_alloc(count.saturating_mul(core::mem::size_of::<u32>()))?;
+        if count > 4096 {
+            read_scalar_vec_large(items, body, p, count, |b, off| {
+                read_varint_at(b, off).map(|(v, np)| (v as u32, np))
+            })?;
+            return Ok(next_pos);
+        }
+        let base = items.len();
+        let total = base.saturating_add(count);
+        if items.capacity() < total {
+            items.reserve(grow_capacity(items.capacity(), total) - base);
+        }
+        let ptr = items.as_mut_ptr();
+        for i in 0..count {
+            let Some((v, next_p)) = read_varint_at_opt(body, p) else {
+                return Err(cold_parse_err("truncated or invalid varint"));
+            };
+            // SAFETY: `items` reserved space for `base + count` elements; `u32` is `Copy`.
+            unsafe {
+                ptr.add(base + i).write(v as u32);
+            }
+            p = next_p;
+        }
+        if p != body.len() {
+            return Err(cold_parse_err("WireArray trailing bytes"));
+        }
+        // SAFETY: All `count` elements in `base..base + count` were initialized above.
+        unsafe {
+            items.set_len(base + count);
+        }
+        Ok(next_pos)
+    }
+
+    /// Decodes a `WireArray(WireUint)` directly into `Vec<u64>` with zero closure overhead.
+    #[inline(always)]
+    pub fn read_uint64_vec_field(
+        items: &mut Vec<u64>,
+        data: &[u8],
+        pos: usize,
+        depth: usize,
+        reset: bool,
+    ) -> Result<usize> {
+        if depth + 1 > MAX_NESTING_DEPTH {
+            return Err(Error::DepthLimitExceeded(depth + 1));
+        }
+        let (body, next_pos) = read_len_slice(data, pos, 2)?;
+        if reset {
+            items.clear();
+        }
+        let (count, mut p) = parse_array_header_typed(body, WIRE_UINT)
+            .ok_or_else(|| cold_parse_err("invalid WireArray(WireUint) header"))?;
+        super::charge_typed_alloc(count.saturating_mul(core::mem::size_of::<u64>()))?;
+        if count > 4096 {
+            read_scalar_vec_large(items, body, p, count, read_varint_at)?;
+            return Ok(next_pos);
+        }
+        let base = items.len();
+        let total = base.saturating_add(count);
+        if items.capacity() < total {
+            items.reserve(grow_capacity(items.capacity(), total) - base);
+        }
+        let ptr = items.as_mut_ptr();
+        for i in 0..count {
+            let Some((v, next_p)) = read_varint_at_opt(body, p) else {
+                return Err(cold_parse_err("truncated or invalid varint"));
+            };
+            // SAFETY: `items` reserved space for `base + count` elements; `u64` is `Copy`.
+            unsafe {
+                ptr.add(base + i).write(v);
+            }
+            p = next_p;
+        }
+        if p != body.len() {
+            return Err(cold_parse_err("WireArray trailing bytes"));
+        }
+        // SAFETY: All `count` elements in `base..base + count` were initialized above.
+        unsafe {
+            items.set_len(base + count);
+        }
+        Ok(next_pos)
+    }
+
+    /// Decodes a `WireArray(WireString)` directly into `Vec<String>` with zero closure overhead.
+    #[inline(always)]
+    pub fn read_string_vec_field(
+        items: &mut Vec<String>,
+        data: &[u8],
+        pos: usize,
+        depth: usize,
+        reset: bool,
+    ) -> Result<usize> {
+        if depth + 1 > MAX_NESTING_DEPTH {
+            return Err(Error::DepthLimitExceeded(depth + 1));
+        }
+        let (body, next_pos) = read_len_slice(data, pos, 2)?;
+        if reset {
+            items.clear();
+        }
+        let (count, mut p) = parse_array_header_typed(body, WIRE_STRING)
+            .ok_or_else(|| cold_parse_err("invalid WireArray(WireString) header"))?;
+        super::charge_typed_alloc(count.saturating_mul(core::mem::size_of::<String>()))?;
+        if count > 4096 {
+            read_scalar_vec_large(items, body, p, count, read_elem_string)?;
+            return Ok(next_pos);
+        }
+        let base = items.len();
+        let total = base.saturating_add(count);
+        if items.capacity() < total {
+            items.reserve(grow_capacity(items.capacity(), total) - base);
+        }
+        let mut guard = SetLenOnDrop {
+            vec: items,
+            len: base,
+        };
+        let ptr = guard.vec.as_mut_ptr();
+        for _ in 0..count {
+            let Some((raw, next_p)) = read_len_slice_opt(body, p, 0) else {
+                return Err(cold_parse_err("invalid container byteLen"));
+            };
+            if !is_valid_utf8(raw) {
+                return Err(Error::InvalidUtf8);
+            }
+            // SAFETY: `is_valid_utf8(raw)` verified `raw` is valid UTF-8.
+            let s = unsafe { core::str::from_utf8_unchecked(raw) }.to_owned();
+            // SAFETY: `items` reserved space for at least `base + count` elements.
+            unsafe {
+                ptr.add(guard.len).write(s);
+            }
+            guard.len += 1;
+            p = next_p;
+        }
+        drop(guard);
+        if p != body.len() {
+            return Err(cold_parse_err("WireArray trailing bytes"));
+        }
+        Ok(next_pos)
+    }
+
     /// Decodes a `WireArray` of scalar elements using `read_elem`.
-    #[inline]
+    #[inline(always)]
     pub fn read_scalar_vec_field<T, F>(
         items: &mut Vec<T>,
         data: &[u8],
@@ -1327,23 +1569,33 @@ pub mod codec {
         if reset {
             items.clear();
         }
-        let (elem_wt, count, mut p) =
-            parse_array_header(body).ok_or_else(|| cold_parse_err("invalid WireArray header"))?;
-        if elem_wt != exp_elem_wt {
-            return Err(cold_parse_err("WireArray element wire type mismatch"));
-        }
+        let (count, mut p) = parse_array_header_typed(body, exp_elem_wt)
+            .ok_or_else(|| cold_parse_err("invalid WireArray header"))?;
         super::charge_typed_alloc(count.saturating_mul(core::mem::size_of::<T>()))?;
+        if count > 4096 {
+            read_scalar_vec_large(items, body, p, count, read_elem)?;
+            return Ok(next_pos);
+        }
         let base = items.len();
-        let cap_add = count.min(4096);
-        let total = base.saturating_add(cap_add);
+        let total = base.saturating_add(count);
         if items.capacity() < total {
             items.reserve(grow_capacity(items.capacity(), total) - base);
         }
+        let mut guard = SetLenOnDrop {
+            vec: items,
+            len: base,
+        };
+        let ptr = guard.vec.as_mut_ptr();
         for _ in 0..count {
             let (val, next_p) = read_elem(body, p)?;
-            items.push(val);
+            // SAFETY: `items` reserved space for at least `base + count` elements.
+            unsafe {
+                ptr.add(guard.len).write(val);
+            }
+            guard.len += 1;
             p = next_p;
         }
+        drop(guard);
         if p != body.len() {
             return Err(cold_parse_err("WireArray trailing bytes"));
         }
@@ -1478,8 +1730,35 @@ pub mod codec {
         Ok(())
     }
 
+    #[cold]
+    #[inline(never)]
+    fn read_sub_msg_vec_large<M: Message>(
+        items: &mut Vec<M>,
+        body: &[u8],
+        mut p: usize,
+        count: usize,
+        depth: usize,
+    ) -> Result<()> {
+        let base = items.len();
+        let total = base.saturating_add(4096);
+        if items.capacity() < total {
+            items.reserve(grow_capacity(items.capacity(), total) - base);
+        }
+        for _ in 0..count {
+            let (elem_bytes, next_p) = read_len_slice(body, p, 0)?;
+            let mut elem = M::default();
+            elem.decode_omnibuf_at_depth(elem_bytes, depth + 2, true)?;
+            items.push(elem);
+            p = next_p;
+        }
+        if p != body.len() {
+            return Err(cold_parse_err("WireArray(WireSubMsg) trailing bytes"));
+        }
+        Ok(())
+    }
+
     /// Decodes `WireArray(WireSubMsg)` into `Vec<M>`.
-    #[inline]
+    #[inline(always)]
     pub fn read_sub_msg_vec_field<M: Message>(
         items: &mut Vec<M>,
         data: &[u8],
@@ -1494,25 +1773,39 @@ pub mod codec {
         if reset {
             items.clear();
         }
-        let (elem_wt, count, mut p) =
-            parse_array_header(body).ok_or_else(|| cold_parse_err("invalid WireArray header"))?;
-        if elem_wt != WIRE_SUB_MSG {
-            return Err(cold_parse_err("expected WireArray(WireSubMsg)"));
-        }
+        let (count, mut p) = parse_array_header_typed(body, WIRE_SUB_MSG)
+            .ok_or_else(|| cold_parse_err("invalid WireArray(WireSubMsg) header"))?;
         super::charge_typed_alloc(count.saturating_mul(core::mem::size_of::<M>()))?;
+        if count > 4096 {
+            read_sub_msg_vec_large(items, body, p, count, depth)?;
+            return Ok(next_pos);
+        }
         let base = items.len();
-        let cap_add = count.min(4096);
-        let total = base.saturating_add(cap_add);
+        let total = base.saturating_add(count);
         if items.capacity() < total {
             items.reserve(grow_capacity(items.capacity(), total) - base);
         }
+        let mut guard = SetLenOnDrop {
+            vec: items,
+            len: base,
+        };
+        let ptr = guard.vec.as_mut_ptr();
         for _ in 0..count {
-            let (elem_bytes, next_p) = read_len_slice(body, p, 0)?;
-            let mut elem = M::default();
-            elem.decode_omnibuf_at_depth(elem_bytes, depth + 2, true)?;
-            items.push(elem);
+            let Some((elem_bytes, next_p)) = read_len_slice_opt(body, p, 0) else {
+                return Err(cold_parse_err("invalid container byteLen"));
+            };
+            // SAFETY: `items` reserved space for at least `base + count` elements.
+            // We write `M::default()` and advance `guard.len` before decoding so any
+            // error or panic cleanly drops the initialized element.
+            unsafe {
+                let slot = ptr.add(guard.len);
+                slot.write(M::default());
+                guard.len += 1;
+                (*slot).decode_omnibuf_at_depth(elem_bytes, depth + 2, true)?;
+            }
             p = next_p;
         }
+        drop(guard);
         if p != body.len() {
             return Err(cold_parse_err("WireArray(WireSubMsg) trailing bytes"));
         }
