@@ -175,16 +175,7 @@ decode_prost(&pkt, &mut out)?;
 
 ## Benchmarks
 
-`just bench` runs `crates/omnibuf-bench` on the 11-field `SamplePeerUpdate` workload (`366 B` OmniBuf wire size, `341 B` Protobuf wire size) across `protoc-gen-omnibuf-rs`, `#[derive(OmniBuf)]`, `buffa`, `prost`, `rmp-serde`, and `serde_json`, writing structured results to `testdata/benchmarks.json`.
-
-Six categories are measured:
-
-- **Full Message Encode Speed:** Serialize a populated 11-field `PeerUpdate` into a fresh `Vec<u8>`.
-- **Full Message Decode Speed:** Materialize an owned `PeerUpdate` and fold all 11 fields into a `black_box` checksum.
-- **Read a Single Nested Field:** Read `peer.location.city` directly from wire bytes (`OpaquePeerUpdate` vs `buffa` `PeerUpdateView` vs full decode).
-- **Selective Single-Field Mutation:** Verify `peer.location.city == "Frankfurt"`, increment `peer.sequence`, and emit an updated wire packet.
-- **Large Embedded Message Encode:** Serialize a `PeerUpdate` whose `20,480 B` `location.datacenter` and `18,432 B` `neighbors[0].router` exceed the 2-byte `16,383 B` container reservation and trigger `2B -> 4B` header expansion.
-- **Embedded Message Growth:** Mutate `location.datacenter` to `20,480 B` ahead of 32 trailing `Neighbor` entries and re-serialize.
+Rust benchmark results, methodology, and cross-language comparisons live at [omnibuf.com/benchmarks?lang=rs](https://omnibuf.com/benchmarks?lang=rs) (all languages at [omnibuf.com/benchmarks](https://omnibuf.com/benchmarks)). Run `just bench` to execute `crates/omnibuf-bench` locally and update [`testdata/benchmarks.json`](testdata/benchmarks.json).
 
 ## Development and Verification
 
