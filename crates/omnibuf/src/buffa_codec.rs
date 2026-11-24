@@ -358,7 +358,7 @@ pub fn encode_reflect_message_append(
         } else {
             static_meta.unwrap_or_default()
         };
-        meta.append_field0(dst);
+        meta.append_field0(dst)?;
     }
     encode_reflect_body(dst, refl, opts.deterministic)
 }

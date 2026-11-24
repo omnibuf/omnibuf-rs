@@ -175,7 +175,7 @@ pub fn encode_dynamic_append(
         } else {
             static_meta.unwrap_or_default()
         };
-        meta.append_field0(dst);
+        meta.append_field0(dst)?;
     }
     encode_dynamic_body(dst, msg, opts.deterministic)
 }

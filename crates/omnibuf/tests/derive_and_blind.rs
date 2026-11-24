@@ -176,7 +176,7 @@ fn blind_decoder_64bit_precision_f32_shortest_and_trailing_field0() {
     meta.fields.insert(3, "lat_f32".to_owned());
     meta.fields.insert(4, "raw_payload".to_owned());
     let mut packet = enc.into_vec();
-    meta.append_field0(&mut packet);
+    meta.append_field0(&mut packet).unwrap();
 
     let map = decode_blind(&packet).unwrap();
     assert_eq!(map.get("max_u64"), Some(&BlindValue::Uint(u64::MAX)));
@@ -218,7 +218,7 @@ fn blind_decoder_rejects_name_collision_and_wire_shape_conflict() {
     meta.fields.insert(1, "dup_name".to_owned());
     meta.fields.insert(2, "dup_name".to_owned());
     let mut pkt = Vec::new();
-    meta.append_field0(&mut pkt);
+    meta.append_field0(&mut pkt).unwrap();
     append_tag(&mut pkt, 1, WIRE_UINT);
     append_varint(&mut pkt, 1);
     append_tag(&mut pkt, 2, WIRE_UINT);

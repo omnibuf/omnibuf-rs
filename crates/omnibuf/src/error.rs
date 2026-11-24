@@ -1,6 +1,7 @@
 use core::fmt;
 
 /// Error returned when encoding or decoding an OmniBuf packet fails.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     /// Wire input violated framing, varint, bounds, or container invariants.

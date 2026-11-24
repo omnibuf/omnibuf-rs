@@ -10,7 +10,8 @@ use crate::wire::{
     MAX_FIELD_NUMBER, MAX_NESTING_DEPTH, WIRE_ARRAY, WIRE_BOOL_FALSE, WIRE_BOOL_TRUE, WIRE_BYTES,
     WIRE_EXTENDED, WIRE_FIXED32, WIRE_FIXED64, WIRE_FLOAT32, WIRE_FLOAT64, WIRE_MAP, WIRE_SFIXED32,
     WIRE_SFIXED64, WIRE_SINT, WIRE_STRING, WIRE_SUB_MSG, WIRE_UINT, append_bytes_elem, append_tag,
-    append_varint, backpatch_container_len, backpatch_container_len_4b, cold_parse_err,
+    append_varint, backpatch_container_len, backpatch_container_len_4b,
+    backpatch_container_len_9b, cold_parse_err,
     container_len_width, decode_varint, decode_zigzag, encode_zigzag, fast_skip_value,
     grow_capacity, is_valid_utf8, parse_array_header, parse_array_header_typed, parse_map_header,
     put_varint_raw, read_len_slice, read_len_slice_opt, read_str_slice, read_varint_at,
@@ -456,7 +457,7 @@ pub trait Message: Default + Sized + 'static {
             } else {
                 Self::schema_meta()
             };
-            meta.append_field0(dst);
+            meta.append_field0(dst)?;
         }
         self.encode_omnibuf_append(dst, opts.deterministic)
     }
@@ -1302,7 +1303,9 @@ pub mod codec {
         }
         let actual_sub_len = dst.len() - (len_pos + lw);
         if actual_sub_len != sub_len {
-            if lw == 4 {
+            if lw == 9 {
+                backpatch_container_len_9b(dst, len_pos);
+            } else if lw == 4 {
                 backpatch_container_len_4b(dst, len_pos);
             } else if lw == 2 {
                 backpatch_container_len(dst, len_pos);

@@ -16,26 +16,39 @@ pub struct SchemaMeta {
     pub children: BTreeMap<u32, SchemaMeta>,
 }
 
+#[inline]
+fn is_valid_schema_field_number(k: u32) -> bool {
+    k >= 1 && u64::from(k) <= MAX_FIELD_NUMBER && !(19_000..=19_999).contains(&k)
+}
+
 impl SchemaMeta {
     /// Appends `Field #0` (`Tag = 0x19`, `WireSubMsg = 12`) encoding `self` to `dst`.
     ///
     /// `BTreeMap` stores keys in ascending order, producing deterministic wire output.
-    pub fn append_field0(&self, dst: &mut Vec<u8>) {
+    pub fn append_field0(&self, dst: &mut Vec<u8>) -> Result<()> {
+        let orig_len = dst.len();
         dst.push((WIRE_SUB_MSG << 1) | 1); // 0x19
         let len_pos = dst.len();
         dst.extend_from_slice(&[0, 0]);
-        self.append_body(dst);
+        if let Err(err) = self.append_body(dst, 1) {
+            dst.truncate(orig_len);
+            return Err(err);
+        }
         backpatch_container_len(dst, len_pos);
+        Ok(())
     }
 
     /// Encodes `Field #0` (`Tag = 0x19`, `WireSubMsg = 12`) into a new `Vec<u8>`.
-    pub fn encode_field0(&self) -> Vec<u8> {
+    pub fn encode_field0(&self) -> Result<Vec<u8>> {
         let mut dst = Vec::with_capacity(128);
-        self.append_field0(&mut dst);
-        dst
+        self.append_field0(&mut dst)?;
+        Ok(dst)
     }
 
-    fn append_body(&self, dst: &mut Vec<u8>) {
+    fn append_body(&self, dst: &mut Vec<u8>, depth: usize) -> Result<()> {
+        if depth > MAX_NESTING_DEPTH {
+            return Err(Error::DepthLimitExceeded(depth));
+        }
         // Field #1: type_name (WireString = 10 -> Tag 0x35)
         if !self.type_name.is_empty() {
             dst.push((((1 << 4) | WIRE_STRING) << 1) | 1);
@@ -44,11 +57,19 @@ impl SchemaMeta {
         }
         // Field #2: fields map<uint32, string> (WireMap = 14 -> Tag 0x5D)
         if !self.fields.is_empty() {
+            if depth + 1 > MAX_NESTING_DEPTH {
+                return Err(Error::DepthLimitExceeded(depth + 1));
+            }
             dst.push((((2 << 4) | WIRE_MAP) << 1) | 1);
             let len_pos = dst.len();
             dst.extend_from_slice(&[0, 0, WIRE_UINT, WIRE_STRING]);
             append_varint(dst, self.fields.len() as u64);
             for (&k, name) in &self.fields {
+                if !is_valid_schema_field_number(k) {
+                    return Err(Error::serialize(format!(
+                        "invalid SchemaMeta field number {k}"
+                    )));
+                }
                 append_varint(dst, u64::from(k));
                 append_varint(dst, name.len() as u64);
                 dst.extend_from_slice(name.as_bytes());
@@ -57,19 +78,28 @@ impl SchemaMeta {
         }
         // Field #3: children map<uint32, SchemaMeta> (WireMap = 14 -> Tag 0x7D)
         if !self.children.is_empty() {
+            if depth + 1 > MAX_NESTING_DEPTH {
+                return Err(Error::DepthLimitExceeded(depth + 1));
+            }
             dst.push((((3 << 4) | WIRE_MAP) << 1) | 1);
             let len_pos = dst.len();
             dst.extend_from_slice(&[0, 0, WIRE_UINT, WIRE_SUB_MSG]);
             append_varint(dst, self.children.len() as u64);
             for (&k, child) in &self.children {
+                if !is_valid_schema_field_number(k) {
+                    return Err(Error::serialize(format!(
+                        "invalid SchemaMeta child field number {k}"
+                    )));
+                }
                 append_varint(dst, u64::from(k));
                 let c_len_pos = dst.len();
                 dst.extend_from_slice(&[0, 0]);
-                child.append_body(dst);
+                child.append_body(dst, depth + 2)?;
                 backpatch_container_len(dst, c_len_pos);
             }
             backpatch_container_len(dst, len_pos);
         }
+        Ok(())
     }
 
     /// Merges `next` into `self` (later fields and children override or extend earlier ones).
@@ -485,9 +515,9 @@ mod tests {
 
         // Hand-craft a single Field #3 WireMap containing duplicate key `5` -> child_a then `5` -> child_b.
         let mut child_a_body = Vec::new();
-        child_a.append_body(&mut child_a_body);
+        child_a.append_body(&mut child_a_body, 1).unwrap();
         let mut child_b_body = Vec::new();
-        child_b.append_body(&mut child_b_body);
+        child_b.append_body(&mut child_b_body, 1).unwrap();
 
         let mut schema_body = Vec::new();
         schema_body.push((((3 << 4) | WIRE_MAP) << 1) | 1);
@@ -519,7 +549,7 @@ mod tests {
         ext_child.fields.insert(3, "merged_extra".to_owned());
         let mut ext_root = SchemaMeta::default();
         ext_root.children.insert(5, ext_child);
-        ext_root.append_field0(&mut pkt);
+        ext_root.append_field0(&mut pkt).unwrap();
 
         let merged = read_field0_schema_meta(&pkt).expect("valid merged Field #0");
         let merged5 = merged.children.get(&5).expect("child 5");

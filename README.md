@@ -18,7 +18,7 @@ Rust runtime, procedural derive macro, and Buf / Protobuf code generator impleme
 
 ## Feature Flags
 
-`omnibuf` enables `derive`, `buffa`, and `prost` by default. Disabling default features drops `syn`, `buffa`, and `prost`, compiling only the core Prefix-Varint wire primitives, `Field #0`, `opaque`, and `blind` modules for lightweight FFI or embedded targets.
+`omnibuf` enables `derive`, `buffa`, and `prost` by default. Disabling default features drops `syn`, `buffa`, and `prost`, compiling only the core Prefix-Varint wire primitives, `Field #0`, `opaque`, and `blind` modules with zero Protobuf dependencies (the crate requires `std`).
 
 ```toml
 # Default: #[derive(OmniBuf)] + buffa + prost
@@ -96,6 +96,8 @@ fn main() -> omnibuf::Result<()> {
     Ok(())
 }
 ```
+
+> **Untrusted network inputs:** `from_slice` leaves element and allocation budgets unbounded for trusted payloads. Pass `DecodeOptions::default_limits()` (or tighter caps) to `from_slice_with_options` for bytes arriving from untrusted peers.
 
 ### Code Generation with Buf
 

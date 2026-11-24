@@ -324,6 +324,43 @@ fn backpatch_container_len_4b_adjust(dst: &mut Vec<u8>, len_pos: usize, sub_len:
     }
 }
 
+/// Backpatches a 9-byte container length slot reserved at `dst[len_pos..len_pos + 9]`.
+///
+/// Payloads above `536_870_911` bytes patch in place; smaller payloads compact back
+/// to a 2-byte or 4-byte container length header.
+#[inline(always)]
+pub fn backpatch_container_len_9b(dst: &mut Vec<u8>, len_pos: usize) {
+    let Some(header_end) = len_pos.checked_add(9) else {
+        return;
+    };
+    let Some(sub_len) = dst.len().checked_sub(header_end) else {
+        return;
+    };
+    if sub_len > 536_870_911 {
+        dst[len_pos] = 0;
+        dst[len_pos + 1..header_end].copy_from_slice(&(sub_len as u64).to_le_bytes());
+    } else {
+        backpatch_container_len_9b_compact(dst, len_pos, sub_len);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn backpatch_container_len_9b_compact(dst: &mut Vec<u8>, len_pos: usize, sub_len: usize) {
+    let old_len = dst.len();
+    if sub_len <= 16_383 {
+        dst.copy_within(len_pos + 9..old_len, len_pos + 2);
+        dst.truncate(old_len - 7);
+        let u = ((sub_len as u16) << 2) | 2;
+        dst[len_pos..len_pos + 2].copy_from_slice(&u.to_le_bytes());
+    } else {
+        dst.copy_within(len_pos + 9..old_len, len_pos + 4);
+        dst.truncate(old_len - 5);
+        let u = ((sub_len as u32) << 3) | 4;
+        dst[len_pos..len_pos + 4].copy_from_slice(&u.to_le_bytes());
+    }
+}
+
 /// Fills a 1-byte reserved varint slot at `dst[pos]` and expands it if `value > 127`.
 #[inline]
 pub fn patch_reserved_varint(dst: &mut Vec<u8>, pos: usize, value: u64) {
@@ -400,7 +437,7 @@ pub(crate) fn is_valid_utf8(b: &[u8]) -> bool {
         }
         return is_valid_utf8_from(b, 0);
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     {
         use core::arch::aarch64::{vld1q_u8, vmaxvq_u8, vorrq_u8};
         if n <= 32 {
@@ -431,7 +468,7 @@ pub(crate) fn is_valid_utf8(b: &[u8]) -> bool {
         }
         is_valid_utf8_long_neon(b)
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
     {
         if n <= 32 {
             let w0 = u64::from_le_bytes(b[..8].try_into().unwrap());
@@ -447,7 +484,7 @@ pub(crate) fn is_valid_utf8(b: &[u8]) -> bool {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 #[inline(never)]
 fn is_valid_utf8_long_neon(b: &[u8]) -> bool {
     use core::arch::aarch64::{vld1q_u8, vmaxvq_u8, vorrq_u8};
@@ -484,7 +521,7 @@ fn is_valid_utf8_long_neon(b: &[u8]) -> bool {
     true
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
 #[inline(never)]
 fn is_valid_utf8_long_swar(b: &[u8]) -> bool {
     let n = b.len();

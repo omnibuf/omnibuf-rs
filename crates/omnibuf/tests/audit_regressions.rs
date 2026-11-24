@@ -97,7 +97,7 @@ fn rs_3_field0_schema_meta_enforces_max_alloc_bytes_against_heap_amplification()
     for i in 1..=200 {
         meta.fields.insert(i, "f".to_owned());
     }
-    let pkt = meta.encode_field0();
+    let pkt = meta.encode_field0().unwrap();
     assert!(
         pkt.len() < 1024,
         "expected compact wire packet < 1024 bytes, got {}",
