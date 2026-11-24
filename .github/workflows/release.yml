@@ -42,16 +42,18 @@ jobs:
             python3 - "$VERSION" <<'PY'
           import re, pathlib, sys
           ver = sys.argv[1]
-          p = pathlib.Path("Cargo.toml")
-          txt = p.read_text()
-          txt = re.sub(r'(?m)^version = "[^"]+"', f'version = "{ver}"', txt, count=1)
-          for dep in ("omnibuf", "omnibuf-derive", "protoc-gen-omnibuf-rs"):
-              txt = re.sub(
-                  rf'({re.escape(dep)}\s*=\s*\{{[^}}]*version\s*=\s*")[^"]+(")',
-                  rf'\g<1>{ver}\g<2>',
-                  txt,
-              )
-          p.write_text(txt)
+          for path_str in ("Cargo.toml", "crates/omnibuf-tonic/Cargo.toml"):
+              p = pathlib.Path(path_str)
+              txt = p.read_text()
+              if path_str == "Cargo.toml":
+                  txt = re.sub(r'(?m)^version = "[^"]+"', f'version = "{ver}"', txt, count=1)
+              for dep in ("omnibuf", "omnibuf-derive", "protoc-gen-omnibuf-rs"):
+                  txt = re.sub(
+                      rf'({re.escape(dep)}\s*=\s*\{{[^}}]*version\s*=\s*")[^"]+(")',
+                      rf'\g<1>{ver}\g<2>',
+                      txt,
+                  )
+              p.write_text(txt)
           PY
             cargo check --workspace
           fi
@@ -103,4 +105,15 @@ jobs:
           done
 
           publish_crate omnibuf
+
+          echo "Waiting for omnibuf v${VERSION} in crates.io sparse index..."
+          for attempt in $(seq 1 30); do
+            if curl -fsSL -H "User-Agent: omnibuf-release/0.1" "https://index.crates.io/om/ni/omnibuf" 2>/dev/null | grep -q "\"vers\":\"${VERSION}\""; then
+              echo "omnibuf v${VERSION} visible in sparse index."
+              break
+            fi
+            sleep 3
+          done
+
+          publish_crate omnibuf-tonic
           publish_crate protoc-gen-omnibuf-rs

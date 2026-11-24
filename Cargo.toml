@@ -3,13 +3,14 @@ resolver = "2"
 members = [
     "crates/omnibuf",
     "crates/omnibuf-derive",
+    "crates/omnibuf-tonic",
     "crates/protoc-gen-omnibuf-rs",
     "crates/conformance-rs",
     "crates/omnibuf-bench",
 ]
 
 [workspace.package]
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -18,9 +19,9 @@ repository = "https://github.com/omnibuf/omnibuf-rs"
 homepage = "https://omnibuf.com/rs"
 
 [workspace.dependencies]
-omnibuf = { path = "crates/omnibuf", version = "0.1.6" }
-omnibuf-derive = { path = "crates/omnibuf-derive", version = "0.1.6" }
-protoc-gen-omnibuf-rs = { path = "crates/protoc-gen-omnibuf-rs", version = "0.1.6" }
+omnibuf = { path = "crates/omnibuf", version = "0.1.7" }
+omnibuf-derive = { path = "crates/omnibuf-derive", version = "0.1.7" }
+protoc-gen-omnibuf-rs = { path = "crates/protoc-gen-omnibuf-rs", version = "0.1.7" }
 buffa = "0.9"
 buffa-build = "0.9"
 buffa-descriptor = { version = "0.9", features = ["reflect", "std"] }

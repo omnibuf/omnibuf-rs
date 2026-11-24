@@ -40,6 +40,17 @@ fn main() -> omnibuf::Result<()> {
 }
 ```
 
+## gRPC / tonic
+
+The detached `omnibuf-tonic` crate implements `tonic::codec::Codec`, `Encoder`, and `Decoder` (`OmniBufCodec<T, U>`) for compact (`"omnibuf"`) and self-describing (`"x-omnibuf"`) payloads while keeping the core `omnibuf` crate free of `tonic` dependencies.
+
+```rust
+use omnibuf_tonic::OmniBufCodec;
+
+let codec = OmniBufCodec::<PingRequest, PingResponse>::new();
+let self_describing = OmniBufCodec::<PingRequest, PingResponse>::self_describing();
+```
+
 ## Implementation
 
 - **Derive macro (`omnibuf-derive`):** `#[derive(OmniBuf)]` generates codecs for native Rust structs, `oneof` enums, `buffa` messages, and `prost` messages.

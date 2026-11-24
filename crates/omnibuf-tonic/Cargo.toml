@@ -1,0 +1,30 @@
+[package]
+name = "omnibuf-tonic"
+description = "Detached tonic gRPC codec implementation for OmniBuf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/omnibuf-tonic"
+readme = "../../README.md"
+keywords = ["serialization", "grpc", "tonic", "rpc", "omnibuf"]
+categories = ["encoding", "network-programming"]
+
+[dependencies]
+bytes = "1"
+omnibuf = { path = "../omnibuf", version = "0.1.7", default-features = false }
+tonic = { version = "0.13", default-features = false, features = ["codegen"] }
+
+[dev-dependencies]
+http = "1"
+omnibuf = { path = "../omnibuf", version = "0.1.7", default-features = false, features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.13", features = ["transport"] }
+tower = "0.5"
+
+[lints]
+workspace = true
