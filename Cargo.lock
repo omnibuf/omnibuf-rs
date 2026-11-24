@@ -164,7 +164,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "conformance-rs"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "buffa",
  "buffa-build",
@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "omnibuf"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "buffa",
  "buffa-descriptor",
@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "omnibuf-bench"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "buffa",
  "buffa-build",
@@ -533,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "omnibuf-derive"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -542,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "omnibuf-tonic"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "bytes",
  "http",
@@ -725,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "protoc-gen-omnibuf-rs"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "prost 0.14.6",
  "prost-types",
