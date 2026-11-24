@@ -780,29 +780,14 @@ pub mod codec {
         let tag = (u64::from(field_num) << 4) | u64::from(wire_type & 0x0F);
         if tag <= 127 {
             let b0 = ((tag as u8) << 1) | 1;
-            dst.reserve(3);
-            unsafe {
-                let len = dst.len();
-                let ptr = dst.as_mut_ptr().add(len);
-                *ptr = b0;
-                *ptr.add(1) = 0;
-                *ptr.add(2) = 0;
-                dst.set_len(len + 3);
-                len + 1
-            }
+            let len_pos = dst.len() + 1;
+            dst.extend_from_slice(&[b0, 0, 0]);
+            len_pos
         } else if tag <= 16_383 {
             let tb = (((tag as u16) << 2) | 2).to_le_bytes();
-            dst.reserve(4);
-            unsafe {
-                let len = dst.len();
-                let ptr = dst.as_mut_ptr().add(len);
-                *ptr = tb[0];
-                *ptr.add(1) = tb[1];
-                *ptr.add(2) = 0;
-                *ptr.add(3) = 0;
-                dst.set_len(len + 4);
-                len + 2
-            }
+            let len_pos = dst.len() + 2;
+            dst.extend_from_slice(&[tb[0], tb[1], 0, 0]);
+            len_pos
         } else {
             append_tag(dst, field_num, wire_type);
             let len_pos = dst.len();
@@ -816,27 +801,14 @@ pub mod codec {
         let tag = (u64::from(field_num) << 4) | u64::from(wire_type & 0x0F);
         if tag <= 127 {
             let b0 = ((tag as u8) << 1) | 1;
-            dst.reserve(5);
-            unsafe {
-                let len = dst.len();
-                let ptr = dst.as_mut_ptr().add(len);
-                *ptr = b0;
-                core::ptr::write_bytes(ptr.add(1), 0, 4);
-                dst.set_len(len + 5);
-                len + 1
-            }
+            let len_pos = dst.len() + 1;
+            dst.extend_from_slice(&[b0, 0, 0, 0, 0]);
+            len_pos
         } else if tag <= 16_383 {
             let tb = (((tag as u16) << 2) | 2).to_le_bytes();
-            dst.reserve(6);
-            unsafe {
-                let len = dst.len();
-                let ptr = dst.as_mut_ptr().add(len);
-                *ptr = tb[0];
-                *ptr.add(1) = tb[1];
-                core::ptr::write_bytes(ptr.add(2), 0, 4);
-                dst.set_len(len + 6);
-                len + 2
-            }
+            let len_pos = dst.len() + 2;
+            dst.extend_from_slice(&[tb[0], tb[1], 0, 0, 0, 0]);
+            len_pos
         } else {
             append_tag(dst, field_num, wire_type);
             let len_pos = dst.len();
@@ -849,6 +821,8 @@ pub mod codec {
     fn begin_tagged_array(dst: &mut Vec<u8>, field_num: u32, elem_wt: u8, count: usize) -> usize {
         let tag = (u64::from(field_num) << 4) | u64::from(WIRE_ARRAY);
         dst.reserve(9 + 3 + 9);
+        // SAFETY: `dst.reserve(21)` guarantees space for up to 9 tag bytes, 3 header bytes,
+        // and up to 9 count varint bytes; all written bytes are initialized before `set_len`.
         unsafe {
             let len = dst.len();
             let ptr = dst.as_mut_ptr().add(len);
@@ -872,6 +846,8 @@ pub mod codec {
     ) -> usize {
         let tag = (u64::from(field_num) << 4) | u64::from(WIRE_ARRAY);
         dst.reserve(9 + 5 + 9);
+        // SAFETY: `dst.reserve(23)` guarantees space for up to 9 tag bytes, 5 header bytes,
+        // and up to 9 count varint bytes; all written bytes are initialized before `set_len`.
         unsafe {
             let len = dst.len();
             let ptr = dst.as_mut_ptr().add(len);
@@ -894,6 +870,7 @@ pub mod codec {
     /// `ptr` must be valid for writes of at least 9 bytes.
     #[inline(always)]
     unsafe fn put_container_len_raw(ptr: *mut u8, sub_len: usize) -> usize {
+        // SAFETY: Caller guarantees `ptr` is valid for writes of at least 9 bytes.
         unsafe {
             if sub_len <= 16_383 {
                 let u = ((sub_len as u16) << 2) | 2;
@@ -1247,6 +1224,9 @@ pub mod codec {
             let tw = varint_len(tag);
             let exact = tw + lw + sub_len;
             dst.reserve(exact + 8);
+            // SAFETY: `dst.reserve(exact + 8)` guarantees at least `exact + 8` writable bytes
+            // at `start_len` (including 8 bytes of slack for the final `put_varint_raw` call),
+            // and the sequence writes exactly `exact` bytes before `set_len`.
             unsafe {
                 let start_len = dst.len();
                 let mut ptr = dst.as_mut_ptr().add(start_len);
@@ -1281,6 +1261,9 @@ pub mod codec {
         dst.reserve(exact.checked_add(8).expect("capacity overflow"));
         let start_len = dst.len();
         let len_pos = start_len + tw;
+        // SAFETY: `dst.reserve(exact + 8)` guarantees room for the header and expected payload;
+        // each loop iteration ensures at least 9 bytes remain in `dst.capacity()` before calling
+        // `put_varint_raw`, and `dst.set_len(written)` records the exact initialized byte count.
         unsafe {
             let mut ptr = dst.as_mut_ptr().add(start_len);
             ptr = ptr.add(put_varint_raw(ptr, tag));
@@ -2296,15 +2279,41 @@ pub mod codec {
         Ok(next_pos)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Key and value wire types for a `WireMap` container.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct MapWireTypes {
+        /// Wire type of each map key.
+        pub key: u8,
+        /// Wire type of each map value.
+        pub val: u8,
+    }
+
+    impl MapWireTypes {
+        /// Creates a new `(key, val)` wire-type pair.
+        #[inline]
+        pub const fn new(key: u8, val: u8) -> Self {
+            Self { key, val }
+        }
+    }
+
+    /// Cursor and validation context for decoding a `WireMap` field.
+    #[derive(Clone, Copy, Debug)]
+    pub struct MapReadCtx<'a> {
+        /// Full wire buffer being decoded.
+        pub data: &'a [u8],
+        /// Byte offset of the `WireMap` length prefix within `data`.
+        pub pos: usize,
+        /// Current container nesting depth.
+        pub depth: usize,
+        /// Expected key and value wire types.
+        pub wire_types: MapWireTypes,
+        /// Whether to clear the target map before inserting decoded entries.
+        pub reset: bool,
+    }
+
     pub fn read_hash_map_borrowed_field<'de, K, V, S, FK, FV>(
         map: &mut HashMap<K, V, S>,
-        data: &'de [u8],
-        pos: usize,
-        depth: usize,
-        exp_key_wt: u8,
-        exp_val_wt: u8,
-        reset: bool,
+        ctx: MapReadCtx<'de>,
         mut read_key: FK,
         mut read_val: FV,
     ) -> Result<usize>
@@ -2314,27 +2323,28 @@ pub mod codec {
         FK: FnMut(&'de [u8], usize) -> Result<(K, usize)>,
         FV: FnMut(&'de [u8], usize, usize) -> Result<(V, usize)>,
     {
-        if depth + 1 > MAX_NESTING_DEPTH {
-            return Err(Error::DepthLimitExceeded(depth + 1));
+        if ctx.depth + 1 > MAX_NESTING_DEPTH {
+            return Err(Error::DepthLimitExceeded(ctx.depth + 1));
         }
-        let (body, next_pos) = read_len_slice(data, pos, 3)?;
+        let (body, next_pos) = read_len_slice(ctx.data, ctx.pos, 3)?;
         let (key_wt, val_wt, count, mut p) =
             parse_map_header(body).ok_or_else(|| Error::parse("invalid WireMap header"))?;
-        if key_wt != exp_key_wt || val_wt != exp_val_wt {
+        if key_wt != ctx.wire_types.key || val_wt != ctx.wire_types.val {
             return Err(Error::parse(format!(
-                "WireMap header mismatch: expected ({exp_key_wt}, {exp_val_wt}), got ({key_wt}, {val_wt})"
+                "WireMap header mismatch: expected ({}, {}), got ({key_wt}, {val_wt})",
+                ctx.wire_types.key, ctx.wire_types.val
             )));
         }
         super::charge_typed_alloc(
             count.saturating_mul(core::mem::size_of::<(K, V)>().saturating_add(16)),
         )?;
-        if reset {
+        if ctx.reset {
             map.clear();
         }
         map.reserve(count.min(4096));
         for _ in 0..count {
             let (k, after_k) = read_key(body, p)?;
-            let (v, after_v) = read_val(body, after_k, depth + 1)?;
+            let (v, after_v) = read_val(body, after_k, ctx.depth + 1)?;
             map.insert(k, v);
             p = after_v;
         }
@@ -2349,12 +2359,10 @@ pub mod codec {
     // ========================================================================
 
     /// Encodes a `HashMap<K, V>` as a `WireMap` field, sorting keys via `Ord` when `deterministic` is `true`.
-    #[allow(clippy::too_many_arguments)]
     pub fn write_hash_map_field<K, V, S, FK, FV>(
         dst: &mut Vec<u8>,
         field_num: u32,
-        key_wt: u8,
-        val_wt: u8,
+        wire_types: MapWireTypes,
         map: &HashMap<K, V, S>,
         deterministic: bool,
         mut write_key: FK,
@@ -2374,9 +2382,9 @@ pub mod codec {
         let use_4b = min_body > 16_383;
         if use_4b {
             dst.reserve(min_body.saturating_add(24));
-            dst.extend_from_slice(&[0, 0, 0, 0, key_wt, val_wt]);
+            dst.extend_from_slice(&[0, 0, 0, 0, wire_types.key, wire_types.val]);
         } else {
-            dst.extend_from_slice(&[0, 0, key_wt, val_wt]);
+            dst.extend_from_slice(&[0, 0, wire_types.key, wire_types.val]);
         }
         append_varint(dst, count as u64);
         if deterministic && count > 1 {
@@ -2401,12 +2409,10 @@ pub mod codec {
     }
 
     /// Encodes a `BTreeMap<K, V>` as a `WireMap` field (keys are already in ascending `Ord` order).
-    #[allow(clippy::too_many_arguments)]
     pub fn write_btree_map_field<K, V, FK, FV>(
         dst: &mut Vec<u8>,
         field_num: u32,
-        key_wt: u8,
-        val_wt: u8,
+        wire_types: MapWireTypes,
         map: &BTreeMap<K, V>,
         deterministic: bool,
         mut write_key: FK,
@@ -2425,9 +2431,9 @@ pub mod codec {
         let use_4b = min_body > 16_383;
         if use_4b {
             dst.reserve(min_body.saturating_add(24));
-            dst.extend_from_slice(&[0, 0, 0, 0, key_wt, val_wt]);
+            dst.extend_from_slice(&[0, 0, 0, 0, wire_types.key, wire_types.val]);
         } else {
-            dst.extend_from_slice(&[0, 0, key_wt, val_wt]);
+            dst.extend_from_slice(&[0, 0, wire_types.key, wire_types.val]);
         }
         append_varint(dst, count as u64);
         for (k, v) in map {
@@ -2443,15 +2449,9 @@ pub mod codec {
     }
 
     /// Decodes a `WireMap` field into a `HashMap<K, V>`.
-    #[allow(clippy::too_many_arguments)]
     pub fn read_hash_map_field<K, V, S, FK, FV>(
         map: &mut HashMap<K, V, S>,
-        data: &[u8],
-        pos: usize,
-        depth: usize,
-        exp_key_wt: u8,
-        exp_val_wt: u8,
-        reset: bool,
+        ctx: MapReadCtx<'_>,
         mut read_key: FK,
         mut read_val: FV,
     ) -> Result<usize>
@@ -2461,27 +2461,28 @@ pub mod codec {
         FK: FnMut(&[u8], usize) -> Result<(K, usize)>,
         FV: FnMut(&[u8], usize, usize) -> Result<(V, usize)>,
     {
-        if depth + 1 > MAX_NESTING_DEPTH {
-            return Err(Error::DepthLimitExceeded(depth + 1));
+        if ctx.depth + 1 > MAX_NESTING_DEPTH {
+            return Err(Error::DepthLimitExceeded(ctx.depth + 1));
         }
-        let (body, next_pos) = read_len_slice(data, pos, 3)?;
+        let (body, next_pos) = read_len_slice(ctx.data, ctx.pos, 3)?;
         let (key_wt, val_wt, count, mut p) =
             parse_map_header(body).ok_or_else(|| Error::parse("invalid WireMap header"))?;
-        if key_wt != exp_key_wt || val_wt != exp_val_wt {
+        if key_wt != ctx.wire_types.key || val_wt != ctx.wire_types.val {
             return Err(Error::parse(format!(
-                "WireMap header mismatch: expected ({exp_key_wt}, {exp_val_wt}), got ({key_wt}, {val_wt})"
+                "WireMap header mismatch: expected ({}, {}), got ({key_wt}, {val_wt})",
+                ctx.wire_types.key, ctx.wire_types.val
             )));
         }
         super::charge_typed_alloc(
             count.saturating_mul(core::mem::size_of::<(K, V)>().saturating_add(16)),
         )?;
-        if reset {
+        if ctx.reset {
             map.clear();
         }
         map.reserve(count.min(4096));
         for _ in 0..count {
             let (k, after_k) = read_key(body, p)?;
-            let (v, after_v) = read_val(body, after_k, depth + 1)?;
+            let (v, after_v) = read_val(body, after_k, ctx.depth + 1)?;
             map.insert(k, v);
             p = after_v;
         }
@@ -2492,15 +2493,9 @@ pub mod codec {
     }
 
     /// Decodes a `WireMap` field into a `BTreeMap<K, V>`.
-    #[allow(clippy::too_many_arguments)]
     pub fn read_btree_map_field<K, V, FK, FV>(
         map: &mut BTreeMap<K, V>,
-        data: &[u8],
-        pos: usize,
-        depth: usize,
-        exp_key_wt: u8,
-        exp_val_wt: u8,
-        reset: bool,
+        ctx: MapReadCtx<'_>,
         mut read_key: FK,
         mut read_val: FV,
     ) -> Result<usize>
@@ -2509,26 +2504,27 @@ pub mod codec {
         FK: FnMut(&[u8], usize) -> Result<(K, usize)>,
         FV: FnMut(&[u8], usize, usize) -> Result<(V, usize)>,
     {
-        if depth + 1 > MAX_NESTING_DEPTH {
-            return Err(Error::DepthLimitExceeded(depth + 1));
+        if ctx.depth + 1 > MAX_NESTING_DEPTH {
+            return Err(Error::DepthLimitExceeded(ctx.depth + 1));
         }
-        let (body, next_pos) = read_len_slice(data, pos, 3)?;
+        let (body, next_pos) = read_len_slice(ctx.data, ctx.pos, 3)?;
         let (key_wt, val_wt, count, mut p) =
             parse_map_header(body).ok_or_else(|| Error::parse("invalid WireMap header"))?;
-        if key_wt != exp_key_wt || val_wt != exp_val_wt {
+        if key_wt != ctx.wire_types.key || val_wt != ctx.wire_types.val {
             return Err(Error::parse(format!(
-                "WireMap header mismatch: expected ({exp_key_wt}, {exp_val_wt}), got ({key_wt}, {val_wt})"
+                "WireMap header mismatch: expected ({}, {}), got ({key_wt}, {val_wt})",
+                ctx.wire_types.key, ctx.wire_types.val
             )));
         }
         super::charge_typed_alloc(
             count.saturating_mul(core::mem::size_of::<(K, V)>().saturating_add(16)),
         )?;
-        if reset {
+        if ctx.reset {
             map.clear();
         }
         for _ in 0..count {
             let (k, after_k) = read_key(body, p)?;
-            let (v, after_v) = read_val(body, after_k, depth + 1)?;
+            let (v, after_v) = read_val(body, after_k, ctx.depth + 1)?;
             map.insert(k, v);
             p = after_v;
         }
@@ -2539,11 +2535,9 @@ pub mod codec {
     }
 
     /// Encodes an untagged `WireMap` container inside a parent `WireArray` or `WireMap`.
-    #[allow(clippy::too_many_arguments)]
     pub fn write_hash_map_elem<K, V, S, FK, FV>(
         dst: &mut Vec<u8>,
-        key_wt: u8,
-        val_wt: u8,
+        wire_types: MapWireTypes,
         map: &HashMap<K, V, S>,
         deterministic: bool,
         mut write_key: FK,
@@ -2555,7 +2549,7 @@ pub mod codec {
         FV: FnMut(&mut Vec<u8>, &V, bool) -> Result<()>,
     {
         let len_pos = dst.len();
-        dst.extend_from_slice(&[0, 0, key_wt, val_wt]);
+        dst.extend_from_slice(&[0, 0, wire_types.key, wire_types.val]);
         append_varint(dst, map.len() as u64);
         if deterministic && map.len() > 1 {
             let mut entries: Vec<(&K, &V)> = map.iter().collect();
@@ -2593,12 +2587,13 @@ pub mod codec {
         let mut map = HashMap::default();
         let next_pos = read_hash_map_field(
             &mut map,
-            data,
-            pos,
-            depth,
-            exp_key_wt,
-            exp_val_wt,
-            false,
+            MapReadCtx {
+                data,
+                pos,
+                depth,
+                wire_types: MapWireTypes::new(exp_key_wt, exp_val_wt),
+                reset: false,
+            },
             &mut read_key,
             &mut read_val,
         )?;
@@ -2608,8 +2603,7 @@ pub mod codec {
     /// Encodes an untagged `BTreeMap<K, V>` container inside a parent `WireArray` or `WireMap`.
     pub fn write_btree_map_elem<K, V, FK, FV>(
         dst: &mut Vec<u8>,
-        key_wt: u8,
-        val_wt: u8,
+        wire_types: MapWireTypes,
         map: &BTreeMap<K, V>,
         deterministic: bool,
         mut write_key: FK,
@@ -2620,7 +2614,7 @@ pub mod codec {
         FV: FnMut(&mut Vec<u8>, &V, bool) -> Result<()>,
     {
         let len_pos = dst.len();
-        dst.extend_from_slice(&[0, 0, key_wt, val_wt]);
+        dst.extend_from_slice(&[0, 0, wire_types.key, wire_types.val]);
         append_varint(dst, map.len() as u64);
         for (k, v) in map {
             write_key(dst, k)?;
@@ -2648,12 +2642,13 @@ pub mod codec {
         let mut map = BTreeMap::new();
         let next_pos = read_btree_map_field(
             &mut map,
-            data,
-            pos,
-            depth,
-            exp_key_wt,
-            exp_val_wt,
-            false,
+            MapReadCtx {
+                data,
+                pos,
+                depth,
+                wire_types: MapWireTypes::new(exp_key_wt, exp_val_wt),
+                reset: false,
+            },
             &mut read_key,
             &mut read_val,
         )?;

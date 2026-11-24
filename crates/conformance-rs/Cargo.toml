@@ -23,3 +23,6 @@ prost-reflect.workspace = true
 buffa-build.workspace = true
 prost-build.workspace = true
 prost-reflect-build.workspace = true
+
+[lints]
+workspace = true

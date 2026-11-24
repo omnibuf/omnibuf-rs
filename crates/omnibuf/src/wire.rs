@@ -89,6 +89,7 @@ pub const fn container_len_width(sub_len: usize) -> usize {
 /// `ptr` must be valid for writes of at least 9 bytes.
 #[inline(always)]
 pub(crate) unsafe fn put_varint_raw(ptr: *mut u8, v: u64) -> usize {
+    // SAFETY: Caller guarantees `ptr` is valid for writes of at least 9 bytes.
     unsafe {
         if v <= 127 {
             *ptr = ((v as u8) << 1) | 1;
@@ -113,6 +114,8 @@ pub(crate) unsafe fn put_varint_raw(ptr: *mut u8, v: u64) -> usize {
 #[inline(always)]
 pub fn append_varint(dst: &mut Vec<u8>, v: u64) {
     dst.reserve(9);
+    // SAFETY: `dst.reserve(9)` guarantees at least 9 writable bytes at `dst.len()`,
+    // and `put_varint_raw` initializes `vn <= 9` bytes.
     unsafe {
         let len = dst.len();
         let vn = put_varint_raw(dst.as_mut_ptr().add(len), v);
@@ -134,6 +137,8 @@ pub fn write_varint_tagged<const N: usize>(dst: &mut Vec<u8>, tag: [u8; N], v: u
         assert!(N <= 16);
     }
     dst.reserve(N + 9);
+    // SAFETY: `dst.reserve(N + 9)` guarantees at least `N + 9` writable bytes at `dst.len()`;
+    // `tag` is a disjoint stack array of `N` bytes, and `put_varint_raw` initializes `vn <= 9` bytes.
     unsafe {
         let len = dst.len();
         let ptr = dst.as_mut_ptr().add(len);
@@ -169,6 +174,8 @@ pub fn write_fixed_tagged<const N: usize, const W: usize>(
         assert!(N <= 16 && W <= 16);
     }
     dst.reserve(N + W);
+    // SAFETY: `dst.reserve(N + W)` guarantees `N + W` writable bytes at `dst.len()`,
+    // and both stack arrays `tag` and `val` are disjoint from `dst`.
     unsafe {
         let len = dst.len();
         let ptr = dst.as_mut_ptr().add(len);
@@ -187,6 +194,8 @@ pub fn write_bytes_tagged<const N: usize>(dst: &mut Vec<u8>, tag: [u8; N], b: &[
     let blen = b.len();
     let needed = blen.checked_add(N + 9).expect("capacity overflow");
     dst.reserve(needed);
+    // SAFETY: `dst.reserve(N + 9 + blen)` guarantees enough writable bytes at `dst.len()`;
+    // `tag` and `b` are disjoint from `dst` (`&mut Vec<u8>` guarantees exclusive access).
     unsafe {
         let len = dst.len();
         let ptr = dst.as_mut_ptr().add(len);
@@ -203,6 +212,8 @@ pub fn append_bytes_elem(dst: &mut Vec<u8>, b: &[u8]) {
     let blen = b.len();
     let needed = blen.checked_add(9).expect("capacity overflow");
     dst.reserve(needed);
+    // SAFETY: `dst.reserve(9 + blen)` guarantees enough writable bytes at `dst.len()`;
+    // `b` is disjoint from `dst` (`&mut Vec<u8>` guarantees exclusive access).
     unsafe {
         let len = dst.len();
         let ptr = dst.as_mut_ptr().add(len);
@@ -414,15 +425,23 @@ pub(crate) fn is_valid_utf8(b: &[u8]) -> bool {
     if n <= 16 {
         if n >= 8 {
             // SAFETY: `n >= 8`, so both 0..8 and (n-8)..n are in bounds.
-            let lo = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) };
-            let hi = unsafe { core::ptr::read_unaligned(ptr.add(n - 8).cast::<u64>()) };
+            let (lo, hi) = unsafe {
+                (
+                    core::ptr::read_unaligned(ptr.cast::<u64>()),
+                    core::ptr::read_unaligned(ptr.add(n - 8).cast::<u64>()),
+                )
+            };
             if ((lo | hi) & 0x8080_8080_8080_8080) == 0 {
                 return true;
             }
         } else if n >= 4 {
             // SAFETY: `n >= 4`, so both 0..4 and (n-4)..n are in bounds.
-            let lo = unsafe { core::ptr::read_unaligned(ptr.cast::<u32>()) };
-            let hi = unsafe { core::ptr::read_unaligned(ptr.add(n - 4).cast::<u32>()) };
+            let (lo, hi) = unsafe {
+                (
+                    core::ptr::read_unaligned(ptr.cast::<u32>()),
+                    core::ptr::read_unaligned(ptr.add(n - 4).cast::<u32>()),
+                )
+            };
             if ((lo | hi) & 0x8080_8080) == 0 {
                 return true;
             }

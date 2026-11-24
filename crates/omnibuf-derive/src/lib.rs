@@ -1846,8 +1846,7 @@ fn gen_elem_writer_closure(krate: &syn::Path, shape: &ElemShape, depth_idx: usiz
                 |dst, #val_ident, #det_ident| {
                     #krate::codec::#fn_ident(
                         dst,
-                        #key_wt,
-                        #val_wt,
+                        #krate::codec::MapWireTypes::new(#key_wt, #val_wt),
                         #val_ident,
                         #det_ident,
                         |dst, #k_ident| {
@@ -2057,8 +2056,7 @@ fn gen_encode_field(krate: &syn::Path, cf: &CompiledField) -> TokenStream2 {
                 #krate::codec::#fn_ident(
                     dst,
                     #f_id,
-                    #key_wt,
-                    #val_wt,
+                    #krate::codec::MapWireTypes::new(#key_wt, #val_wt),
                     &self.#f_ident,
                     deterministic,
                     |dst, #k_ident| {
@@ -2621,12 +2619,13 @@ fn gen_fast_decode_stmt(krate: &syn::Path, cf: &CompiledField) -> Option<TokenSt
                     let pos = dec.position();
                     let next_pos = #krate::codec::#fn_ident(
                         &mut self.#f_ident,
-                        dec.data(),
-                        pos,
-                        depth,
-                        #key_wt,
-                        #val_wt,
-                        false,
+                        #krate::codec::MapReadCtx {
+                            data: dec.data(),
+                            pos,
+                            depth,
+                            wire_types: #krate::codec::MapWireTypes::new(#key_wt, #val_wt),
+                            reset: false,
+                        },
                         |b, p| #read_key,
                         #val_reader,
                     )?;
@@ -2862,12 +2861,13 @@ fn gen_decode_arm(krate: &syn::Path, cf: &CompiledField) -> TokenStream2 {
                     let pos = dec.position();
                     let next_pos = #krate::codec::#fn_ident(
                         &mut self.#f_ident,
-                        dec.data(),
-                        pos,
-                        depth,
-                        #key_wt,
-                        #val_wt,
-                        false,
+                        #krate::codec::MapReadCtx {
+                            data: dec.data(),
+                            pos,
+                            depth,
+                            wire_types: #krate::codec::MapWireTypes::new(#key_wt, #val_wt),
+                            reset: false,
+                        },
                         |b, p| #read_key,
                         #val_reader,
                     )?;

@@ -345,3 +345,27 @@ fn large_container_over_16kib_backpatch_bit_exact_equivalence() {
         ">16 KiB f8_sub_msg.label",
     );
 }
+
+#[derive(Debug, Default, PartialEq, OmniBuf)]
+struct Uint8ArrayMsg {
+    #[omnibuf(id = 1, wire = "uint")]
+    vals: Vec<u8>,
+}
+
+/// Encoding `Vec<u8>` (10,000 1-byte `u8` varint elements) via `write_varint_vec_field`
+/// must not blindly reserve `9 * count` (>90 KB) capacity for elements that take at most 2 bytes each.
+#[test]
+fn write_varint_vec_field_does_not_over_reserve_capacity() {
+    let msg = Uint8ArrayMsg {
+        vals: vec![1u8; 10_000],
+    };
+    let mut dst = Vec::new();
+    msg.encode_omnibuf_append(&mut dst, false).unwrap();
+
+    assert!(
+        dst.capacity() < 90_000,
+        "write_varint_vec_field over-reserved 9x capacity: capacity={} for encoded len={}",
+        dst.capacity(),
+        dst.len()
+    );
+}

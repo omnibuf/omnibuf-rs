@@ -27,3 +27,6 @@ prost.workspace = true
 prost-build.workspace = true
 prost-types.workspace = true
 protoc-gen-omnibuf-rs.workspace = true
+
+[lints]
+workspace = true

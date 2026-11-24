@@ -981,3 +981,112 @@ fn high_field_numbers_preserve_tags() {
         }
     }
 }
+
+#[derive(Clone, Debug, Default, PartialEq, OmniBuf)]
+struct InnerCell {
+    #[omnibuf(id = 1, name = "cell_tag")]
+    cell_tag: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, OmniBuf)]
+struct MatrixMsg {
+    #[omnibuf(id = 1, name = "grid")]
+    grid: Vec<Vec<InnerCell>>,
+}
+
+/// `#[derive(OmniBuf)]` struct with `Vec<Vec<InnerCell>>` encoded with
+/// `EncodeOptions::self_describing()` must include `InnerCell`'s `SchemaMeta` so `decode_blind`
+/// resolves `"cell_tag"` instead of falling back to `"field_1"`.
+#[test]
+fn derive_nested_vec_of_submsg_emits_child_schema_meta() {
+    let msg = MatrixMsg {
+        grid: vec![vec![InnerCell {
+            cell_tag: "alpha".to_owned(),
+        }]],
+    };
+    let pkt = to_vec_with_options(&msg, EncodeOptions::self_describing()).unwrap();
+    let json = decode_blind_json(&pkt).unwrap();
+
+    assert!(
+        json.contains("\"cell_tag\":\"alpha\""),
+        "decode_blind_json failed to resolve inner Vec<Vec<InnerCell>> field name: got {json}"
+    );
+}
+
+#[derive(Clone, Debug, PartialEq, OmniBuf)]
+enum RawKeywordOneof {
+    #[omnibuf(id = 1)]
+    r#Type(String),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, OmniBuf)]
+struct RawOneofHolder {
+    #[omnibuf(oneof, tags = "1")]
+    kind: Option<RawKeywordOneof>,
+}
+
+/// `#[derive(OmniBuf)]` oneof enum variant `r#Type(String)` must strip the `r#` raw-ident
+/// prefix before snake_casing so `SchemaMeta` records `"type"`, not `"r#_type"`.
+#[test]
+fn derive_oneof_raw_ident_strips_raw_prefix_in_schema_meta() {
+    use omnibuf::Message;
+
+    let meta = RawOneofHolder::schema_meta();
+    assert_eq!(
+        meta.fields.get(&1).map(String::as_str),
+        Some("type"),
+        "expected oneof variant `r#Type` schema field name to be \"type\", got {:?}",
+        meta.fields.get(&1)
+    );
+}
+
+#[derive(OmniBuf, Default, PartialEq, Debug)]
+struct ClearableLeaf {
+    #[omnibuf(id = 1)]
+    x: u32,
+    #[omnibuf(id = 2)]
+    label: String,
+}
+
+#[derive(OmniBuf, Default, PartialEq, Debug)]
+struct NonOptBoxHolder {
+    #[omnibuf(id = 1)]
+    leaf: Box<ClearableLeaf>,
+}
+
+/// `#[derive(OmniBuf)]` must dereference non-optional `Box<SubMsg>` in `clear_omnibuf`.
+#[test]
+fn derive_non_optional_boxed_submsg_clear_omnibuf() {
+    use omnibuf::Message;
+
+    let mut holder = NonOptBoxHolder {
+        leaf: Box::new(ClearableLeaf {
+            x: 99,
+            label: "populated".to_owned(),
+        }),
+    };
+    holder.clear_omnibuf();
+    assert_eq!(holder.leaf.x, 0);
+    assert!(holder.leaf.label.is_empty());
+
+    // Roundtrip and non-merging decode into a dirty holder also clears prior boxed sub-message state.
+    let populated = NonOptBoxHolder {
+        leaf: Box::new(ClearableLeaf {
+            x: 7,
+            label: "fresh".to_owned(),
+        }),
+    };
+    let wire = to_vec(&populated).unwrap();
+    let mut dirty = NonOptBoxHolder {
+        leaf: Box::new(ClearableLeaf {
+            x: 1234,
+            label: "stale".to_owned(),
+        }),
+    };
+    dirty.decode_omnibuf(&wire).unwrap();
+    assert_eq!(dirty, populated);
+
+    // Decoding an empty packet clears the boxed sub-message.
+    dirty.decode_omnibuf(&[]).unwrap();
+    assert_eq!(dirty, NonOptBoxHolder::default());
+}

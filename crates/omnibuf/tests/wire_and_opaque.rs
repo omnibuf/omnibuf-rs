@@ -431,3 +431,37 @@ fn fallible_opaque_splicers_and_field0_validation_reject_corrupt_packets() {
         .is_err()
     );
 }
+
+/// `Decoder::read_fixed32`/`read_fixed64` and `read_elem_fixed32`/`read_elem_fixed64`
+/// must return `Err` instead of overflowing when `pos` is near `usize::MAX`.
+#[test]
+fn fixed_readers_reject_position_overflow() {
+    let mut dec = Decoder::new(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    dec.set_position(usize::MAX - 2);
+    assert!(dec.read_fixed32().is_err());
+    assert!(dec.read_fixed64().is_err());
+
+    assert!(omnibuf::codec::read_elem_fixed32(&[0; 8], usize::MAX - 2).is_err());
+    assert!(omnibuf::codec::read_elem_fixed64(&[0; 8], usize::MAX - 4).is_err());
+}
+
+/// Public `parse_array_header_typed` must reject invalid `exp_elem_wt` values
+/// (`WIRE_BOOL_TRUE` or `> WIRE_EXTENDED`).
+#[test]
+fn parse_array_header_typed_rejects_invalid_exp_elem_wt() {
+    use omnibuf::wire::{WIRE_BOOL_FALSE, WIRE_EXTENDED, parse_array_header_typed};
+
+    assert_eq!(
+        parse_array_header_typed(&[WIRE_BOOL_TRUE, 0x01], WIRE_BOOL_TRUE),
+        None
+    );
+    assert_eq!(
+        parse_array_header_typed(&[WIRE_EXTENDED + 1, 0x01], WIRE_EXTENDED + 1),
+        None
+    );
+    assert_eq!(parse_array_header_typed(&[255, 0x01], 255), None);
+    assert_eq!(
+        parse_array_header_typed(&[WIRE_BOOL_FALSE, 0x01], WIRE_BOOL_FALSE),
+        Some((0, 2))
+    );
+}

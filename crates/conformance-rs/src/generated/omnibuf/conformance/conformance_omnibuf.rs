@@ -2081,8 +2081,7 @@ impl ::omnibuf::Message for TestAllTypes {
         ::omnibuf::codec::write_hash_map_field(
             dst,
             12,
-            10,
-            0,
+            ::omnibuf::codec::MapWireTypes::new(10, 0),
             &self.f12_map_str_uint,
             deterministic,
             |dst, k| {
@@ -2185,12 +2184,13 @@ impl ::omnibuf::Message for TestAllTypes {
             let pos = dec.position();
             let next_pos = ::omnibuf::codec::read_hash_map_field(
                 &mut self.f12_map_str_uint,
-                dec.data(),
-                pos,
-                depth,
-                10,
-                0,
-                false,
+                ::omnibuf::codec::MapReadCtx {
+                    data: dec.data(),
+                    pos,
+                    depth,
+                    wire_types: ::omnibuf::codec::MapWireTypes::new(10, 0),
+                    reset: false,
+                },
                 ::omnibuf::codec::read_elem_string,
                 |b, p, _d| ::omnibuf::codec::read_elem_uint(b, p),
             )?;
@@ -2302,12 +2302,13 @@ impl ::omnibuf::Message for TestAllTypes {
                         let pos = dec.position();
                         let next_pos = ::omnibuf::codec::read_hash_map_field(
                             &mut this.f12_map_str_uint,
-                            dec.data(),
-                            pos,
-                            depth,
-                            10,
-                            0,
-                            false,
+                            ::omnibuf::codec::MapReadCtx {
+                                data: dec.data(),
+                                pos,
+                                depth,
+                                wire_types: ::omnibuf::codec::MapWireTypes::new(10, 0),
+                                reset: false,
+                            },
                             ::omnibuf::codec::read_elem_string,
                             |b, p, _d| ::omnibuf::codec::read_elem_uint(b, p),
                         )?;
@@ -2743,12 +2744,13 @@ impl<'a> ::omnibuf::DecodeBorrowed<'a> for TestAllTypesBorrowed<'a> {
                     let pos = dec.position();
                     let next_pos = ::omnibuf::codec::read_hash_map_borrowed_field(
                         &mut self.f12_map_str_uint,
-                        dec.data(),
-                        pos,
-                        depth,
-                        10,
-                        0,
-                        false,
+                        ::omnibuf::codec::MapReadCtx {
+                            data: dec.data(),
+                            pos,
+                            depth,
+                            wire_types: ::omnibuf::codec::MapWireTypes::new(10, 0),
+                            reset: false,
+                        },
                         ::omnibuf::codec::read_elem_str_borrowed,
                         |b, p, _d| ::omnibuf::codec::read_elem_uint(b, p),
                     )?;
@@ -3431,8 +3433,7 @@ impl<'a> OpaqueTestAllTypes<'a> {
                     ::omnibuf::codec::write_hash_map_field(
                         dst,
                         12,
-                        10,
-                        0,
+                        ::omnibuf::codec::MapWireTypes::new(10, 0),
                         &self.dirty_state.as_deref().unwrap().f_f12_map_str_uint,
                         deterministic,
                         |dst, k| {
@@ -3598,8 +3599,7 @@ impl<'a> OpaqueTestAllTypes<'a> {
                     ::omnibuf::codec::write_hash_map_field(
                         dst,
                         12,
-                        10,
-                        0,
+                        ::omnibuf::codec::MapWireTypes::new(10, 0),
                         &self.dirty_state.as_deref().unwrap().f_f12_map_str_uint,
                         deterministic,
                         |dst, k| {

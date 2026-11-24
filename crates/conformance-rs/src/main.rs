@@ -1270,4 +1270,73 @@ mod buffa_integration_tests {
                 .is_err()
         );
     }
+
+    /// `OpaquePeerUpdate::marshal_append` and `try_marshal_append` must preserve an existing
+    /// framing prefix (`[0xDE, 0xAD, 0xBE, 0xEF]`) in `dst` both when `dirty == 0` and when `dirty != 0`.
+    #[test]
+    fn opaque_peer_update_marshal_append_preserves_framing_prefix() {
+        use crate::generated::peer_omnibuf;
+
+        let orig = peer_omnibuf::PeerUpdate {
+            asn: 64512,
+            router_id: "edge-fra-01".to_owned(),
+            sequence: 7,
+            active: true,
+            ..Default::default()
+        };
+        let raw = orig.marshal_omnibuf();
+        let prefix = [0xDE, 0xAD, 0xBE, 0xEF];
+
+        // 1. Clean (`dirty == 0`) marshal_append & try_marshal_append
+        let clean_view = peer_omnibuf::OpaquePeerUpdate::new(&raw);
+
+        let mut dst_clean = prefix.to_vec();
+        clean_view.marshal_append(&mut dst_clean);
+        assert!(
+            dst_clean.starts_with(&prefix),
+            "clean marshal_append wiped framing prefix: got {:?}",
+            &dst_clean[..dst_clean.len().min(8)]
+        );
+        assert_eq!(
+            peer_omnibuf::PeerUpdate::from_omnibuf(&dst_clean[4..]).unwrap(),
+            orig
+        );
+
+        let mut dst_try_clean = prefix.to_vec();
+        clean_view.try_marshal_append(&mut dst_try_clean).unwrap();
+        assert!(
+            dst_try_clean.starts_with(&prefix),
+            "clean try_marshal_append wiped framing prefix: got {:?}",
+            &dst_try_clean[..dst_try_clean.len().min(8)]
+        );
+        assert_eq!(
+            peer_omnibuf::PeerUpdate::from_omnibuf(&dst_try_clean[4..]).unwrap(),
+            orig
+        );
+
+        // 2. Dirty (`dirty != 0`) marshal_append & try_marshal_append
+        let mut dirty_view = peer_omnibuf::OpaquePeerUpdate::new(&raw);
+        dirty_view.set_sequence(42);
+
+        let mut dst_dirty = prefix.to_vec();
+        dirty_view.marshal_append(&mut dst_dirty);
+        assert!(
+            dst_dirty.starts_with(&prefix),
+            "dirty marshal_append wiped framing prefix: got {:?}",
+            &dst_dirty[..dst_dirty.len().min(8)]
+        );
+        let decoded_dirty = peer_omnibuf::PeerUpdate::from_omnibuf(&dst_dirty[4..]).unwrap();
+        assert_eq!(decoded_dirty.sequence, 42);
+
+        let mut dst_try_dirty = prefix.to_vec();
+        dirty_view.try_marshal_append(&mut dst_try_dirty).unwrap();
+        assert!(
+            dst_try_dirty.starts_with(&prefix),
+            "dirty try_marshal_append wiped framing prefix: got {:?}",
+            &dst_try_dirty[..dst_try_dirty.len().min(8)]
+        );
+        let decoded_try_dirty =
+            peer_omnibuf::PeerUpdate::from_omnibuf(&dst_try_dirty[4..]).unwrap();
+        assert_eq!(decoded_try_dirty.sequence, 42);
+    }
 }

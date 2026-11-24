@@ -1788,7 +1788,7 @@ fn emit_encode_stmt(code: &mut String, gf: &GenField, prefix: &str, fallible: bo
             };
             let _ = writeln!(
                 code,
-                "        ::omnibuf::codec::write_hash_map_field(dst, {fnum}, {kwt}, {vwt}, &{access}, deterministic, |dst, k| {{ {wk} ::core::result::Result::Ok(()) }}, |dst, v, det| {{ {wv} }}){q};"
+                "        ::omnibuf::codec::write_hash_map_field(dst, {fnum}, ::omnibuf::codec::MapWireTypes::new({kwt}, {vwt}), &{access}, deterministic, |dst, k| {{ {wk} ::core::result::Result::Ok(()) }}, |dst, v, det| {{ {wv} }}){q};"
             );
         }
     }
@@ -1903,7 +1903,7 @@ fn decode_field_body(gf: &GenField, recv: &str) -> (u8, String) {
             (
                 WIRE_MAP,
                 format!(
-                    "let pos = dec.position(); let next_pos = ::omnibuf::codec::read_hash_map_field(&mut {recv}.{fident}, dec.data(), pos, depth, {kwt}, {vwt}, false, {rk_arg}, {rv})?; dec.set_position(next_pos);"
+                    "let pos = dec.position(); let next_pos = ::omnibuf::codec::read_hash_map_field(&mut {recv}.{fident}, ::omnibuf::codec::MapReadCtx {{ data: dec.data(), pos, depth, wire_types: ::omnibuf::codec::MapWireTypes::new({kwt}, {vwt}), reset: false }}, {rk_arg}, {rv})?; dec.set_position(next_pos);"
                 ),
             )
         }
@@ -2091,7 +2091,7 @@ fn emit_decode_arm(code: &mut String, gf: &GenField) {
             };
             let _ = writeln!(
                 code,
-                "                {fnum} if wt == {WIRE_MAP} => {{ let pos = dec.position(); let next_pos = ::omnibuf::codec::read_hash_map_field(&mut self.{fident}, dec.data(), pos, depth, {kwt}, {vwt}, false, {rk_arg}, {rv})?; dec.set_position(next_pos); }}"
+                "                {fnum} if wt == {WIRE_MAP} => {{ let pos = dec.position(); let next_pos = ::omnibuf::codec::read_hash_map_field(&mut self.{fident}, ::omnibuf::codec::MapReadCtx {{ data: dec.data(), pos, depth, wire_types: ::omnibuf::codec::MapWireTypes::new({kwt}, {vwt}), reset: false }}, {rk_arg}, {rv})?; dec.set_position(next_pos); }}"
             );
         }
     }
@@ -2594,7 +2594,7 @@ fn emit_borrowed_decode_arm(code: &mut String, gf: &GenField) {
             };
             let _ = writeln!(
                 code,
-                "                {fnum} if wt == {WIRE_MAP} => {{ let pos = dec.position(); let next_pos = ::omnibuf::codec::read_hash_map_borrowed_field(&mut self.{fident}, dec.data(), pos, depth, {kwt}, {vwt}, false, {rk_arg}, {rv})?; dec.set_position(next_pos); }}"
+                "                {fnum} if wt == {WIRE_MAP} => {{ let pos = dec.position(); let next_pos = ::omnibuf::codec::read_hash_map_borrowed_field(&mut self.{fident}, ::omnibuf::codec::MapReadCtx {{ data: dec.data(), pos, depth, wire_types: ::omnibuf::codec::MapWireTypes::new({kwt}, {vwt}), reset: false }}, {rk_arg}, {rv})?; dec.set_position(next_pos); }}"
             );
         }
     }
