@@ -1,7 +1,4 @@
-//! Detached `tonic::codec::Codec` implementation for OmniBuf.
-//!
-//! Core `omnibuf` remains completely free of `tonic` dependencies; depend on
-//! `omnibuf-tonic` only in gRPC binaries or crates that use `tonic`.
+//! OmniBuf `tonic::codec::Codec` implementation for gRPC services (`application/grpc+omnibuf`).
 
 use std::marker::PhantomData;
 

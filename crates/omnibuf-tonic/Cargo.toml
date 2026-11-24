@@ -1,6 +1,6 @@
 [package]
 name = "omnibuf-tonic"
-description = "Detached tonic gRPC codec implementation for OmniBuf"
+description = "OmniBuf gRPC codec for tonic (application/grpc+omnibuf)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,7 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/omnibuf-tonic"
-readme = "../../README.md"
+readme = "README.md"
 keywords = ["serialization", "grpc", "tonic", "rpc", "omnibuf"]
 categories = ["encoding", "network-programming"]
 
