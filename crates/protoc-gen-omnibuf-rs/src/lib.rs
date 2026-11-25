@@ -1363,7 +1363,7 @@ fn emit_message_trait_impl(
                 let sub_ref = if *boxed { "&**__sub" } else { "__sub" };
                 let _ = writeln!(
                     child_code,
-                    "            if let ::core::option::Option::Some(ref __sub) = self.{fident} && let ::core::option::Option::Some(__c) = <{rust_type} as ::omnibuf::Message>::build_value_schema_meta({sub_ref}, depth + 2) {{ meta.children.insert({fnum}, __c); }}"
+                    "            if let ::core::option::Option::Some(__c) = self.{fident}.as_ref().and_then(|__sub| <{rust_type} as ::omnibuf::Message>::build_value_schema_meta({sub_ref}, depth + 2)) {{ meta.children.insert({fnum}, __c); }}"
                 );
             }
             GenFieldKind::SubMsgArr { rust_type, .. } => {
