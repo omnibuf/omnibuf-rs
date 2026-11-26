@@ -228,84 +228,28 @@ impl ::omnibuf::Message for ConformanceRequest {
         active: &mut ::std::collections::HashSet<::core::any::TypeId>,
         depth: usize,
     ) -> ::core::option::Option<::omnibuf::SchemaMeta> {
+        let _ = active;
         if depth >= ::omnibuf::MAX_NESTING_DEPTH {
             return ::core::option::Option::None;
         }
-        let type_id = ::core::any::TypeId::of::<Self>();
-        let mut meta = ::omnibuf::SchemaMeta {
+        ::core::option::Option::Some(::omnibuf::SchemaMeta {
             type_name: ::std::string::String::from("ConformanceRequest"),
-            fields: ::std::collections::BTreeMap::new(),
+            fields: [
+                (1u32, "test_name"),
+                (2u32, "message_type"),
+                (3u32, "tier"),
+                (4u32, "requested_output_format"),
+                (5u32, "omnibuf_payload"),
+                (6u32, "json_payload"),
+                (7u32, "self_describing"),
+                (8u32, "test_opaque_splice"),
+                (9u32, "test_opaque_splice_shrink"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k, ::std::string::String::from(v)))
+            .collect(),
             children: ::std::collections::BTreeMap::new(),
-        };
-        meta.fields
-            .insert(1, ::std::string::String::from("test_name"));
-        meta.fields
-            .insert(2, ::std::string::String::from("message_type"));
-        meta.fields.insert(3, ::std::string::String::from("tier"));
-        meta.fields
-            .insert(4, ::std::string::String::from("requested_output_format"));
-        meta.fields
-            .insert(5, ::std::string::String::from("omnibuf_payload"));
-        meta.fields
-            .insert(6, ::std::string::String::from("json_payload"));
-        meta.fields
-            .insert(7, ::std::string::String::from("self_describing"));
-        meta.fields
-            .insert(8, ::std::string::String::from("test_opaque_splice"));
-        meta.fields
-            .insert(9, ::std::string::String::from("test_opaque_splice_shrink"));
-        if !active.insert(type_id) {
-            return ::core::option::Option::Some(meta);
-        }
-        active.remove(&type_id);
-        ::core::option::Option::Some(meta)
-    }
-
-    fn is_schema_cyclic(
-        active: &mut ::std::collections::HashSet<::core::any::TypeId>,
-        depth: usize,
-    ) -> bool {
-        if depth >= ::omnibuf::MAX_NESTING_DEPTH {
-            return false;
-        }
-        let type_id = ::core::any::TypeId::of::<Self>();
-        if !active.insert(type_id) {
-            return true;
-        }
-        active.remove(&type_id);
-        false
-    }
-
-    fn build_value_schema_meta(
-        &self,
-        depth: usize,
-    ) -> ::core::option::Option<::omnibuf::SchemaMeta> {
-        if depth >= ::omnibuf::MAX_NESTING_DEPTH {
-            return ::core::option::Option::None;
-        }
-        let mut meta = ::omnibuf::SchemaMeta {
-            type_name: ::std::string::String::from("ConformanceRequest"),
-            fields: ::std::collections::BTreeMap::new(),
-            children: ::std::collections::BTreeMap::new(),
-        };
-        meta.fields
-            .insert(1, ::std::string::String::from("test_name"));
-        meta.fields
-            .insert(2, ::std::string::String::from("message_type"));
-        meta.fields.insert(3, ::std::string::String::from("tier"));
-        meta.fields
-            .insert(4, ::std::string::String::from("requested_output_format"));
-        meta.fields
-            .insert(5, ::std::string::String::from("omnibuf_payload"));
-        meta.fields
-            .insert(6, ::std::string::String::from("json_payload"));
-        meta.fields
-            .insert(7, ::std::string::String::from("self_describing"));
-        meta.fields
-            .insert(8, ::std::string::String::from("test_opaque_splice"));
-        meta.fields
-            .insert(9, ::std::string::String::from("test_opaque_splice_shrink"));
-        ::core::option::Option::Some(meta)
+        })
     }
 }
 
@@ -388,19 +332,6 @@ impl<'a> ::omnibuf::DecodeBorrowed<'a> for ConformanceRequestBorrowed<'a> {
             }
         }
         ::core::result::Result::Ok(())
-    }
-
-    #[inline]
-    fn clear_omnibuf_borrowed(&mut self) {
-        self.test_name = "";
-        self.message_type = "";
-        self.tier = ::core::default::Default::default();
-        self.requested_output_format = ::core::default::Default::default();
-        self.omnibuf_payload = &[];
-        self.json_payload = "";
-        self.self_describing = ::core::default::Default::default();
-        self.test_opaque_splice = ::core::default::Default::default();
-        self.test_opaque_splice_shrink = ::core::default::Default::default();
     }
 }
 
@@ -640,6 +571,49 @@ impl<'a> OpaqueConformanceRequest<'a> {
     }
 
     #[inline]
+    fn write_dirty_field(&self, dst: &mut ::std::vec::Vec<u8>, fnum: u16) {
+        let deterministic = true;
+        let _ = deterministic;
+        let ::core::option::Option::Some(__dirty) = self.dirty_state.as_deref() else {
+            return;
+        };
+        match fnum {
+            1 => {
+                ::omnibuf::codec::write_string_field(dst, 1, __dirty.f_test_name.as_str());
+            }
+            2 => {
+                ::omnibuf::codec::write_string_field(dst, 2, __dirty.f_message_type.as_str());
+            }
+            3 => {
+                ::omnibuf::codec::write_sint_field(dst, 3, i64::from(__dirty.f_tier));
+            }
+            4 => {
+                ::omnibuf::codec::write_sint_field(
+                    dst,
+                    4,
+                    i64::from(__dirty.f_requested_output_format),
+                );
+            }
+            5 => {
+                ::omnibuf::codec::write_bytes_field(dst, 5, __dirty.f_omnibuf_payload.as_slice());
+            }
+            6 => {
+                ::omnibuf::codec::write_string_field(dst, 6, __dirty.f_json_payload.as_str());
+            }
+            7 => {
+                ::omnibuf::codec::write_bool_field(dst, 7, __dirty.f_self_describing);
+            }
+            8 => {
+                ::omnibuf::codec::write_bool_field(dst, 8, __dirty.f_test_opaque_splice);
+            }
+            9 => {
+                ::omnibuf::codec::write_bool_field(dst, 9, __dirty.f_test_opaque_splice_shrink);
+            }
+            _ => {}
+        }
+    }
+
+    #[inline]
     pub fn marshal(&self) -> ::std::vec::Vec<u8> {
         let mut dst = ::std::vec::Vec::with_capacity(self.raw.len() + 32);
         self.marshal_append(&mut dst);
@@ -652,86 +626,7 @@ impl<'a> OpaqueConformanceRequest<'a> {
             return;
         }
         ::omnibuf::opaque::splice_fields(dst, &self.raw, self.dirty, 9, |dst, fnum| {
-            let deterministic = true;
-            let _ = deterministic;
-            match fnum {
-                1 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        1,
-                        self.dirty_state.as_deref().unwrap().f_test_name.as_str(),
-                    );
-                }
-                2 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        2,
-                        self.dirty_state.as_deref().unwrap().f_message_type.as_str(),
-                    );
-                }
-                3 => {
-                    ::omnibuf::codec::write_sint_field(
-                        dst,
-                        3,
-                        i64::from(self.dirty_state.as_deref().unwrap().f_tier),
-                    );
-                }
-                4 => {
-                    ::omnibuf::codec::write_sint_field(
-                        dst,
-                        4,
-                        i64::from(
-                            self.dirty_state
-                                .as_deref()
-                                .unwrap()
-                                .f_requested_output_format,
-                        ),
-                    );
-                }
-                5 => {
-                    ::omnibuf::codec::write_bytes_field(
-                        dst,
-                        5,
-                        self.dirty_state
-                            .as_deref()
-                            .unwrap()
-                            .f_omnibuf_payload
-                            .as_slice(),
-                    );
-                }
-                6 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        6,
-                        self.dirty_state.as_deref().unwrap().f_json_payload.as_str(),
-                    );
-                }
-                7 => {
-                    ::omnibuf::codec::write_bool_field(
-                        dst,
-                        7,
-                        self.dirty_state.as_deref().unwrap().f_self_describing,
-                    );
-                }
-                8 => {
-                    ::omnibuf::codec::write_bool_field(
-                        dst,
-                        8,
-                        self.dirty_state.as_deref().unwrap().f_test_opaque_splice,
-                    );
-                }
-                9 => {
-                    ::omnibuf::codec::write_bool_field(
-                        dst,
-                        9,
-                        self.dirty_state
-                            .as_deref()
-                            .unwrap()
-                            .f_test_opaque_splice_shrink,
-                    );
-                }
-                _ => {}
-            }
+            self.write_dirty_field(dst, fnum)
         });
     }
 
@@ -747,86 +642,7 @@ impl<'a> OpaqueConformanceRequest<'a> {
             return ::omnibuf::opaque::try_append_packet(dst, &self.raw);
         }
         ::omnibuf::opaque::try_splice_fields(dst, &self.raw, self.dirty, 9, |dst, fnum| {
-            let deterministic = true;
-            let _ = deterministic;
-            match fnum {
-                1 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        1,
-                        self.dirty_state.as_deref().unwrap().f_test_name.as_str(),
-                    );
-                }
-                2 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        2,
-                        self.dirty_state.as_deref().unwrap().f_message_type.as_str(),
-                    );
-                }
-                3 => {
-                    ::omnibuf::codec::write_sint_field(
-                        dst,
-                        3,
-                        i64::from(self.dirty_state.as_deref().unwrap().f_tier),
-                    );
-                }
-                4 => {
-                    ::omnibuf::codec::write_sint_field(
-                        dst,
-                        4,
-                        i64::from(
-                            self.dirty_state
-                                .as_deref()
-                                .unwrap()
-                                .f_requested_output_format,
-                        ),
-                    );
-                }
-                5 => {
-                    ::omnibuf::codec::write_bytes_field(
-                        dst,
-                        5,
-                        self.dirty_state
-                            .as_deref()
-                            .unwrap()
-                            .f_omnibuf_payload
-                            .as_slice(),
-                    );
-                }
-                6 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        6,
-                        self.dirty_state.as_deref().unwrap().f_json_payload.as_str(),
-                    );
-                }
-                7 => {
-                    ::omnibuf::codec::write_bool_field(
-                        dst,
-                        7,
-                        self.dirty_state.as_deref().unwrap().f_self_describing,
-                    );
-                }
-                8 => {
-                    ::omnibuf::codec::write_bool_field(
-                        dst,
-                        8,
-                        self.dirty_state.as_deref().unwrap().f_test_opaque_splice,
-                    );
-                }
-                9 => {
-                    ::omnibuf::codec::write_bool_field(
-                        dst,
-                        9,
-                        self.dirty_state
-                            .as_deref()
-                            .unwrap()
-                            .f_test_opaque_splice_shrink,
-                    );
-                }
-                _ => {}
-            }
+            self.write_dirty_field(dst, fnum)
         })
     }
 
@@ -1018,74 +834,25 @@ impl ::omnibuf::Message for ConformanceResponse {
         active: &mut ::std::collections::HashSet<::core::any::TypeId>,
         depth: usize,
     ) -> ::core::option::Option<::omnibuf::SchemaMeta> {
+        let _ = active;
         if depth >= ::omnibuf::MAX_NESTING_DEPTH {
             return ::core::option::Option::None;
         }
-        let type_id = ::core::any::TypeId::of::<Self>();
-        let mut meta = ::omnibuf::SchemaMeta {
+        ::core::option::Option::Some(::omnibuf::SchemaMeta {
             type_name: ::std::string::String::from("ConformanceResponse"),
-            fields: ::std::collections::BTreeMap::new(),
+            fields: [
+                (1u32, "parse_error"),
+                (2u32, "serialize_error"),
+                (3u32, "runtime_error"),
+                (4u32, "skipped"),
+                (5u32, "omnibuf_payload"),
+                (6u32, "json_payload"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k, ::std::string::String::from(v)))
+            .collect(),
             children: ::std::collections::BTreeMap::new(),
-        };
-        meta.fields
-            .insert(1, ::std::string::String::from("parse_error"));
-        meta.fields
-            .insert(2, ::std::string::String::from("serialize_error"));
-        meta.fields
-            .insert(3, ::std::string::String::from("runtime_error"));
-        meta.fields
-            .insert(4, ::std::string::String::from("skipped"));
-        meta.fields
-            .insert(5, ::std::string::String::from("omnibuf_payload"));
-        meta.fields
-            .insert(6, ::std::string::String::from("json_payload"));
-        if !active.insert(type_id) {
-            return ::core::option::Option::Some(meta);
-        }
-        active.remove(&type_id);
-        ::core::option::Option::Some(meta)
-    }
-
-    fn is_schema_cyclic(
-        active: &mut ::std::collections::HashSet<::core::any::TypeId>,
-        depth: usize,
-    ) -> bool {
-        if depth >= ::omnibuf::MAX_NESTING_DEPTH {
-            return false;
-        }
-        let type_id = ::core::any::TypeId::of::<Self>();
-        if !active.insert(type_id) {
-            return true;
-        }
-        active.remove(&type_id);
-        false
-    }
-
-    fn build_value_schema_meta(
-        &self,
-        depth: usize,
-    ) -> ::core::option::Option<::omnibuf::SchemaMeta> {
-        if depth >= ::omnibuf::MAX_NESTING_DEPTH {
-            return ::core::option::Option::None;
-        }
-        let mut meta = ::omnibuf::SchemaMeta {
-            type_name: ::std::string::String::from("ConformanceResponse"),
-            fields: ::std::collections::BTreeMap::new(),
-            children: ::std::collections::BTreeMap::new(),
-        };
-        meta.fields
-            .insert(1, ::std::string::String::from("parse_error"));
-        meta.fields
-            .insert(2, ::std::string::String::from("serialize_error"));
-        meta.fields
-            .insert(3, ::std::string::String::from("runtime_error"));
-        meta.fields
-            .insert(4, ::std::string::String::from("skipped"));
-        meta.fields
-            .insert(5, ::std::string::String::from("omnibuf_payload"));
-        meta.fields
-            .insert(6, ::std::string::String::from("json_payload"));
-        ::core::option::Option::Some(meta)
+        })
     }
 }
 
@@ -1150,16 +917,6 @@ impl<'a> ::omnibuf::DecodeBorrowed<'a> for ConformanceResponseBorrowed<'a> {
             }
         }
         ::core::result::Result::Ok(())
-    }
-
-    #[inline]
-    fn clear_omnibuf_borrowed(&mut self) {
-        self.parse_error = "";
-        self.serialize_error = "";
-        self.runtime_error = "";
-        self.skipped = "";
-        self.omnibuf_payload = &[];
-        self.json_payload = "";
     }
 }
 
@@ -1342,6 +1099,36 @@ impl<'a> OpaqueConformanceResponse<'a> {
     }
 
     #[inline]
+    fn write_dirty_field(&self, dst: &mut ::std::vec::Vec<u8>, fnum: u16) {
+        let deterministic = true;
+        let _ = deterministic;
+        let ::core::option::Option::Some(__dirty) = self.dirty_state.as_deref() else {
+            return;
+        };
+        match fnum {
+            1 => {
+                ::omnibuf::codec::write_string_field(dst, 1, __dirty.f_parse_error.as_str());
+            }
+            2 => {
+                ::omnibuf::codec::write_string_field(dst, 2, __dirty.f_serialize_error.as_str());
+            }
+            3 => {
+                ::omnibuf::codec::write_string_field(dst, 3, __dirty.f_runtime_error.as_str());
+            }
+            4 => {
+                ::omnibuf::codec::write_string_field(dst, 4, __dirty.f_skipped.as_str());
+            }
+            5 => {
+                ::omnibuf::codec::write_bytes_field(dst, 5, __dirty.f_omnibuf_payload.as_slice());
+            }
+            6 => {
+                ::omnibuf::codec::write_string_field(dst, 6, __dirty.f_json_payload.as_str());
+            }
+            _ => {}
+        }
+    }
+
+    #[inline]
     pub fn marshal(&self) -> ::std::vec::Vec<u8> {
         let mut dst = ::std::vec::Vec::with_capacity(self.raw.len() + 32);
         self.marshal_append(&mut dst);
@@ -1354,65 +1141,7 @@ impl<'a> OpaqueConformanceResponse<'a> {
             return;
         }
         ::omnibuf::opaque::splice_fields(dst, &self.raw, self.dirty, 6, |dst, fnum| {
-            let deterministic = true;
-            let _ = deterministic;
-            match fnum {
-                1 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        1,
-                        self.dirty_state.as_deref().unwrap().f_parse_error.as_str(),
-                    );
-                }
-                2 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        2,
-                        self.dirty_state
-                            .as_deref()
-                            .unwrap()
-                            .f_serialize_error
-                            .as_str(),
-                    );
-                }
-                3 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        3,
-                        self.dirty_state
-                            .as_deref()
-                            .unwrap()
-                            .f_runtime_error
-                            .as_str(),
-                    );
-                }
-                4 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        4,
-                        self.dirty_state.as_deref().unwrap().f_skipped.as_str(),
-                    );
-                }
-                5 => {
-                    ::omnibuf::codec::write_bytes_field(
-                        dst,
-                        5,
-                        self.dirty_state
-                            .as_deref()
-                            .unwrap()
-                            .f_omnibuf_payload
-                            .as_slice(),
-                    );
-                }
-                6 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        6,
-                        self.dirty_state.as_deref().unwrap().f_json_payload.as_str(),
-                    );
-                }
-                _ => {}
-            }
+            self.write_dirty_field(dst, fnum)
         });
     }
 
@@ -1428,65 +1157,7 @@ impl<'a> OpaqueConformanceResponse<'a> {
             return ::omnibuf::opaque::try_append_packet(dst, &self.raw);
         }
         ::omnibuf::opaque::try_splice_fields(dst, &self.raw, self.dirty, 6, |dst, fnum| {
-            let deterministic = true;
-            let _ = deterministic;
-            match fnum {
-                1 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        1,
-                        self.dirty_state.as_deref().unwrap().f_parse_error.as_str(),
-                    );
-                }
-                2 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        2,
-                        self.dirty_state
-                            .as_deref()
-                            .unwrap()
-                            .f_serialize_error
-                            .as_str(),
-                    );
-                }
-                3 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        3,
-                        self.dirty_state
-                            .as_deref()
-                            .unwrap()
-                            .f_runtime_error
-                            .as_str(),
-                    );
-                }
-                4 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        4,
-                        self.dirty_state.as_deref().unwrap().f_skipped.as_str(),
-                    );
-                }
-                5 => {
-                    ::omnibuf::codec::write_bytes_field(
-                        dst,
-                        5,
-                        self.dirty_state
-                            .as_deref()
-                            .unwrap()
-                            .f_omnibuf_payload
-                            .as_slice(),
-                    );
-                }
-                6 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        6,
-                        self.dirty_state.as_deref().unwrap().f_json_payload.as_str(),
-                    );
-                }
-                _ => {}
-            }
+            self.write_dirty_field(dst, fnum)
         })
     }
 
@@ -1636,58 +1307,23 @@ impl ::omnibuf::Message for AllTypesSubMsg {
         active: &mut ::std::collections::HashSet<::core::any::TypeId>,
         depth: usize,
     ) -> ::core::option::Option<::omnibuf::SchemaMeta> {
+        let _ = active;
         if depth >= ::omnibuf::MAX_NESTING_DEPTH {
             return ::core::option::Option::None;
         }
-        let type_id = ::core::any::TypeId::of::<Self>();
-        let mut meta = ::omnibuf::SchemaMeta {
+        ::core::option::Option::Some(::omnibuf::SchemaMeta {
             type_name: ::std::string::String::from("AllTypesSubMsg"),
-            fields: ::std::collections::BTreeMap::new(),
+            fields: [
+                (1u32, "id"),
+                (2u32, "label"),
+                (3u32, "flag"),
+                (4u32, "score"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k, ::std::string::String::from(v)))
+            .collect(),
             children: ::std::collections::BTreeMap::new(),
-        };
-        meta.fields.insert(1, ::std::string::String::from("id"));
-        meta.fields.insert(2, ::std::string::String::from("label"));
-        meta.fields.insert(3, ::std::string::String::from("flag"));
-        meta.fields.insert(4, ::std::string::String::from("score"));
-        if !active.insert(type_id) {
-            return ::core::option::Option::Some(meta);
-        }
-        active.remove(&type_id);
-        ::core::option::Option::Some(meta)
-    }
-
-    fn is_schema_cyclic(
-        active: &mut ::std::collections::HashSet<::core::any::TypeId>,
-        depth: usize,
-    ) -> bool {
-        if depth >= ::omnibuf::MAX_NESTING_DEPTH {
-            return false;
-        }
-        let type_id = ::core::any::TypeId::of::<Self>();
-        if !active.insert(type_id) {
-            return true;
-        }
-        active.remove(&type_id);
-        false
-    }
-
-    fn build_value_schema_meta(
-        &self,
-        depth: usize,
-    ) -> ::core::option::Option<::omnibuf::SchemaMeta> {
-        if depth >= ::omnibuf::MAX_NESTING_DEPTH {
-            return ::core::option::Option::None;
-        }
-        let mut meta = ::omnibuf::SchemaMeta {
-            type_name: ::std::string::String::from("AllTypesSubMsg"),
-            fields: ::std::collections::BTreeMap::new(),
-            children: ::std::collections::BTreeMap::new(),
-        };
-        meta.fields.insert(1, ::std::string::String::from("id"));
-        meta.fields.insert(2, ::std::string::String::from("label"));
-        meta.fields.insert(3, ::std::string::String::from("flag"));
-        meta.fields.insert(4, ::std::string::String::from("score"));
-        ::core::option::Option::Some(meta)
+        })
     }
 }
 
@@ -1746,14 +1382,6 @@ impl<'a> ::omnibuf::DecodeBorrowed<'a> for AllTypesSubMsgBorrowed<'a> {
             }
         }
         ::core::result::Result::Ok(())
-    }
-
-    #[inline]
-    fn clear_omnibuf_borrowed(&mut self) {
-        self.id = ::core::default::Default::default();
-        self.label = "";
-        self.flag = ::core::default::Default::default();
-        self.score = ::core::default::Default::default();
     }
 }
 
@@ -1902,6 +1530,30 @@ impl<'a> OpaqueAllTypesSubMsg<'a> {
     }
 
     #[inline]
+    fn write_dirty_field(&self, dst: &mut ::std::vec::Vec<u8>, fnum: u16) {
+        let deterministic = true;
+        let _ = deterministic;
+        let ::core::option::Option::Some(__dirty) = self.dirty_state.as_deref() else {
+            return;
+        };
+        match fnum {
+            1 => {
+                ::omnibuf::codec::write_uint_field(dst, 1, u64::from(__dirty.f_id));
+            }
+            2 => {
+                ::omnibuf::codec::write_string_field(dst, 2, __dirty.f_label.as_str());
+            }
+            3 => {
+                ::omnibuf::codec::write_bool_field(dst, 3, __dirty.f_flag);
+            }
+            4 => {
+                ::omnibuf::codec::write_sint_field(dst, 4, __dirty.f_score);
+            }
+            _ => {}
+        }
+    }
+
+    #[inline]
     pub fn marshal(&self) -> ::std::vec::Vec<u8> {
         let mut dst = ::std::vec::Vec::with_capacity(self.raw.len() + 32);
         self.marshal_append(&mut dst);
@@ -1914,39 +1566,7 @@ impl<'a> OpaqueAllTypesSubMsg<'a> {
             return;
         }
         ::omnibuf::opaque::splice_fields(dst, &self.raw, self.dirty, 4, |dst, fnum| {
-            let deterministic = true;
-            let _ = deterministic;
-            match fnum {
-                1 => {
-                    ::omnibuf::codec::write_uint_field(
-                        dst,
-                        1,
-                        u64::from(self.dirty_state.as_deref().unwrap().f_id),
-                    );
-                }
-                2 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        2,
-                        self.dirty_state.as_deref().unwrap().f_label.as_str(),
-                    );
-                }
-                3 => {
-                    ::omnibuf::codec::write_bool_field(
-                        dst,
-                        3,
-                        self.dirty_state.as_deref().unwrap().f_flag,
-                    );
-                }
-                4 => {
-                    ::omnibuf::codec::write_sint_field(
-                        dst,
-                        4,
-                        self.dirty_state.as_deref().unwrap().f_score,
-                    );
-                }
-                _ => {}
-            }
+            self.write_dirty_field(dst, fnum)
         });
     }
 
@@ -1962,39 +1582,7 @@ impl<'a> OpaqueAllTypesSubMsg<'a> {
             return ::omnibuf::opaque::try_append_packet(dst, &self.raw);
         }
         ::omnibuf::opaque::try_splice_fields(dst, &self.raw, self.dirty, 4, |dst, fnum| {
-            let deterministic = true;
-            let _ = deterministic;
-            match fnum {
-                1 => {
-                    ::omnibuf::codec::write_uint_field(
-                        dst,
-                        1,
-                        u64::from(self.dirty_state.as_deref().unwrap().f_id),
-                    );
-                }
-                2 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        2,
-                        self.dirty_state.as_deref().unwrap().f_label.as_str(),
-                    );
-                }
-                3 => {
-                    ::omnibuf::codec::write_bool_field(
-                        dst,
-                        3,
-                        self.dirty_state.as_deref().unwrap().f_flag,
-                    );
-                }
-                4 => {
-                    ::omnibuf::codec::write_sint_field(
-                        dst,
-                        4,
-                        self.dirty_state.as_deref().unwrap().f_score,
-                    );
-                }
-                _ => {}
-            }
+            self.write_dirty_field(dst, fnum)
         })
     }
 
@@ -2049,6 +1637,35 @@ impl TestAllTypes {
     #[inline]
     pub fn unmarshal_omnibuf(&mut self, data: &[u8]) -> ::omnibuf::Result<()> {
         <Self as ::omnibuf::Message>::decode_omnibuf(self, data)
+    }
+
+    fn __omnibuf_base_schema_meta() -> ::omnibuf::SchemaMeta {
+        ::omnibuf::SchemaMeta {
+            type_name: ::std::string::String::from("TestAllTypes"),
+            fields: [
+                (1u32, "f1_uint32"),
+                (2u32, "f2_uint64"),
+                (3u32, "f3_sint32"),
+                (4u32, "f4_sint64"),
+                (5u32, "f5_bool"),
+                (6u32, "f6_string"),
+                (7u32, "f7_bytes"),
+                (8u32, "f8_sub_msg"),
+                (9u32, "f9_string_arr"),
+                (10u32, "f10_uint32_arr"),
+                (11u32, "f11_sub_msg_arr"),
+                (12u32, "f12_map_str_uint"),
+                (13u32, "f13_float32"),
+                (14u32, "f14_float64"),
+                (15u32, "f15_fixed32"),
+                (16u32, "f16_fixed64"),
+                (20u32, "f20_overflow_str"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k, ::std::string::String::from(v)))
+            .collect(),
+            children: ::std::collections::BTreeMap::new(),
+        }
     }
 }
 
@@ -2462,45 +2079,7 @@ impl ::omnibuf::Message for TestAllTypes {
             return ::core::option::Option::None;
         }
         let type_id = ::core::any::TypeId::of::<Self>();
-        let mut meta = ::omnibuf::SchemaMeta {
-            type_name: ::std::string::String::from("TestAllTypes"),
-            fields: ::std::collections::BTreeMap::new(),
-            children: ::std::collections::BTreeMap::new(),
-        };
-        meta.fields
-            .insert(1, ::std::string::String::from("f1_uint32"));
-        meta.fields
-            .insert(2, ::std::string::String::from("f2_uint64"));
-        meta.fields
-            .insert(3, ::std::string::String::from("f3_sint32"));
-        meta.fields
-            .insert(4, ::std::string::String::from("f4_sint64"));
-        meta.fields
-            .insert(5, ::std::string::String::from("f5_bool"));
-        meta.fields
-            .insert(6, ::std::string::String::from("f6_string"));
-        meta.fields
-            .insert(7, ::std::string::String::from("f7_bytes"));
-        meta.fields
-            .insert(8, ::std::string::String::from("f8_sub_msg"));
-        meta.fields
-            .insert(9, ::std::string::String::from("f9_string_arr"));
-        meta.fields
-            .insert(10, ::std::string::String::from("f10_uint32_arr"));
-        meta.fields
-            .insert(11, ::std::string::String::from("f11_sub_msg_arr"));
-        meta.fields
-            .insert(12, ::std::string::String::from("f12_map_str_uint"));
-        meta.fields
-            .insert(13, ::std::string::String::from("f13_float32"));
-        meta.fields
-            .insert(14, ::std::string::String::from("f14_float64"));
-        meta.fields
-            .insert(15, ::std::string::String::from("f15_fixed32"));
-        meta.fields
-            .insert(16, ::std::string::String::from("f16_fixed64"));
-        meta.fields
-            .insert(20, ::std::string::String::from("f20_overflow_str"));
+        let mut meta = Self::__omnibuf_base_schema_meta();
         if !active.insert(type_id) {
             return ::core::option::Option::Some(meta);
         }
@@ -2548,53 +2127,11 @@ impl ::omnibuf::Message for TestAllTypes {
         if depth >= ::omnibuf::MAX_NESTING_DEPTH {
             return ::core::option::Option::None;
         }
-        let mut meta = ::omnibuf::SchemaMeta {
-            type_name: ::std::string::String::from("TestAllTypes"),
-            fields: ::std::collections::BTreeMap::new(),
-            children: ::std::collections::BTreeMap::new(),
-        };
-        meta.fields
-            .insert(1, ::std::string::String::from("f1_uint32"));
-        meta.fields
-            .insert(2, ::std::string::String::from("f2_uint64"));
-        meta.fields
-            .insert(3, ::std::string::String::from("f3_sint32"));
-        meta.fields
-            .insert(4, ::std::string::String::from("f4_sint64"));
-        meta.fields
-            .insert(5, ::std::string::String::from("f5_bool"));
-        meta.fields
-            .insert(6, ::std::string::String::from("f6_string"));
-        meta.fields
-            .insert(7, ::std::string::String::from("f7_bytes"));
-        meta.fields
-            .insert(8, ::std::string::String::from("f8_sub_msg"));
-        meta.fields
-            .insert(9, ::std::string::String::from("f9_string_arr"));
-        meta.fields
-            .insert(10, ::std::string::String::from("f10_uint32_arr"));
-        meta.fields
-            .insert(11, ::std::string::String::from("f11_sub_msg_arr"));
-        meta.fields
-            .insert(12, ::std::string::String::from("f12_map_str_uint"));
-        meta.fields
-            .insert(13, ::std::string::String::from("f13_float32"));
-        meta.fields
-            .insert(14, ::std::string::String::from("f14_float64"));
-        meta.fields
-            .insert(15, ::std::string::String::from("f15_fixed32"));
-        meta.fields
-            .insert(16, ::std::string::String::from("f16_fixed64"));
-        meta.fields
-            .insert(20, ::std::string::String::from("f20_overflow_str"));
+        let mut meta = Self::__omnibuf_base_schema_meta();
         if depth + 2 < ::omnibuf::MAX_NESTING_DEPTH {
-            if let ::core::option::Option::Some(ref __sub) = self.f8_sub_msg
-                && let ::core::option::Option::Some(__c) =
-                    <AllTypesSubMsg as ::omnibuf::Message>::build_value_schema_meta(
-                        __sub,
-                        depth + 2,
-                    )
-            {
+            if let ::core::option::Option::Some(__c) = self.f8_sub_msg.as_ref().and_then(|__sub| {
+                <AllTypesSubMsg as ::omnibuf::Message>::build_value_schema_meta(__sub, depth + 2)
+            }) {
                 meta.children.insert(8, __c);
             }
             if !self.f11_sub_msg_arr.is_empty() {
@@ -3326,6 +2863,110 @@ impl<'a> OpaqueTestAllTypes<'a> {
     }
 
     #[inline]
+    fn write_dirty_field(&self, dst: &mut ::std::vec::Vec<u8>, fnum: u16) {
+        let deterministic = true;
+        let _ = deterministic;
+        let ::core::option::Option::Some(__dirty) = self.dirty_state.as_deref() else {
+            return;
+        };
+        match fnum {
+            1 => {
+                ::omnibuf::codec::write_uint_field(dst, 1, u64::from(__dirty.f_f1_uint32));
+            }
+            2 => {
+                ::omnibuf::codec::write_uint_field(dst, 2, __dirty.f_f2_uint64);
+            }
+            3 => {
+                ::omnibuf::codec::write_sint_field(dst, 3, i64::from(__dirty.f_f3_sint32));
+            }
+            4 => {
+                ::omnibuf::codec::write_sint_field(dst, 4, __dirty.f_f4_sint64);
+            }
+            5 => {
+                ::omnibuf::codec::write_bool_field(dst, 5, __dirty.f_f5_bool);
+            }
+            6 => {
+                ::omnibuf::codec::write_string_field(dst, 6, __dirty.f_f6_string.as_str());
+            }
+            7 => {
+                ::omnibuf::codec::write_bytes_field(dst, 7, __dirty.f_f7_bytes.as_slice());
+            }
+            8 => {
+                if let ::core::option::Option::Some(ref sub) = __dirty.f_f8_sub_msg {
+                    ::omnibuf::codec::write_sub_msg_field(dst, 8, sub, deterministic).unwrap();
+                }
+            }
+            9 => {
+                ::omnibuf::codec::write_scalar_vec_field(
+                    dst,
+                    9,
+                    10,
+                    &__dirty.f_f9_string_arr,
+                    |dst, item| {
+                        ::omnibuf::wire::append_bytes_elem(dst, (item).as_bytes());
+                        ::core::result::Result::Ok(())
+                    },
+                )
+                .unwrap();
+            }
+            10 => {
+                ::omnibuf::codec::write_varint_vec_field(
+                    dst,
+                    10,
+                    0,
+                    &__dirty.f_f10_uint32_arr,
+                    |item| u64::from(*item),
+                )
+                .unwrap();
+            }
+            11 => {
+                ::omnibuf::codec::write_sub_msg_vec_field(
+                    dst,
+                    11,
+                    &__dirty.f_f11_sub_msg_arr,
+                    deterministic,
+                )
+                .unwrap();
+            }
+            12 => {
+                ::omnibuf::codec::write_hash_map_field(
+                    dst,
+                    12,
+                    ::omnibuf::codec::MapWireTypes::new(10, 0),
+                    &__dirty.f_f12_map_str_uint,
+                    deterministic,
+                    |dst, k| {
+                        ::omnibuf::wire::append_bytes_elem(dst, (k).as_bytes());
+                        ::core::result::Result::Ok(())
+                    },
+                    |dst, v, det| {
+                        let _ = det;
+                        ::omnibuf::wire::append_varint(dst, *v);
+                        ::core::result::Result::Ok(())
+                    },
+                )
+                .unwrap();
+            }
+            13 => {
+                ::omnibuf::codec::write_float32_field(dst, 13, __dirty.f_f13_float32);
+            }
+            14 => {
+                ::omnibuf::codec::write_float64_field(dst, 14, __dirty.f_f14_float64);
+            }
+            15 => {
+                ::omnibuf::codec::write_fixed32_field(dst, 15, __dirty.f_f15_fixed32);
+            }
+            16 => {
+                ::omnibuf::codec::write_fixed64_field(dst, 16, __dirty.f_f16_fixed64);
+            }
+            20 => {
+                ::omnibuf::codec::write_string_field(dst, 20, __dirty.f_f20_overflow_str.as_str());
+            }
+            _ => {}
+        }
+    }
+
+    #[inline]
     pub fn marshal(&self) -> ::std::vec::Vec<u8> {
         let mut dst = ::std::vec::Vec::with_capacity(self.raw.len() + 32);
         self.marshal_append(&mut dst);
@@ -3338,157 +2979,7 @@ impl<'a> OpaqueTestAllTypes<'a> {
             return;
         }
         ::omnibuf::opaque::splice_fields(dst, &self.raw, self.dirty, 20, |dst, fnum| {
-            let deterministic = true;
-            let _ = deterministic;
-            match fnum {
-                1 => {
-                    ::omnibuf::codec::write_uint_field(
-                        dst,
-                        1,
-                        u64::from(self.dirty_state.as_deref().unwrap().f_f1_uint32),
-                    );
-                }
-                2 => {
-                    ::omnibuf::codec::write_uint_field(
-                        dst,
-                        2,
-                        self.dirty_state.as_deref().unwrap().f_f2_uint64,
-                    );
-                }
-                3 => {
-                    ::omnibuf::codec::write_sint_field(
-                        dst,
-                        3,
-                        i64::from(self.dirty_state.as_deref().unwrap().f_f3_sint32),
-                    );
-                }
-                4 => {
-                    ::omnibuf::codec::write_sint_field(
-                        dst,
-                        4,
-                        self.dirty_state.as_deref().unwrap().f_f4_sint64,
-                    );
-                }
-                5 => {
-                    ::omnibuf::codec::write_bool_field(
-                        dst,
-                        5,
-                        self.dirty_state.as_deref().unwrap().f_f5_bool,
-                    );
-                }
-                6 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        6,
-                        self.dirty_state.as_deref().unwrap().f_f6_string.as_str(),
-                    );
-                }
-                7 => {
-                    ::omnibuf::codec::write_bytes_field(
-                        dst,
-                        7,
-                        self.dirty_state.as_deref().unwrap().f_f7_bytes.as_slice(),
-                    );
-                }
-                8 => {
-                    if let ::core::option::Option::Some(ref sub) =
-                        self.dirty_state.as_deref().unwrap().f_f8_sub_msg
-                    {
-                        ::omnibuf::codec::write_sub_msg_field(dst, 8, sub, deterministic).unwrap();
-                    }
-                }
-                9 => {
-                    ::omnibuf::codec::write_scalar_vec_field(
-                        dst,
-                        9,
-                        10,
-                        &self.dirty_state.as_deref().unwrap().f_f9_string_arr,
-                        |dst, item| {
-                            ::omnibuf::wire::append_bytes_elem(dst, (item).as_bytes());
-                            ::core::result::Result::Ok(())
-                        },
-                    )
-                    .unwrap();
-                }
-                10 => {
-                    ::omnibuf::codec::write_varint_vec_field(
-                        dst,
-                        10,
-                        0,
-                        &self.dirty_state.as_deref().unwrap().f_f10_uint32_arr,
-                        |item| u64::from(*item),
-                    )
-                    .unwrap();
-                }
-                11 => {
-                    ::omnibuf::codec::write_sub_msg_vec_field(
-                        dst,
-                        11,
-                        &self.dirty_state.as_deref().unwrap().f_f11_sub_msg_arr,
-                        deterministic,
-                    )
-                    .unwrap();
-                }
-                12 => {
-                    ::omnibuf::codec::write_hash_map_field(
-                        dst,
-                        12,
-                        ::omnibuf::codec::MapWireTypes::new(10, 0),
-                        &self.dirty_state.as_deref().unwrap().f_f12_map_str_uint,
-                        deterministic,
-                        |dst, k| {
-                            ::omnibuf::wire::append_bytes_elem(dst, (k).as_bytes());
-                            ::core::result::Result::Ok(())
-                        },
-                        |dst, v, det| {
-                            let _ = det;
-                            ::omnibuf::wire::append_varint(dst, *v);
-                            ::core::result::Result::Ok(())
-                        },
-                    )
-                    .unwrap();
-                }
-                13 => {
-                    ::omnibuf::codec::write_float32_field(
-                        dst,
-                        13,
-                        self.dirty_state.as_deref().unwrap().f_f13_float32,
-                    );
-                }
-                14 => {
-                    ::omnibuf::codec::write_float64_field(
-                        dst,
-                        14,
-                        self.dirty_state.as_deref().unwrap().f_f14_float64,
-                    );
-                }
-                15 => {
-                    ::omnibuf::codec::write_fixed32_field(
-                        dst,
-                        15,
-                        self.dirty_state.as_deref().unwrap().f_f15_fixed32,
-                    );
-                }
-                16 => {
-                    ::omnibuf::codec::write_fixed64_field(
-                        dst,
-                        16,
-                        self.dirty_state.as_deref().unwrap().f_f16_fixed64,
-                    );
-                }
-                20 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        20,
-                        self.dirty_state
-                            .as_deref()
-                            .unwrap()
-                            .f_f20_overflow_str
-                            .as_str(),
-                    );
-                }
-                _ => {}
-            }
+            self.write_dirty_field(dst, fnum)
         });
     }
 
@@ -3504,157 +2995,7 @@ impl<'a> OpaqueTestAllTypes<'a> {
             return ::omnibuf::opaque::try_append_packet(dst, &self.raw);
         }
         ::omnibuf::opaque::try_splice_fields(dst, &self.raw, self.dirty, 20, |dst, fnum| {
-            let deterministic = true;
-            let _ = deterministic;
-            match fnum {
-                1 => {
-                    ::omnibuf::codec::write_uint_field(
-                        dst,
-                        1,
-                        u64::from(self.dirty_state.as_deref().unwrap().f_f1_uint32),
-                    );
-                }
-                2 => {
-                    ::omnibuf::codec::write_uint_field(
-                        dst,
-                        2,
-                        self.dirty_state.as_deref().unwrap().f_f2_uint64,
-                    );
-                }
-                3 => {
-                    ::omnibuf::codec::write_sint_field(
-                        dst,
-                        3,
-                        i64::from(self.dirty_state.as_deref().unwrap().f_f3_sint32),
-                    );
-                }
-                4 => {
-                    ::omnibuf::codec::write_sint_field(
-                        dst,
-                        4,
-                        self.dirty_state.as_deref().unwrap().f_f4_sint64,
-                    );
-                }
-                5 => {
-                    ::omnibuf::codec::write_bool_field(
-                        dst,
-                        5,
-                        self.dirty_state.as_deref().unwrap().f_f5_bool,
-                    );
-                }
-                6 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        6,
-                        self.dirty_state.as_deref().unwrap().f_f6_string.as_str(),
-                    );
-                }
-                7 => {
-                    ::omnibuf::codec::write_bytes_field(
-                        dst,
-                        7,
-                        self.dirty_state.as_deref().unwrap().f_f7_bytes.as_slice(),
-                    );
-                }
-                8 => {
-                    if let ::core::option::Option::Some(ref sub) =
-                        self.dirty_state.as_deref().unwrap().f_f8_sub_msg
-                    {
-                        ::omnibuf::codec::write_sub_msg_field(dst, 8, sub, deterministic).unwrap();
-                    }
-                }
-                9 => {
-                    ::omnibuf::codec::write_scalar_vec_field(
-                        dst,
-                        9,
-                        10,
-                        &self.dirty_state.as_deref().unwrap().f_f9_string_arr,
-                        |dst, item| {
-                            ::omnibuf::wire::append_bytes_elem(dst, (item).as_bytes());
-                            ::core::result::Result::Ok(())
-                        },
-                    )
-                    .unwrap();
-                }
-                10 => {
-                    ::omnibuf::codec::write_varint_vec_field(
-                        dst,
-                        10,
-                        0,
-                        &self.dirty_state.as_deref().unwrap().f_f10_uint32_arr,
-                        |item| u64::from(*item),
-                    )
-                    .unwrap();
-                }
-                11 => {
-                    ::omnibuf::codec::write_sub_msg_vec_field(
-                        dst,
-                        11,
-                        &self.dirty_state.as_deref().unwrap().f_f11_sub_msg_arr,
-                        deterministic,
-                    )
-                    .unwrap();
-                }
-                12 => {
-                    ::omnibuf::codec::write_hash_map_field(
-                        dst,
-                        12,
-                        ::omnibuf::codec::MapWireTypes::new(10, 0),
-                        &self.dirty_state.as_deref().unwrap().f_f12_map_str_uint,
-                        deterministic,
-                        |dst, k| {
-                            ::omnibuf::wire::append_bytes_elem(dst, (k).as_bytes());
-                            ::core::result::Result::Ok(())
-                        },
-                        |dst, v, det| {
-                            let _ = det;
-                            ::omnibuf::wire::append_varint(dst, *v);
-                            ::core::result::Result::Ok(())
-                        },
-                    )
-                    .unwrap();
-                }
-                13 => {
-                    ::omnibuf::codec::write_float32_field(
-                        dst,
-                        13,
-                        self.dirty_state.as_deref().unwrap().f_f13_float32,
-                    );
-                }
-                14 => {
-                    ::omnibuf::codec::write_float64_field(
-                        dst,
-                        14,
-                        self.dirty_state.as_deref().unwrap().f_f14_float64,
-                    );
-                }
-                15 => {
-                    ::omnibuf::codec::write_fixed32_field(
-                        dst,
-                        15,
-                        self.dirty_state.as_deref().unwrap().f_f15_fixed32,
-                    );
-                }
-                16 => {
-                    ::omnibuf::codec::write_fixed64_field(
-                        dst,
-                        16,
-                        self.dirty_state.as_deref().unwrap().f_f16_fixed64,
-                    );
-                }
-                20 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        20,
-                        self.dirty_state
-                            .as_deref()
-                            .unwrap()
-                            .f_f20_overflow_str
-                            .as_str(),
-                    );
-                }
-                _ => {}
-            }
+            self.write_dirty_field(dst, fnum)
         })
     }
 

@@ -1022,3 +1022,95 @@ fn boxed_oneof_uses_codec_box_helpers() {
         "generated code should not bypass codec alloc charging with raw Box::new:\n{src}"
     );
 }
+
+/// Generated code avoids duplicating opaque dirty-field dispatch, Field #0 base schema maps,
+/// leaf cyclic/value schema methods, and non-heap borrowed clear implementations.
+#[test]
+fn deduplicates_opaque_dispatch_schema_meta_and_borrowed_clear() {
+    let req = CodeGeneratorRequest {
+        file_to_generate: vec!["compact.proto".to_owned()],
+        parameter: None,
+        compiler_version: None,
+        proto_file: vec![FileDescriptorProto {
+            name: Some("compact.proto".to_owned()),
+            package: Some("compact.v1".to_owned()),
+            syntax: Some("proto3".to_owned()),
+            message_type: vec![
+                DescriptorProto {
+                    name: Some("Vec3".to_owned()),
+                    field: vec![
+                        FieldDescriptorProto {
+                            name: Some("x".to_owned()),
+                            number: Some(1),
+                            label: Some(Label::Optional as i32),
+                            r#type: Some(Type::Float as i32),
+                            ..Default::default()
+                        },
+                        FieldDescriptorProto {
+                            name: Some("y".to_owned()),
+                            number: Some(2),
+                            label: Some(Label::Optional as i32),
+                            r#type: Some(Type::Float as i32),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+                DescriptorProto {
+                    name: Some("MeshNode".to_owned()),
+                    field: vec![
+                        FieldDescriptorProto {
+                            name: Some("pos".to_owned()),
+                            number: Some(1),
+                            label: Some(Label::Optional as i32),
+                            r#type: Some(Type::Message as i32),
+                            type_name: Some(".compact.v1.Vec3".to_owned()),
+                            ..Default::default()
+                        },
+                        FieldDescriptorProto {
+                            name: Some("tags".to_owned()),
+                            number: Some(2),
+                            label: Some(Label::Repeated as i32),
+                            r#type: Some(Type::String as i32),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }],
+    };
+    let resp = generate(&req);
+    assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+    let src = resp.file[0].content.as_deref().unwrap();
+
+    // Opaque marshal_append and try_marshal_append share a single write_dirty_field helper per message.
+    assert_eq!(src.matches("fn write_dirty_field(").count(), 2);
+    assert_eq!(src.matches("self.write_dirty_field(dst, fnum)").count(), 4);
+
+    // Leaf message (Vec3) omits is_schema_cyclic, build_value_schema_meta, and clear_omnibuf_borrowed.
+    let (vec3_part, mesh_part) = src
+        .split_once("pub struct MeshNode ")
+        .expect("missing MeshNode");
+    assert!(!vec3_part.contains("fn is_schema_cyclic("));
+    assert!(!vec3_part.contains("fn build_value_schema_meta("));
+    assert!(!vec3_part.contains("fn __omnibuf_base_schema_meta("));
+    assert!(!vec3_part.contains("fn clear_omnibuf_borrowed("));
+    assert!(vec3_part.contains("*self = ::core::default::Default::default();"));
+
+    // Parent message (MeshNode) shares __omnibuf_base_schema_meta and keeps clear_omnibuf_borrowed for its Vec field.
+    assert_eq!(
+        mesh_part.matches("fn __omnibuf_base_schema_meta(").count(),
+        1
+    );
+    assert_eq!(
+        mesh_part
+            .matches("Self::__omnibuf_base_schema_meta()")
+            .count(),
+        2
+    );
+    assert!(mesh_part.contains("fn is_schema_cyclic("));
+    assert!(mesh_part.contains("fn build_value_schema_meta("));
+    assert!(mesh_part.contains("fn clear_omnibuf_borrowed("));
+}

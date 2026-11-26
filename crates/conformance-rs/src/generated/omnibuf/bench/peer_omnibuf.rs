@@ -162,68 +162,25 @@ impl ::omnibuf::Message for Location {
         active: &mut ::std::collections::HashSet<::core::any::TypeId>,
         depth: usize,
     ) -> ::core::option::Option<::omnibuf::SchemaMeta> {
+        let _ = active;
         if depth >= ::omnibuf::MAX_NESTING_DEPTH {
             return ::core::option::Option::None;
         }
-        let type_id = ::core::any::TypeId::of::<Self>();
-        let mut meta = ::omnibuf::SchemaMeta {
+        ::core::option::Option::Some(::omnibuf::SchemaMeta {
             type_name: ::std::string::String::from("Location"),
-            fields: ::std::collections::BTreeMap::new(),
+            fields: [
+                (1u32, "region"),
+                (2u32, "datacenter"),
+                (3u32, "city"),
+                (4u32, "rack"),
+                (5u32, "latitude"),
+                (6u32, "longitude"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k, ::std::string::String::from(v)))
+            .collect(),
             children: ::std::collections::BTreeMap::new(),
-        };
-        meta.fields.insert(1, ::std::string::String::from("region"));
-        meta.fields
-            .insert(2, ::std::string::String::from("datacenter"));
-        meta.fields.insert(3, ::std::string::String::from("city"));
-        meta.fields.insert(4, ::std::string::String::from("rack"));
-        meta.fields
-            .insert(5, ::std::string::String::from("latitude"));
-        meta.fields
-            .insert(6, ::std::string::String::from("longitude"));
-        if !active.insert(type_id) {
-            return ::core::option::Option::Some(meta);
-        }
-        active.remove(&type_id);
-        ::core::option::Option::Some(meta)
-    }
-
-    fn is_schema_cyclic(
-        active: &mut ::std::collections::HashSet<::core::any::TypeId>,
-        depth: usize,
-    ) -> bool {
-        if depth >= ::omnibuf::MAX_NESTING_DEPTH {
-            return false;
-        }
-        let type_id = ::core::any::TypeId::of::<Self>();
-        if !active.insert(type_id) {
-            return true;
-        }
-        active.remove(&type_id);
-        false
-    }
-
-    fn build_value_schema_meta(
-        &self,
-        depth: usize,
-    ) -> ::core::option::Option<::omnibuf::SchemaMeta> {
-        if depth >= ::omnibuf::MAX_NESTING_DEPTH {
-            return ::core::option::Option::None;
-        }
-        let mut meta = ::omnibuf::SchemaMeta {
-            type_name: ::std::string::String::from("Location"),
-            fields: ::std::collections::BTreeMap::new(),
-            children: ::std::collections::BTreeMap::new(),
-        };
-        meta.fields.insert(1, ::std::string::String::from("region"));
-        meta.fields
-            .insert(2, ::std::string::String::from("datacenter"));
-        meta.fields.insert(3, ::std::string::String::from("city"));
-        meta.fields.insert(4, ::std::string::String::from("rack"));
-        meta.fields
-            .insert(5, ::std::string::String::from("latitude"));
-        meta.fields
-            .insert(6, ::std::string::String::from("longitude"));
-        ::core::option::Option::Some(meta)
+        })
     }
 }
 
@@ -288,16 +245,6 @@ impl<'a> ::omnibuf::DecodeBorrowed<'a> for LocationBorrowed<'a> {
             }
         }
         ::core::result::Result::Ok(())
-    }
-
-    #[inline]
-    fn clear_omnibuf_borrowed(&mut self) {
-        self.region = "";
-        self.datacenter = "";
-        self.city = "";
-        self.rack = ::core::default::Default::default();
-        self.latitude = ::core::default::Default::default();
-        self.longitude = ::core::default::Default::default();
     }
 }
 
@@ -478,6 +425,36 @@ impl<'a> OpaqueLocation<'a> {
     }
 
     #[inline]
+    fn write_dirty_field(&self, dst: &mut ::std::vec::Vec<u8>, fnum: u16) {
+        let deterministic = true;
+        let _ = deterministic;
+        let ::core::option::Option::Some(__dirty) = self.dirty_state.as_deref() else {
+            return;
+        };
+        match fnum {
+            1 => {
+                ::omnibuf::codec::write_string_field(dst, 1, __dirty.f_region.as_str());
+            }
+            2 => {
+                ::omnibuf::codec::write_string_field(dst, 2, __dirty.f_datacenter.as_str());
+            }
+            3 => {
+                ::omnibuf::codec::write_string_field(dst, 3, __dirty.f_city.as_str());
+            }
+            4 => {
+                ::omnibuf::codec::write_uint_field(dst, 4, u64::from(__dirty.f_rack));
+            }
+            5 => {
+                ::omnibuf::codec::write_float32_field(dst, 5, __dirty.f_latitude);
+            }
+            6 => {
+                ::omnibuf::codec::write_float32_field(dst, 6, __dirty.f_longitude);
+            }
+            _ => {}
+        }
+    }
+
+    #[inline]
     pub fn marshal(&self) -> ::std::vec::Vec<u8> {
         let mut dst = ::std::vec::Vec::with_capacity(self.raw.len() + 32);
         self.marshal_append(&mut dst);
@@ -490,53 +467,7 @@ impl<'a> OpaqueLocation<'a> {
             return;
         }
         ::omnibuf::opaque::splice_fields(dst, &self.raw, self.dirty, 6, |dst, fnum| {
-            let deterministic = true;
-            let _ = deterministic;
-            match fnum {
-                1 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        1,
-                        self.dirty_state.as_deref().unwrap().f_region.as_str(),
-                    );
-                }
-                2 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        2,
-                        self.dirty_state.as_deref().unwrap().f_datacenter.as_str(),
-                    );
-                }
-                3 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        3,
-                        self.dirty_state.as_deref().unwrap().f_city.as_str(),
-                    );
-                }
-                4 => {
-                    ::omnibuf::codec::write_uint_field(
-                        dst,
-                        4,
-                        u64::from(self.dirty_state.as_deref().unwrap().f_rack),
-                    );
-                }
-                5 => {
-                    ::omnibuf::codec::write_float32_field(
-                        dst,
-                        5,
-                        self.dirty_state.as_deref().unwrap().f_latitude,
-                    );
-                }
-                6 => {
-                    ::omnibuf::codec::write_float32_field(
-                        dst,
-                        6,
-                        self.dirty_state.as_deref().unwrap().f_longitude,
-                    );
-                }
-                _ => {}
-            }
+            self.write_dirty_field(dst, fnum)
         });
     }
 
@@ -552,53 +483,7 @@ impl<'a> OpaqueLocation<'a> {
             return ::omnibuf::opaque::try_append_packet(dst, &self.raw);
         }
         ::omnibuf::opaque::try_splice_fields(dst, &self.raw, self.dirty, 6, |dst, fnum| {
-            let deterministic = true;
-            let _ = deterministic;
-            match fnum {
-                1 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        1,
-                        self.dirty_state.as_deref().unwrap().f_region.as_str(),
-                    );
-                }
-                2 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        2,
-                        self.dirty_state.as_deref().unwrap().f_datacenter.as_str(),
-                    );
-                }
-                3 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        3,
-                        self.dirty_state.as_deref().unwrap().f_city.as_str(),
-                    );
-                }
-                4 => {
-                    ::omnibuf::codec::write_uint_field(
-                        dst,
-                        4,
-                        u64::from(self.dirty_state.as_deref().unwrap().f_rack),
-                    );
-                }
-                5 => {
-                    ::omnibuf::codec::write_float32_field(
-                        dst,
-                        5,
-                        self.dirty_state.as_deref().unwrap().f_latitude,
-                    );
-                }
-                6 => {
-                    ::omnibuf::codec::write_float32_field(
-                        dst,
-                        6,
-                        self.dirty_state.as_deref().unwrap().f_longitude,
-                    );
-                }
-                _ => {}
-            }
+            self.write_dirty_field(dst, fnum)
         })
     }
 
@@ -748,64 +633,23 @@ impl ::omnibuf::Message for Neighbor {
         active: &mut ::std::collections::HashSet<::core::any::TypeId>,
         depth: usize,
     ) -> ::core::option::Option<::omnibuf::SchemaMeta> {
+        let _ = active;
         if depth >= ::omnibuf::MAX_NESTING_DEPTH {
             return ::core::option::Option::None;
         }
-        let type_id = ::core::any::TypeId::of::<Self>();
-        let mut meta = ::omnibuf::SchemaMeta {
+        ::core::option::Option::Some(::omnibuf::SchemaMeta {
             type_name: ::std::string::String::from("Neighbor"),
-            fields: ::std::collections::BTreeMap::new(),
+            fields: [
+                (1u32, "peer_asn"),
+                (2u32, "router"),
+                (3u32, "latency_us"),
+                (4u32, "established"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k, ::std::string::String::from(v)))
+            .collect(),
             children: ::std::collections::BTreeMap::new(),
-        };
-        meta.fields
-            .insert(1, ::std::string::String::from("peer_asn"));
-        meta.fields.insert(2, ::std::string::String::from("router"));
-        meta.fields
-            .insert(3, ::std::string::String::from("latency_us"));
-        meta.fields
-            .insert(4, ::std::string::String::from("established"));
-        if !active.insert(type_id) {
-            return ::core::option::Option::Some(meta);
-        }
-        active.remove(&type_id);
-        ::core::option::Option::Some(meta)
-    }
-
-    fn is_schema_cyclic(
-        active: &mut ::std::collections::HashSet<::core::any::TypeId>,
-        depth: usize,
-    ) -> bool {
-        if depth >= ::omnibuf::MAX_NESTING_DEPTH {
-            return false;
-        }
-        let type_id = ::core::any::TypeId::of::<Self>();
-        if !active.insert(type_id) {
-            return true;
-        }
-        active.remove(&type_id);
-        false
-    }
-
-    fn build_value_schema_meta(
-        &self,
-        depth: usize,
-    ) -> ::core::option::Option<::omnibuf::SchemaMeta> {
-        if depth >= ::omnibuf::MAX_NESTING_DEPTH {
-            return ::core::option::Option::None;
-        }
-        let mut meta = ::omnibuf::SchemaMeta {
-            type_name: ::std::string::String::from("Neighbor"),
-            fields: ::std::collections::BTreeMap::new(),
-            children: ::std::collections::BTreeMap::new(),
-        };
-        meta.fields
-            .insert(1, ::std::string::String::from("peer_asn"));
-        meta.fields.insert(2, ::std::string::String::from("router"));
-        meta.fields
-            .insert(3, ::std::string::String::from("latency_us"));
-        meta.fields
-            .insert(4, ::std::string::String::from("established"));
-        ::core::option::Option::Some(meta)
+        })
     }
 }
 
@@ -864,14 +708,6 @@ impl<'a> ::omnibuf::DecodeBorrowed<'a> for NeighborBorrowed<'a> {
             }
         }
         ::core::result::Result::Ok(())
-    }
-
-    #[inline]
-    fn clear_omnibuf_borrowed(&mut self) {
-        self.peer_asn = ::core::default::Default::default();
-        self.router = "";
-        self.latency_us = ::core::default::Default::default();
-        self.established = ::core::default::Default::default();
     }
 }
 
@@ -1018,6 +854,30 @@ impl<'a> OpaqueNeighbor<'a> {
     }
 
     #[inline]
+    fn write_dirty_field(&self, dst: &mut ::std::vec::Vec<u8>, fnum: u16) {
+        let deterministic = true;
+        let _ = deterministic;
+        let ::core::option::Option::Some(__dirty) = self.dirty_state.as_deref() else {
+            return;
+        };
+        match fnum {
+            1 => {
+                ::omnibuf::codec::write_uint_field(dst, 1, u64::from(__dirty.f_peer_asn));
+            }
+            2 => {
+                ::omnibuf::codec::write_string_field(dst, 2, __dirty.f_router.as_str());
+            }
+            3 => {
+                ::omnibuf::codec::write_uint_field(dst, 3, u64::from(__dirty.f_latency_us));
+            }
+            4 => {
+                ::omnibuf::codec::write_bool_field(dst, 4, __dirty.f_established);
+            }
+            _ => {}
+        }
+    }
+
+    #[inline]
     pub fn marshal(&self) -> ::std::vec::Vec<u8> {
         let mut dst = ::std::vec::Vec::with_capacity(self.raw.len() + 32);
         self.marshal_append(&mut dst);
@@ -1030,39 +890,7 @@ impl<'a> OpaqueNeighbor<'a> {
             return;
         }
         ::omnibuf::opaque::splice_fields(dst, &self.raw, self.dirty, 4, |dst, fnum| {
-            let deterministic = true;
-            let _ = deterministic;
-            match fnum {
-                1 => {
-                    ::omnibuf::codec::write_uint_field(
-                        dst,
-                        1,
-                        u64::from(self.dirty_state.as_deref().unwrap().f_peer_asn),
-                    );
-                }
-                2 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        2,
-                        self.dirty_state.as_deref().unwrap().f_router.as_str(),
-                    );
-                }
-                3 => {
-                    ::omnibuf::codec::write_uint_field(
-                        dst,
-                        3,
-                        u64::from(self.dirty_state.as_deref().unwrap().f_latency_us),
-                    );
-                }
-                4 => {
-                    ::omnibuf::codec::write_bool_field(
-                        dst,
-                        4,
-                        self.dirty_state.as_deref().unwrap().f_established,
-                    );
-                }
-                _ => {}
-            }
+            self.write_dirty_field(dst, fnum)
         });
     }
 
@@ -1078,39 +906,7 @@ impl<'a> OpaqueNeighbor<'a> {
             return ::omnibuf::opaque::try_append_packet(dst, &self.raw);
         }
         ::omnibuf::opaque::try_splice_fields(dst, &self.raw, self.dirty, 4, |dst, fnum| {
-            let deterministic = true;
-            let _ = deterministic;
-            match fnum {
-                1 => {
-                    ::omnibuf::codec::write_uint_field(
-                        dst,
-                        1,
-                        u64::from(self.dirty_state.as_deref().unwrap().f_peer_asn),
-                    );
-                }
-                2 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        2,
-                        self.dirty_state.as_deref().unwrap().f_router.as_str(),
-                    );
-                }
-                3 => {
-                    ::omnibuf::codec::write_uint_field(
-                        dst,
-                        3,
-                        u64::from(self.dirty_state.as_deref().unwrap().f_latency_us),
-                    );
-                }
-                4 => {
-                    ::omnibuf::codec::write_bool_field(
-                        dst,
-                        4,
-                        self.dirty_state.as_deref().unwrap().f_established,
-                    );
-                }
-                _ => {}
-            }
+            self.write_dirty_field(dst, fnum)
         })
     }
 
@@ -1159,6 +955,29 @@ impl PeerUpdate {
     #[inline]
     pub fn unmarshal_omnibuf(&mut self, data: &[u8]) -> ::omnibuf::Result<()> {
         <Self as ::omnibuf::Message>::decode_omnibuf(self, data)
+    }
+
+    fn __omnibuf_base_schema_meta() -> ::omnibuf::SchemaMeta {
+        ::omnibuf::SchemaMeta {
+            type_name: ::std::string::String::from("PeerUpdate"),
+            fields: [
+                (1u32, "asn"),
+                (2u32, "router_id"),
+                (3u32, "active"),
+                (4u32, "uptime_sec"),
+                (5u32, "rssi_dbm"),
+                (6u32, "cpu_load"),
+                (7u32, "tags"),
+                (8u32, "prefixes"),
+                (9u32, "location"),
+                (10u32, "neighbors"),
+                (11u32, "sequence"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k, ::std::string::String::from(v)))
+            .collect(),
+            children: ::std::collections::BTreeMap::new(),
+        }
     }
 }
 
@@ -1453,30 +1272,7 @@ impl ::omnibuf::Message for PeerUpdate {
             return ::core::option::Option::None;
         }
         let type_id = ::core::any::TypeId::of::<Self>();
-        let mut meta = ::omnibuf::SchemaMeta {
-            type_name: ::std::string::String::from("PeerUpdate"),
-            fields: ::std::collections::BTreeMap::new(),
-            children: ::std::collections::BTreeMap::new(),
-        };
-        meta.fields.insert(1, ::std::string::String::from("asn"));
-        meta.fields
-            .insert(2, ::std::string::String::from("router_id"));
-        meta.fields.insert(3, ::std::string::String::from("active"));
-        meta.fields
-            .insert(4, ::std::string::String::from("uptime_sec"));
-        meta.fields
-            .insert(5, ::std::string::String::from("rssi_dbm"));
-        meta.fields
-            .insert(6, ::std::string::String::from("cpu_load"));
-        meta.fields.insert(7, ::std::string::String::from("tags"));
-        meta.fields
-            .insert(8, ::std::string::String::from("prefixes"));
-        meta.fields
-            .insert(9, ::std::string::String::from("location"));
-        meta.fields
-            .insert(10, ::std::string::String::from("neighbors"));
-        meta.fields
-            .insert(11, ::std::string::String::from("sequence"));
+        let mut meta = Self::__omnibuf_base_schema_meta();
         if !active.insert(type_id) {
             return ::core::option::Option::Some(meta);
         }
@@ -1524,35 +1320,11 @@ impl ::omnibuf::Message for PeerUpdate {
         if depth >= ::omnibuf::MAX_NESTING_DEPTH {
             return ::core::option::Option::None;
         }
-        let mut meta = ::omnibuf::SchemaMeta {
-            type_name: ::std::string::String::from("PeerUpdate"),
-            fields: ::std::collections::BTreeMap::new(),
-            children: ::std::collections::BTreeMap::new(),
-        };
-        meta.fields.insert(1, ::std::string::String::from("asn"));
-        meta.fields
-            .insert(2, ::std::string::String::from("router_id"));
-        meta.fields.insert(3, ::std::string::String::from("active"));
-        meta.fields
-            .insert(4, ::std::string::String::from("uptime_sec"));
-        meta.fields
-            .insert(5, ::std::string::String::from("rssi_dbm"));
-        meta.fields
-            .insert(6, ::std::string::String::from("cpu_load"));
-        meta.fields.insert(7, ::std::string::String::from("tags"));
-        meta.fields
-            .insert(8, ::std::string::String::from("prefixes"));
-        meta.fields
-            .insert(9, ::std::string::String::from("location"));
-        meta.fields
-            .insert(10, ::std::string::String::from("neighbors"));
-        meta.fields
-            .insert(11, ::std::string::String::from("sequence"));
+        let mut meta = Self::__omnibuf_base_schema_meta();
         if depth + 2 < ::omnibuf::MAX_NESTING_DEPTH {
-            if let ::core::option::Option::Some(ref __sub) = self.location
-                && let ::core::option::Option::Some(__c) =
-                    <Location as ::omnibuf::Message>::build_value_schema_meta(__sub, depth + 2)
-            {
+            if let ::core::option::Option::Some(__c) = self.location.as_ref().and_then(|__sub| {
+                <Location as ::omnibuf::Message>::build_value_schema_meta(__sub, depth + 2)
+            }) {
                 meta.children.insert(9, __c);
             }
             if !self.neighbors.is_empty() {
@@ -2117,6 +1889,72 @@ impl<'a> OpaquePeerUpdate<'a> {
     }
 
     #[inline]
+    fn write_dirty_field(&self, dst: &mut ::std::vec::Vec<u8>, fnum: u16) {
+        let deterministic = true;
+        let _ = deterministic;
+        let ::core::option::Option::Some(__dirty) = self.dirty_state.as_deref() else {
+            return;
+        };
+        match fnum {
+            1 => {
+                ::omnibuf::codec::write_uint_field(dst, 1, u64::from(__dirty.f_asn));
+            }
+            2 => {
+                ::omnibuf::codec::write_string_field(dst, 2, __dirty.f_router_id.as_str());
+            }
+            3 => {
+                ::omnibuf::codec::write_bool_field(dst, 3, __dirty.f_active);
+            }
+            4 => {
+                ::omnibuf::codec::write_uint_field(dst, 4, __dirty.f_uptime_sec);
+            }
+            5 => {
+                ::omnibuf::codec::write_sint_field(dst, 5, i64::from(__dirty.f_rssi_dbm));
+            }
+            6 => {
+                ::omnibuf::codec::write_float64_field(dst, 6, __dirty.f_cpu_load);
+            }
+            7 => {
+                ::omnibuf::codec::write_scalar_vec_field(
+                    dst,
+                    7,
+                    10,
+                    &__dirty.f_tags,
+                    |dst, item| {
+                        ::omnibuf::wire::append_bytes_elem(dst, (item).as_bytes());
+                        ::core::result::Result::Ok(())
+                    },
+                )
+                .unwrap();
+            }
+            8 => {
+                ::omnibuf::codec::write_varint_vec_field(dst, 8, 0, &__dirty.f_prefixes, |item| {
+                    u64::from(*item)
+                })
+                .unwrap();
+            }
+            9 => {
+                if let ::core::option::Option::Some(ref sub) = __dirty.f_location {
+                    ::omnibuf::codec::write_sub_msg_field(dst, 9, sub, deterministic).unwrap();
+                }
+            }
+            10 => {
+                ::omnibuf::codec::write_sub_msg_vec_field(
+                    dst,
+                    10,
+                    &__dirty.f_neighbors,
+                    deterministic,
+                )
+                .unwrap();
+            }
+            11 => {
+                ::omnibuf::codec::write_uint_field(dst, 11, __dirty.f_sequence);
+            }
+            _ => {}
+        }
+    }
+
+    #[inline]
     pub fn marshal(&self) -> ::std::vec::Vec<u8> {
         let mut dst = ::std::vec::Vec::with_capacity(self.raw.len() + 32);
         self.marshal_append(&mut dst);
@@ -2129,99 +1967,7 @@ impl<'a> OpaquePeerUpdate<'a> {
             return;
         }
         ::omnibuf::opaque::splice_fields(dst, &self.raw, self.dirty, 11, |dst, fnum| {
-            let deterministic = true;
-            let _ = deterministic;
-            match fnum {
-                1 => {
-                    ::omnibuf::codec::write_uint_field(
-                        dst,
-                        1,
-                        u64::from(self.dirty_state.as_deref().unwrap().f_asn),
-                    );
-                }
-                2 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        2,
-                        self.dirty_state.as_deref().unwrap().f_router_id.as_str(),
-                    );
-                }
-                3 => {
-                    ::omnibuf::codec::write_bool_field(
-                        dst,
-                        3,
-                        self.dirty_state.as_deref().unwrap().f_active,
-                    );
-                }
-                4 => {
-                    ::omnibuf::codec::write_uint_field(
-                        dst,
-                        4,
-                        self.dirty_state.as_deref().unwrap().f_uptime_sec,
-                    );
-                }
-                5 => {
-                    ::omnibuf::codec::write_sint_field(
-                        dst,
-                        5,
-                        i64::from(self.dirty_state.as_deref().unwrap().f_rssi_dbm),
-                    );
-                }
-                6 => {
-                    ::omnibuf::codec::write_float64_field(
-                        dst,
-                        6,
-                        self.dirty_state.as_deref().unwrap().f_cpu_load,
-                    );
-                }
-                7 => {
-                    ::omnibuf::codec::write_scalar_vec_field(
-                        dst,
-                        7,
-                        10,
-                        &self.dirty_state.as_deref().unwrap().f_tags,
-                        |dst, item| {
-                            ::omnibuf::wire::append_bytes_elem(dst, (item).as_bytes());
-                            ::core::result::Result::Ok(())
-                        },
-                    )
-                    .unwrap();
-                }
-                8 => {
-                    ::omnibuf::codec::write_varint_vec_field(
-                        dst,
-                        8,
-                        0,
-                        &self.dirty_state.as_deref().unwrap().f_prefixes,
-                        |item| u64::from(*item),
-                    )
-                    .unwrap();
-                }
-                9 => {
-                    if let ::core::option::Option::Some(ref sub) =
-                        self.dirty_state.as_deref().unwrap().f_location
-                    {
-                        ::omnibuf::codec::write_sub_msg_field(dst, 9, sub, deterministic).unwrap();
-                    }
-                }
-                10 => {
-                    ::omnibuf::codec::write_sub_msg_vec_field(
-                        dst,
-                        10,
-                        &self.dirty_state.as_deref().unwrap().f_neighbors,
-                        deterministic,
-                    )
-                    .unwrap();
-                }
-                11 => {
-                    ::omnibuf::codec::write_uint_field(
-                        dst,
-                        11,
-                        self.dirty_state.as_deref().unwrap().f_sequence,
-                    );
-                }
-                _ => {}
-            }
+            self.write_dirty_field(dst, fnum)
         });
     }
 
@@ -2237,99 +1983,7 @@ impl<'a> OpaquePeerUpdate<'a> {
             return ::omnibuf::opaque::try_append_packet(dst, &self.raw);
         }
         ::omnibuf::opaque::try_splice_fields(dst, &self.raw, self.dirty, 11, |dst, fnum| {
-            let deterministic = true;
-            let _ = deterministic;
-            match fnum {
-                1 => {
-                    ::omnibuf::codec::write_uint_field(
-                        dst,
-                        1,
-                        u64::from(self.dirty_state.as_deref().unwrap().f_asn),
-                    );
-                }
-                2 => {
-                    ::omnibuf::codec::write_string_field(
-                        dst,
-                        2,
-                        self.dirty_state.as_deref().unwrap().f_router_id.as_str(),
-                    );
-                }
-                3 => {
-                    ::omnibuf::codec::write_bool_field(
-                        dst,
-                        3,
-                        self.dirty_state.as_deref().unwrap().f_active,
-                    );
-                }
-                4 => {
-                    ::omnibuf::codec::write_uint_field(
-                        dst,
-                        4,
-                        self.dirty_state.as_deref().unwrap().f_uptime_sec,
-                    );
-                }
-                5 => {
-                    ::omnibuf::codec::write_sint_field(
-                        dst,
-                        5,
-                        i64::from(self.dirty_state.as_deref().unwrap().f_rssi_dbm),
-                    );
-                }
-                6 => {
-                    ::omnibuf::codec::write_float64_field(
-                        dst,
-                        6,
-                        self.dirty_state.as_deref().unwrap().f_cpu_load,
-                    );
-                }
-                7 => {
-                    ::omnibuf::codec::write_scalar_vec_field(
-                        dst,
-                        7,
-                        10,
-                        &self.dirty_state.as_deref().unwrap().f_tags,
-                        |dst, item| {
-                            ::omnibuf::wire::append_bytes_elem(dst, (item).as_bytes());
-                            ::core::result::Result::Ok(())
-                        },
-                    )
-                    .unwrap();
-                }
-                8 => {
-                    ::omnibuf::codec::write_varint_vec_field(
-                        dst,
-                        8,
-                        0,
-                        &self.dirty_state.as_deref().unwrap().f_prefixes,
-                        |item| u64::from(*item),
-                    )
-                    .unwrap();
-                }
-                9 => {
-                    if let ::core::option::Option::Some(ref sub) =
-                        self.dirty_state.as_deref().unwrap().f_location
-                    {
-                        ::omnibuf::codec::write_sub_msg_field(dst, 9, sub, deterministic).unwrap();
-                    }
-                }
-                10 => {
-                    ::omnibuf::codec::write_sub_msg_vec_field(
-                        dst,
-                        10,
-                        &self.dirty_state.as_deref().unwrap().f_neighbors,
-                        deterministic,
-                    )
-                    .unwrap();
-                }
-                11 => {
-                    ::omnibuf::codec::write_uint_field(
-                        dst,
-                        11,
-                        self.dirty_state.as_deref().unwrap().f_sequence,
-                    );
-                }
-                _ => {}
-            }
+            self.write_dirty_field(dst, fnum)
         })
     }
 

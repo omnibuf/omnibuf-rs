@@ -15,12 +15,12 @@ categories = ["encoding", "network-programming"]
 
 [dependencies]
 bytes = "1"
-omnibuf = { path = "../omnibuf", version = "0.1.9", default-features = false }
+omnibuf = { path = "../omnibuf", version = "0.1.10", default-features = false }
 tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 
 [dev-dependencies]
 http = "1"
-omnibuf = { path = "../omnibuf", version = "0.1.9", default-features = false, features = ["derive"] }
+omnibuf = { path = "../omnibuf", version = "0.1.10", default-features = false, features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.14", features = ["transport"] }

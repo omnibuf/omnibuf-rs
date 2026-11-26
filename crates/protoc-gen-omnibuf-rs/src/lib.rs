@@ -701,6 +701,7 @@ fn is_reserved_opaque_stem(stem: &str) -> bool {
             | "try_marshal_append"
             | "marshal_validated"
             | "marshal_validated_append"
+            | "write_dirty_field"
     )
 }
 
@@ -977,6 +978,16 @@ fn emit_message(
         "        <Self as ::omnibuf::Message>::decode_omnibuf(self, data)"
     );
     let _ = writeln!(code, "    }}");
+    if has_child_messages(&fields, &oneofs) {
+        let proto_short_name = desc.name.as_deref().unwrap_or(rust_name);
+        let _ = writeln!(code);
+        let _ = writeln!(
+            code,
+            "    fn __omnibuf_base_schema_meta() -> ::omnibuf::SchemaMeta {{"
+        );
+        emit_schema_meta_expr(code, "        ", proto_short_name, &fields, &oneofs);
+        let _ = writeln!(code, "    }}");
+    }
     let _ = writeln!(code, "}}\n");
 
     // 3. `omnibuf::Message` implementation
@@ -1146,18 +1157,31 @@ fn emit_message_trait_impl(
     }
     let _ = writeln!(code, "    }}\n");
 
+    let has_reusable_heap = fields.iter().any(|gf| {
+        matches!(
+            gf.kind,
+            GenFieldKind::Scalar(ProtoScalar::String | ProtoScalar::Bytes)
+                | GenFieldKind::ScalarArr(_)
+                | GenFieldKind::SubMsgArr { .. }
+                | GenFieldKind::Map { .. }
+        )
+    });
     let _ = writeln!(code, "    #[inline]");
     let _ = writeln!(code, "    fn clear_omnibuf(&mut self) {{");
-    for gf in fields {
-        let clear_expr = clear_stmt_for_field(gf);
-        let _ = writeln!(code, "        {clear_expr}");
-    }
-    for go in oneofs {
-        let fident = &go.field_ident;
-        let _ = writeln!(
-            code,
-            "        if self.{fident}.is_some() {{ self.{fident} = ::core::option::Option::None; }}"
-        );
+    if has_reusable_heap {
+        for gf in fields {
+            let clear_expr = clear_stmt_for_field(gf);
+            let _ = writeln!(code, "        {clear_expr}");
+        }
+        for go in oneofs {
+            let fident = &go.field_ident;
+            let _ = writeln!(
+                code,
+                "        if self.{fident}.is_some() {{ self.{fident} = ::core::option::Option::None; }}"
+            );
+        }
+    } else if total_members > 0 {
+        let _ = writeln!(code, "        *self = ::core::default::Default::default();");
     }
     let _ = writeln!(code, "    }}\n");
 
@@ -1181,10 +1205,24 @@ fn emit_message_trait_impl(
     }
     let _ = writeln!(code, "    }}\n");
 
+    let has_children = has_child_messages(fields, oneofs);
     let _ = writeln!(
         code,
         "    fn build_schema_meta(active: &mut ::std::collections::HashSet<::core::any::TypeId>, depth: usize) -> ::core::option::Option<::omnibuf::SchemaMeta> {{"
     );
+    if !has_children {
+        let _ = writeln!(code, "        let _ = active;");
+        let _ = writeln!(code, "        if depth >= ::omnibuf::MAX_NESTING_DEPTH {{");
+        let _ = writeln!(code, "            return ::core::option::Option::None;");
+        let _ = writeln!(code, "        }}");
+        let _ = writeln!(code, "        ::core::option::Option::Some(");
+        emit_schema_meta_expr(code, "            ", proto_short_name, fields, oneofs);
+        let _ = writeln!(code, "        )");
+        let _ = writeln!(code, "    }}");
+        let _ = writeln!(code, "}}\n");
+        return;
+    }
+
     let _ = writeln!(code, "        if depth >= ::omnibuf::MAX_NESTING_DEPTH {{");
     let _ = writeln!(code, "            return ::core::option::Option::None;");
     let _ = writeln!(code, "        }}");
@@ -1192,38 +1230,10 @@ fn emit_message_trait_impl(
         code,
         "        let type_id = ::core::any::TypeId::of::<Self>();"
     );
-    let _ = writeln!(code, "        let mut meta = ::omnibuf::SchemaMeta {{");
     let _ = writeln!(
         code,
-        "            type_name: ::std::string::String::from({proto_short_name:?}),"
+        "        let mut meta = Self::__omnibuf_base_schema_meta();"
     );
-    let _ = writeln!(
-        code,
-        "            fields: ::std::collections::BTreeMap::new(),"
-    );
-    let _ = writeln!(
-        code,
-        "            children: ::std::collections::BTreeMap::new(),"
-    );
-    let _ = writeln!(code, "        }};");
-    for gf in fields {
-        let fnum = gf.number;
-        let pname = &gf.proto_name;
-        let _ = writeln!(
-            code,
-            "        meta.fields.insert({fnum}, ::std::string::String::from({pname:?}));"
-        );
-    }
-    for go in oneofs {
-        for arm in &go.arms {
-            let fnum = arm.number;
-            let pname = &arm.proto_name;
-            let _ = writeln!(
-                code,
-                "        meta.fields.insert({fnum}, ::std::string::String::from({pname:?}));"
-            );
-        }
-    }
     let _ = writeln!(code, "        if !active.insert(type_id) {{");
     let _ = writeln!(
         code,
@@ -1320,38 +1330,10 @@ fn emit_message_trait_impl(
         code,
         "        if depth >= ::omnibuf::MAX_NESTING_DEPTH {{ return ::core::option::Option::None; }}"
     );
-    let _ = writeln!(code, "        let mut meta = ::omnibuf::SchemaMeta {{");
     let _ = writeln!(
         code,
-        "            type_name: ::std::string::String::from({proto_short_name:?}),"
+        "        let mut meta = Self::__omnibuf_base_schema_meta();"
     );
-    let _ = writeln!(
-        code,
-        "            fields: ::std::collections::BTreeMap::new(),"
-    );
-    let _ = writeln!(
-        code,
-        "            children: ::std::collections::BTreeMap::new(),"
-    );
-    let _ = writeln!(code, "        }};");
-    for gf in fields {
-        let fnum = gf.number;
-        let pname = &gf.proto_name;
-        let _ = writeln!(
-            code,
-            "        meta.fields.insert({fnum}, ::std::string::String::from({pname:?}));"
-        );
-    }
-    for go in oneofs {
-        for arm in &go.arms {
-            let fnum = arm.number;
-            let pname = &arm.proto_name;
-            let _ = writeln!(
-                code,
-                "        meta.fields.insert({fnum}, ::std::string::String::from({pname:?}));"
-            );
-        }
-    }
     let mut child_code = String::new();
     for gf in fields {
         let fnum = gf.number;
@@ -1425,6 +1407,70 @@ fn emit_message_trait_impl(
     let _ = writeln!(code, "        ::core::option::Option::Some(meta)");
     let _ = writeln!(code, "    }}");
     let _ = writeln!(code, "}}\n");
+}
+
+fn has_child_messages(fields: &[GenField], oneofs: &[GenOneof]) -> bool {
+    fields.iter().any(|gf| {
+        matches!(
+            gf.kind,
+            GenFieldKind::SubMsg { .. }
+                | GenFieldKind::SubMsgArr { .. }
+                | GenFieldKind::Map {
+                    val: MapValKind::SubMsg { .. },
+                    ..
+                }
+        )
+    }) || oneofs.iter().any(|go| {
+        go.arms
+            .iter()
+            .any(|a| matches!(a.kind, OneofArmKind::SubMsg { .. }))
+    })
+}
+
+fn emit_schema_meta_expr(
+    code: &mut String,
+    indent: &str,
+    proto_short_name: &str,
+    fields: &[GenField],
+    oneofs: &[GenOneof],
+) {
+    let mut entries: Vec<(u32, &str)> = Vec::new();
+    for gf in fields {
+        entries.push((gf.number, gf.proto_name.as_str()));
+    }
+    for go in oneofs {
+        for arm in &go.arms {
+            entries.push((arm.number, arm.proto_name.as_str()));
+        }
+    }
+    let _ = writeln!(code, "{indent}::omnibuf::SchemaMeta {{");
+    let _ = writeln!(
+        code,
+        "{indent}    type_name: ::std::string::String::from({proto_short_name:?}),"
+    );
+    if entries.is_empty() {
+        let _ = writeln!(
+            code,
+            "{indent}    fields: ::std::collections::BTreeMap::new(),"
+        );
+    } else {
+        let _ = write!(code, "{indent}    fields: [");
+        for (idx, (fnum, pname)) in entries.iter().enumerate() {
+            if idx > 0 {
+                code.push_str(", ");
+            }
+            let _ = write!(code, "({fnum}u32, {pname:?})");
+        }
+        let _ = writeln!(
+            code,
+            "].into_iter().map(|(k, v)| (k, ::std::string::String::from(v))).collect(),"
+        );
+    }
+    let _ = writeln!(
+        code,
+        "{indent}    children: ::std::collections::BTreeMap::new(),"
+    );
+    let _ = writeln!(code, "{indent}}}");
 }
 
 fn emit_encode_oneof(code: &mut String, go: &GenOneof) {
@@ -2475,47 +2521,55 @@ fn emit_borrowed_view(
     }
     let _ = writeln!(code, "    }}\n");
 
-    let _ = writeln!(code, "    #[inline]");
-    let _ = writeln!(code, "    fn clear_omnibuf_borrowed(&mut self) {{");
-    for gf in fields {
-        let fident = &gf.rust_ident;
-        match &gf.kind {
-            GenFieldKind::Scalar(ProtoScalar::String) => {
-                let _ = writeln!(code, "        self.{fident} = \"\";");
-            }
-            GenFieldKind::Scalar(ProtoScalar::Bytes) => {
-                let _ = writeln!(code, "        self.{fident} = &[];");
-            }
-            GenFieldKind::ScalarArr(_)
-            | GenFieldKind::SubMsgArr { .. }
-            | GenFieldKind::Map { .. } => {
-                let _ = writeln!(
-                    code,
-                    "        if !self.{fident}.is_empty() {{ self.{fident}.clear(); }}"
-                );
-            }
-            GenFieldKind::OptScalar(_) | GenFieldKind::SubMsg { .. } => {
-                let _ = writeln!(
-                    code,
-                    "        if self.{fident}.is_some() {{ self.{fident} = ::core::option::Option::None; }}"
-                );
-            }
-            GenFieldKind::Scalar(_) => {
-                let _ = writeln!(
-                    code,
-                    "        self.{fident} = ::core::default::Default::default();"
-                );
+    let has_borrowed_reusable_heap = fields.iter().any(|gf| {
+        matches!(
+            gf.kind,
+            GenFieldKind::ScalarArr(_) | GenFieldKind::SubMsgArr { .. } | GenFieldKind::Map { .. }
+        )
+    });
+    if has_borrowed_reusable_heap {
+        let _ = writeln!(code, "    #[inline]");
+        let _ = writeln!(code, "    fn clear_omnibuf_borrowed(&mut self) {{");
+        for gf in fields {
+            let fident = &gf.rust_ident;
+            match &gf.kind {
+                GenFieldKind::Scalar(ProtoScalar::String) => {
+                    let _ = writeln!(code, "        self.{fident} = \"\";");
+                }
+                GenFieldKind::Scalar(ProtoScalar::Bytes) => {
+                    let _ = writeln!(code, "        self.{fident} = &[];");
+                }
+                GenFieldKind::ScalarArr(_)
+                | GenFieldKind::SubMsgArr { .. }
+                | GenFieldKind::Map { .. } => {
+                    let _ = writeln!(
+                        code,
+                        "        if !self.{fident}.is_empty() {{ self.{fident}.clear(); }}"
+                    );
+                }
+                GenFieldKind::OptScalar(_) | GenFieldKind::SubMsg { .. } => {
+                    let _ = writeln!(
+                        code,
+                        "        if self.{fident}.is_some() {{ self.{fident} = ::core::option::Option::None; }}"
+                    );
+                }
+                GenFieldKind::Scalar(_) => {
+                    let _ = writeln!(
+                        code,
+                        "        self.{fident} = ::core::default::Default::default();"
+                    );
+                }
             }
         }
+        for go in oneofs {
+            let fident = &go.field_ident;
+            let _ = writeln!(
+                code,
+                "        if self.{fident}.is_some() {{ self.{fident} = ::core::option::Option::None; }}"
+            );
+        }
+        let _ = writeln!(code, "    }}");
     }
-    for go in oneofs {
-        let fident = &go.field_ident;
-        let _ = writeln!(
-            code,
-            "        if self.{fident}.is_some() {{ self.{fident} = ::core::option::Option::None; }}"
-        );
-    }
-    let _ = writeln!(code, "    }}");
     let _ = writeln!(code, "}}\n");
 }
 
@@ -2799,6 +2853,30 @@ fn emit_opaque_view(code: &mut String, rust_name: &str, fields: &[GenField]) {
         emit_opaque_field_methods(code, gf);
     }
 
+    if has_fields {
+        let _ = writeln!(code, "    #[inline]");
+        let _ = writeln!(
+            code,
+            "    fn write_dirty_field(&self, dst: &mut ::std::vec::Vec<u8>, fnum: u16) {{"
+        );
+        let _ = writeln!(code, "        let deterministic = true;");
+        let _ = writeln!(code, "        let _ = deterministic;");
+        let _ = writeln!(
+            code,
+            "        let ::core::option::Option::Some(__dirty) = self.dirty_state.as_deref() else {{ return; }};"
+        );
+        let _ = writeln!(code, "        match fnum {{");
+        for gf in fields {
+            let fnum = gf.number;
+            let _ = writeln!(code, "            {fnum} => {{");
+            emit_opaque_dirty_field(code, gf);
+            let _ = writeln!(code, "            }}");
+        }
+        let _ = writeln!(code, "            _ => {{}}");
+        let _ = writeln!(code, "        }}");
+        let _ = writeln!(code, "    }}\n");
+    }
+
     let _ = writeln!(code, "    #[inline]");
     let _ = writeln!(code, "    pub fn marshal(&self) -> ::std::vec::Vec<u8> {{");
     let _ = writeln!(
@@ -2813,29 +2891,24 @@ fn emit_opaque_view(code: &mut String, rust_name: &str, fields: &[GenField]) {
         code,
         "    pub fn marshal_append(&self, dst: &mut ::std::vec::Vec<u8>) {{"
     );
-    let _ = writeln!(code, "        if self.dirty == 0 {{");
-    let _ = writeln!(
-        code,
-        "            ::omnibuf::opaque::append_packet(dst, &self.raw);"
-    );
-    let _ = writeln!(code, "            return;");
-    let _ = writeln!(code, "        }}");
-    let _ = writeln!(
-        code,
-        "        ::omnibuf::opaque::splice_fields(dst, &self.raw, self.dirty, {max_field}, |dst, fnum| {{"
-    );
-    let _ = writeln!(code, "            let deterministic = true;");
-    let _ = writeln!(code, "            let _ = deterministic;");
-    let _ = writeln!(code, "            match fnum {{");
-    for gf in fields {
-        let fnum = gf.number;
-        let _ = writeln!(code, "                {fnum} => {{");
-        emit_opaque_dirty_field(code, gf);
-        let _ = writeln!(code, "                }}");
+    if has_fields {
+        let _ = writeln!(code, "        if self.dirty == 0 {{");
+        let _ = writeln!(
+            code,
+            "            ::omnibuf::opaque::append_packet(dst, &self.raw);"
+        );
+        let _ = writeln!(code, "            return;");
+        let _ = writeln!(code, "        }}");
+        let _ = writeln!(
+            code,
+            "        ::omnibuf::opaque::splice_fields(dst, &self.raw, self.dirty, {max_field}, |dst, fnum| self.write_dirty_field(dst, fnum));"
+        );
+    } else {
+        let _ = writeln!(
+            code,
+            "        ::omnibuf::opaque::append_packet(dst, &self.raw);"
+        );
     }
-    let _ = writeln!(code, "                _ => {{}}");
-    let _ = writeln!(code, "            }}");
-    let _ = writeln!(code, "        }});");
     let _ = writeln!(code, "    }}\n");
 
     let _ = writeln!(code, "    #[inline]");
@@ -2855,28 +2928,23 @@ fn emit_opaque_view(code: &mut String, rust_name: &str, fields: &[GenField]) {
         code,
         "    pub fn try_marshal_append(&self, dst: &mut ::std::vec::Vec<u8>) -> ::omnibuf::Result<()> {{"
     );
-    let _ = writeln!(code, "        if self.dirty == 0 {{");
-    let _ = writeln!(
-        code,
-        "            return ::omnibuf::opaque::try_append_packet(dst, &self.raw);"
-    );
-    let _ = writeln!(code, "        }}");
-    let _ = writeln!(
-        code,
-        "        ::omnibuf::opaque::try_splice_fields(dst, &self.raw, self.dirty, {max_field}, |dst, fnum| {{"
-    );
-    let _ = writeln!(code, "            let deterministic = true;");
-    let _ = writeln!(code, "            let _ = deterministic;");
-    let _ = writeln!(code, "            match fnum {{");
-    for gf in fields {
-        let fnum = gf.number;
-        let _ = writeln!(code, "                {fnum} => {{");
-        emit_opaque_dirty_field(code, gf);
-        let _ = writeln!(code, "                }}");
+    if has_fields {
+        let _ = writeln!(code, "        if self.dirty == 0 {{");
+        let _ = writeln!(
+            code,
+            "            return ::omnibuf::opaque::try_append_packet(dst, &self.raw);"
+        );
+        let _ = writeln!(code, "        }}");
+        let _ = writeln!(
+            code,
+            "        ::omnibuf::opaque::try_splice_fields(dst, &self.raw, self.dirty, {max_field}, |dst, fnum| self.write_dirty_field(dst, fnum))"
+        );
+    } else {
+        let _ = writeln!(
+            code,
+            "        ::omnibuf::opaque::try_append_packet(dst, &self.raw)"
+        );
     }
-    let _ = writeln!(code, "                _ => {{}}");
-    let _ = writeln!(code, "            }}");
-    let _ = writeln!(code, "        }})");
     let _ = writeln!(code, "    }}\n");
 
     let _ = writeln!(code, "    #[inline]");
@@ -3544,7 +3612,7 @@ fn emit_opaque_dirty_field(code: &mut String, gf: &GenField) {
         method_stem: gf.method_stem.clone(),
         kind: gf.kind.clone(),
     };
-    emit_encode_stmt(code, &temp, "self.dirty_state.as_deref().unwrap().", false);
+    emit_encode_stmt(code, &temp, "__dirty.", false);
 }
 
 fn sanitize_pascal_ident(s: &str) -> String {
