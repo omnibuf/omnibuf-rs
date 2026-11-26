@@ -465,3 +465,193 @@ fn parse_array_header_typed_rejects_invalid_exp_elem_wt() {
         Some((0, 2))
     );
 }
+
+#[test]
+fn bulk_vec_helpers_raw_writer_and_container_slice_edge_cases() {
+    use omnibuf::codec::{
+        RawBufWriter, read_bool_vec_field, read_bytes_vec_field, read_fixed32_vec_field,
+        read_fixed64_vec_field, read_float32_vec_field, read_float64_vec_field,
+        read_sfixed32_vec_field, read_sfixed64_vec_field, read_string_vec_field,
+        write_bool_vec_field, write_bytes_vec_field, write_fixed32_vec_field,
+        write_fixed64_vec_field, write_float32_vec_field, write_float64_vec_field,
+        write_sfixed32_vec_field, write_sfixed64_vec_field, write_string_vec_field,
+    };
+    use omnibuf::wire::read_container_slice;
+
+    // 1. Bulk fixed-width numeric arrays roundtrip across empty, small, and 32-element slices.
+    let f64s: Vec<f64> = (0..32).map(|i| (i as f64) * -1.25 + 0.5).collect();
+    let mut buf = Vec::new();
+    write_float64_vec_field(&mut buf, 1, &f64s).unwrap();
+    let mut dec = Decoder::new(&buf);
+    assert_eq!(dec.next_tag().unwrap(), Some((1, WIRE_ARRAY)));
+    let mut got_f64 = Vec::new();
+    let np = read_float64_vec_field(&mut got_f64, dec.data(), dec.position(), 0, false).unwrap();
+    assert_eq!(np, buf.len());
+    assert_eq!(got_f64, f64s);
+
+    let f32s = vec![-0.0f32, 1.5, f32::MIN, f32::MAX];
+    buf.clear();
+    write_float32_vec_field(&mut buf, 2, &f32s).unwrap();
+    let mut dec = Decoder::new(&buf);
+    assert_eq!(dec.next_tag().unwrap(), Some((2, WIRE_ARRAY)));
+    let mut got_f32 = Vec::new();
+    read_float32_vec_field(&mut got_f32, dec.data(), dec.position(), 0, false).unwrap();
+    assert_eq!(
+        got_f32.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        f32s.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+
+    let u64s = vec![0u64, 1, u64::MAX, 0x0123_4567_89AB_CDEF];
+    buf.clear();
+    write_fixed64_vec_field(&mut buf, 3, &u64s).unwrap();
+    let mut dec = Decoder::new(&buf);
+    assert_eq!(dec.next_tag().unwrap(), Some((3, WIRE_ARRAY)));
+    let mut got_u64 = Vec::new();
+    read_fixed64_vec_field(&mut got_u64, dec.data(), dec.position(), 0, false).unwrap();
+    assert_eq!(got_u64, u64s);
+
+    let i64s = vec![i64::MIN, -1, 0, i64::MAX];
+    buf.clear();
+    write_sfixed64_vec_field(&mut buf, 4, &i64s).unwrap();
+    let mut dec = Decoder::new(&buf);
+    assert_eq!(dec.next_tag().unwrap(), Some((4, WIRE_ARRAY)));
+    let mut got_i64 = Vec::new();
+    read_sfixed64_vec_field(&mut got_i64, dec.data(), dec.position(), 0, false).unwrap();
+    assert_eq!(got_i64, i64s);
+
+    let u32s = vec![0u32, 42, u32::MAX];
+    buf.clear();
+    write_fixed32_vec_field(&mut buf, 5, &u32s).unwrap();
+    let mut dec = Decoder::new(&buf);
+    assert_eq!(dec.next_tag().unwrap(), Some((5, WIRE_ARRAY)));
+    let mut got_u32 = Vec::new();
+    read_fixed32_vec_field(&mut got_u32, dec.data(), dec.position(), 0, false).unwrap();
+    assert_eq!(got_u32, u32s);
+
+    let i32s = vec![i32::MIN, -7, 0, i32::MAX];
+    buf.clear();
+    write_sfixed32_vec_field(&mut buf, 6, &i32s).unwrap();
+    let mut dec = Decoder::new(&buf);
+    assert_eq!(dec.next_tag().unwrap(), Some((6, WIRE_ARRAY)));
+    let mut got_i32 = Vec::new();
+    read_sfixed32_vec_field(&mut got_i32, dec.data(), dec.position(), 0, false).unwrap();
+    assert_eq!(got_i32, i32s);
+
+    // 2. Bool array roundtrip and strict SWAR + tail rejection of invalid bytes (>= 2).
+    for len in [0usize, 1, 7, 8, 9, 15, 16, 17] {
+        let bools: Vec<bool> = (0..len).map(|i| (i % 2) == 1).collect();
+        buf.clear();
+        write_bool_vec_field(&mut buf, 7, &bools).unwrap();
+        let mut dec = Decoder::new(&buf);
+        assert_eq!(dec.next_tag().unwrap(), Some((7, WIRE_ARRAY)));
+        let mut got_bools = Vec::new();
+        read_bool_vec_field(&mut got_bools, dec.data(), dec.position(), 0, false).unwrap();
+        assert_eq!(got_bools, bools);
+
+        for bad_idx in 0..len {
+            let mut corrupt = buf.clone();
+            let payload_start = corrupt.len() - len;
+            corrupt[payload_start + bad_idx] = 2;
+            let mut dec = Decoder::new(&corrupt);
+            assert_eq!(dec.next_tag().unwrap(), Some((7, WIRE_ARRAY)));
+            let mut out = Vec::new();
+            assert!(read_bool_vec_field(&mut out, dec.data(), dec.position(), 0, false).is_err());
+        }
+    }
+
+    // 3. String & bytes vec helpers across short ASCII, non-ASCII UTF-8, >127B, and invalid UTF-8.
+    let strings = vec![
+        String::new(),
+        "a".into(),
+        "ab".into(),
+        "abc".into(),
+        "abcd".into(),
+        "abcdefg".into(),
+        "abcdefgh".into(),
+        "0123456789abcdef".into(),
+        "0123456789abcdef0123456789abcdef".into(),
+        "日本語🚀".into(),
+        "x".repeat(200),
+    ];
+    buf.clear();
+    write_string_vec_field(&mut buf, 8, &strings).unwrap();
+    let mut dec = Decoder::new(&buf);
+    assert_eq!(dec.next_tag().unwrap(), Some((8, WIRE_ARRAY)));
+    let mut got_strings = Vec::new();
+    read_string_vec_field(&mut got_strings, dec.data(), dec.position(), 0, false).unwrap();
+    assert_eq!(got_strings, strings);
+
+    let byte_vecs = vec![vec![], vec![1, 2, 3], vec![0xFF; 20], vec![0xAA; 150]];
+    buf.clear();
+    write_bytes_vec_field(&mut buf, 9, &byte_vecs).unwrap();
+    let mut dec = Decoder::new(&buf);
+    assert_eq!(dec.next_tag().unwrap(), Some((9, WIRE_ARRAY)));
+    let mut got_bytes = Vec::new();
+    read_bytes_vec_field(&mut got_bytes, dec.data(), dec.position(), 0, false).unwrap();
+    assert_eq!(got_bytes, byte_vecs);
+
+    // Invalid UTF-8 in WireArray(WireString) must be rejected.
+    let mut bad_utf8 = Vec::new();
+    write_string_vec_field(&mut bad_utf8, 8, &["hello".into()]).unwrap();
+    let last = bad_utf8.len() - 1;
+    bad_utf8[last] = 0xFF;
+    let mut dec = Decoder::new(&bad_utf8);
+    assert_eq!(dec.next_tag().unwrap(), Some((8, WIRE_ARRAY)));
+    let mut out_s = Vec::new();
+    assert!(read_string_vec_field(&mut out_s, dec.data(), dec.position(), 0, false).is_err());
+
+    // 4. RawBufWriter growth from zero-capacity Vec and high field numbers (> 16383).
+    let mut raw_dst = Vec::new();
+    {
+        let mut w = RawBufWriter::new(&mut raw_dst, 0);
+        w.write_bool(1, true);
+        w.write_sint(2, -42);
+        w.write_float64(4, 3.5);
+        w.write_string(5, "hi");
+        w.write_string(20_000, "high-field-num-日本語");
+        w.write_bytes(20_001, &[1, 2, 3, 4, 5]);
+        w.finish();
+    }
+    let mut dec = Decoder::new(&raw_dst);
+    assert_eq!(dec.next_tag().unwrap(), Some((1, WIRE_BOOL_TRUE)));
+    assert_eq!(dec.next_tag().unwrap(), Some((2, WIRE_SINT)));
+    assert_eq!(dec.read_sint().unwrap(), -42);
+    assert_eq!(dec.next_tag().unwrap(), Some((4, WIRE_FLOAT64)));
+    assert_eq!(dec.read_float64().unwrap(), 3.5);
+    assert_eq!(dec.next_tag().unwrap(), Some((5, WIRE_STRING)));
+    let mut s1 = String::new();
+    dec.read_str_into(&mut s1).unwrap();
+    assert_eq!(s1, "hi");
+    assert_eq!(dec.next_tag().unwrap(), Some((20_000, WIRE_STRING)));
+    let mut s2 = String::new();
+    dec.read_str_into(&mut s2).unwrap();
+    assert_eq!(s2, "high-field-num-日本語");
+    assert_eq!(dec.next_tag().unwrap(), Some((20_001, WIRE_BYTES)));
+    let mut b2 = Vec::new();
+    dec.read_bytes_into(&mut b2).unwrap();
+    assert_eq!(b2, vec![1, 2, 3, 4, 5]);
+    assert!(dec.is_empty());
+
+    // 5. read_container_slice accepts 1-byte (non-canonical), 2-byte (canonical), and 4-byte headers.
+    let one_byte_empty = [0x01u8];
+    assert_eq!(
+        read_container_slice(&one_byte_empty, 0, 0).unwrap(),
+        (&[][..], 1)
+    );
+    let one_byte_nonempty = [0x05u8, b'a', b'b'];
+    assert_eq!(
+        read_container_slice(&one_byte_nonempty, 0, 0).unwrap(),
+        (&b"ab"[..], 3)
+    );
+    let two_byte = [0x0Au8, 0x00, b'x', b'y'];
+    assert_eq!(
+        read_container_slice(&two_byte, 0, 0).unwrap(),
+        (&b"xy"[..], 4)
+    );
+    let mut four_byte = ((2u32 << 3) | 4).to_le_bytes().to_vec();
+    four_byte.extend_from_slice(b"zw");
+    assert_eq!(
+        read_container_slice(&four_byte, 0, 0).unwrap(),
+        (&b"zw"[..], 6)
+    );
+}

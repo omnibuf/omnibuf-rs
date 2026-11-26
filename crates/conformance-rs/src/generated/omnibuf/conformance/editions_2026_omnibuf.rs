@@ -39,18 +39,28 @@ impl Editions2026Child {
 }
 
 impl ::omnibuf::Message for Editions2026Child {
-    #[inline]
+    const HAS_NESTED_CONTAINERS: bool = false;
+
+    #[inline(always)]
     fn encode_omnibuf_append(
         &self,
         dst: &mut ::std::vec::Vec<u8>,
         deterministic: bool,
     ) -> ::omnibuf::Result<()> {
         let _ = deterministic;
-        if let ::core::option::Option::Some(ref v) = self.id {
-            ::omnibuf::codec::write_sint_field(dst, 1, i64::from(*v));
-        }
-        if let ::core::option::Option::Some(ref v) = self.note {
-            ::omnibuf::codec::write_string_field(dst, 2, v.as_str());
+        {
+            let mut __w = ::omnibuf::codec::RawBufWriter::new(
+                dst,
+                (10usize)
+                    .saturating_add(self.note.as_ref().map_or(0usize, |__v| 10usize + __v.len())),
+            );
+            if let ::core::option::Option::Some(ref v) = self.id {
+                __w.write_sint(1, i64::from(*v));
+            }
+            if let ::core::option::Option::Some(ref v) = self.note {
+                __w.write_string(2, v.as_str());
+            }
+            __w.finish();
         }
         ::core::result::Result::Ok(())
     }
@@ -469,6 +479,8 @@ impl TestEditions2026 {
 }
 
 impl ::omnibuf::Message for TestEditions2026 {
+    const HAS_NESTED_CONTAINERS: bool = true;
+
     #[inline]
     fn encode_omnibuf_append(
         &self,
@@ -476,26 +488,42 @@ impl ::omnibuf::Message for TestEditions2026 {
         deterministic: bool,
     ) -> ::omnibuf::Result<()> {
         let _ = deterministic;
-        if let ::core::option::Option::Some(ref v) = self.explicit_int {
-            ::omnibuf::codec::write_sint_field(dst, 1, i64::from(*v));
+        {
+            let mut __w = ::omnibuf::codec::RawBufWriter::new(
+                dst,
+                ((42usize).saturating_add(
+                    self.explicit_string
+                        .as_ref()
+                        .map_or(0usize, |__v| 10usize + __v.len()),
+                ))
+                .saturating_add(
+                    self.explicit_bytes
+                        .as_ref()
+                        .map_or(0usize, |__v| 10usize + __v.len()),
+                ),
+            );
+            if let ::core::option::Option::Some(ref v) = self.explicit_int {
+                __w.write_sint(1, i64::from(*v));
+            }
+            if let ::core::option::Option::Some(ref v) = self.explicit_bool {
+                __w.write_bool(2, *v);
+            }
+            if let ::core::option::Option::Some(ref v) = self.explicit_string {
+                __w.write_string(3, v.as_str());
+            }
+            if let ::core::option::Option::Some(ref v) = self.explicit_bytes {
+                __w.write_bytes(4, v.as_slice());
+            }
+            if let ::core::option::Option::Some(ref v) = self.explicit_double {
+                __w.write_float64(5, *v);
+            }
+            if let ::core::option::Option::Some(ref v) = self.status {
+                __w.write_sint(6, i64::from(*v));
+            }
+            __w.write_sint(7, i64::from(self.implicit_count));
+            __w.write_bool(8, self.implicit_flag);
+            __w.finish();
         }
-        if let ::core::option::Option::Some(ref v) = self.explicit_bool {
-            ::omnibuf::codec::write_bool_field(dst, 2, *v);
-        }
-        if let ::core::option::Option::Some(ref v) = self.explicit_string {
-            ::omnibuf::codec::write_string_field(dst, 3, v.as_str());
-        }
-        if let ::core::option::Option::Some(ref v) = self.explicit_bytes {
-            ::omnibuf::codec::write_bytes_field(dst, 4, v.as_slice());
-        }
-        if let ::core::option::Option::Some(ref v) = self.explicit_double {
-            ::omnibuf::codec::write_float64_field(dst, 5, *v);
-        }
-        if let ::core::option::Option::Some(ref v) = self.status {
-            ::omnibuf::codec::write_sint_field(dst, 6, i64::from(*v));
-        }
-        ::omnibuf::codec::write_sint_field(dst, 7, i64::from(self.implicit_count));
-        ::omnibuf::codec::write_bool_field(dst, 8, self.implicit_flag);
         if let ::core::option::Option::Some(ref sub) = self.child {
             ::omnibuf::codec::write_sub_msg_field(dst, 9, sub, deterministic)?;
         }

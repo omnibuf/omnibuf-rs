@@ -11,11 +11,12 @@ use crate::wire::{
     WIRE_EXTENDED, WIRE_FIXED32, WIRE_FIXED64, WIRE_FLOAT32, WIRE_FLOAT64, WIRE_MAP, WIRE_SFIXED32,
     WIRE_SFIXED64, WIRE_SINT, WIRE_STRING, WIRE_SUB_MSG, WIRE_UINT, append_bytes_elem, append_tag,
     append_varint, backpatch_container_len, backpatch_container_len_4b, backpatch_container_len_9b,
-    cold_parse_err, container_len_width, decode_varint, decode_zigzag, encode_zigzag,
-    fast_skip_value, grow_capacity, is_valid_utf8, parse_array_header, parse_array_header_typed,
-    parse_map_header, put_varint_raw, read_len_slice, read_len_slice_opt, read_str_slice,
-    read_varint_at, read_varint_at_opt, varint_len, write_bool_tagged, write_bytes_tagged,
-    write_fixed_tagged, write_varint_tagged,
+    backpatch_container_len_fast, bytes_to_owned_utf8, bytes_to_owned_vec, cold_parse_err,
+    container_len_width, copy_bytes_fast, decode_varint, decode_zigzag, encode_zigzag,
+    fast_skip_value, grow_capacity, parse_array_header, parse_array_header_typed, parse_map_header,
+    put_varint_raw, read_container_slice, read_container_slice_opt, read_len_slice,
+    read_len_slice_opt, read_str_slice, read_varint_at, read_varint_at_opt, varint_len,
+    write_bool_tagged, write_bytes_tagged, write_fixed_tagged, write_varint_tagged,
 };
 
 static ACTIVE_BUDGET_GUARDS: AtomicUsize = AtomicUsize::new(0);
@@ -376,6 +377,12 @@ fn validate_entry_with_limits(
 
 /// Trait implemented by Rust types that serialize and deserialize in OmniBuf wire format.
 pub trait Message: Default + Sized + 'static {
+    /// Whether `Self` contains any nested sub-message, array, map, or oneof fields.
+    ///
+    /// Leaf structs containing only scalar, string, or bytes fields set this to `false`
+    /// so container writers can skip redundant `min_wire_size()` pre-scans.
+    const HAS_NESTED_CONTAINERS: bool = true;
+
     /// Appends the OmniBuf wire representation of `self` to `dst`.
     fn encode_omnibuf_append(&self, dst: &mut Vec<u8>, deterministic: bool) -> Result<()>;
 
@@ -775,19 +782,297 @@ pub mod codec {
         }
     }
 
+    /// Single-reserve raw-pointer writer for contiguous runs of flat scalar, string, and bytes fields.
+    ///
+    /// Amortizes capacity checks and `Vec::len` updates across a run of fields while keeping
+    /// all caller-facing write methods safe.
+    pub struct RawBufWriter<'a> {
+        dst: &'a mut Vec<u8>,
+        ptr: *mut u8,
+        end: *mut u8,
+    }
+
+    impl<'a> RawBufWriter<'a> {
+        /// Reserves at least `max_bytes` of spare capacity in `dst` and initializes a raw write cursor.
+        #[inline(always)]
+        pub fn new(dst: &'a mut Vec<u8>, max_bytes: usize) -> Self {
+            let len = dst.len();
+            if dst.capacity() - len < max_bytes {
+                dst.reserve(max_bytes);
+            }
+            let cap = dst.capacity();
+            let base = dst.as_mut_ptr();
+            // SAFETY: `len <= cap` always holds for any `Vec<u8>`.
+            unsafe {
+                Self {
+                    dst,
+                    ptr: base.add(len),
+                    end: base.add(cap),
+                }
+            }
+        }
+
+        /// Commits all written bytes back to `dst.len()`.
+        #[inline(always)]
+        pub fn finish(self) {
+            // SAFETY: `self.ptr` was derived from `self.dst.as_mut_ptr()` and only advanced
+            // over initialized bytes within `self.dst`'s capacity.
+            unsafe {
+                let new_len = self.ptr.offset_from(self.dst.as_ptr()) as usize;
+                self.dst.set_len(new_len);
+            }
+        }
+
+        #[cold]
+        #[inline(never)]
+        fn grow_cold(&mut self, needed: usize) {
+            // SAFETY: `self.ptr` is within `self.dst`'s allocation and every byte before `self.ptr`
+            // has been initialized.
+            unsafe {
+                let written = self.ptr.offset_from(self.dst.as_ptr()) as usize;
+                self.dst.set_len(written);
+                self.dst.reserve(needed);
+                let base = self.dst.as_mut_ptr();
+                self.ptr = base.add(written);
+                self.end = base.add(self.dst.capacity());
+            }
+        }
+
+        #[inline(always)]
+        fn ensure(&mut self, needed: usize) {
+            if (self.end as usize).wrapping_sub(self.ptr as usize) < needed {
+                self.grow_cold(needed);
+            }
+        }
+
+        /// Writes `tag` at `self.ptr`, advancing `self.ptr` by `varint_len(tag)`.
+        ///
+        /// # Safety
+        /// At least `varint_len(tag)` writable bytes must remain at `self.ptr`.
+        #[inline(always)]
+        unsafe fn write_tag_unchecked(&mut self, tag: u64) {
+            // SAFETY: Caller guarantees at least `varint_len(tag)` writable bytes remain at `self.ptr`.
+            unsafe {
+                if tag <= 127 {
+                    *self.ptr = ((tag as u8) << 1) | 1;
+                    self.ptr = self.ptr.add(1);
+                } else if tag <= 16_383 {
+                    let u = ((tag as u16) << 2) | 2;
+                    core::ptr::write_unaligned(self.ptr.cast::<u16>(), u.to_le());
+                    self.ptr = self.ptr.add(2);
+                } else if tag <= 536_870_911 {
+                    let u = ((tag as u32) << 3) | 4;
+                    core::ptr::write_unaligned(self.ptr.cast::<u32>(), u.to_le());
+                    self.ptr = self.ptr.add(4);
+                } else {
+                    *self.ptr = 0;
+                    core::ptr::write_unaligned(self.ptr.add(1).cast::<u64>(), tag.to_le());
+                    self.ptr = self.ptr.add(9);
+                }
+            }
+        }
+
+        /// Writes a zero-payload boolean field tag.
+        #[inline(always)]
+        pub fn write_bool(&mut self, field_num: u32, v: bool) {
+            let tf = (u64::from(field_num) << 4) | u64::from(WIRE_BOOL_FALSE);
+            let tt = (u64::from(field_num) << 4) | u64::from(WIRE_BOOL_TRUE);
+            if tt <= 127 {
+                self.ensure(1);
+                // SAFETY: `self.ensure(1)` guarantees at least 1 writable byte at `self.ptr`.
+                unsafe {
+                    *self.ptr = (((tf as u8) << 1) | 1) | ((u8::from(v)) << 1);
+                    self.ptr = self.ptr.add(1);
+                }
+            } else if tt <= 16_383 {
+                self.ensure(2);
+                let u = if v {
+                    ((tt as u16) << 2) | 2
+                } else {
+                    ((tf as u16) << 2) | 2
+                };
+                // SAFETY: `self.ensure(2)` guarantees at least 2 writable bytes at `self.ptr`.
+                unsafe {
+                    core::ptr::write_unaligned(self.ptr.cast::<u16>(), u.to_le());
+                    self.ptr = self.ptr.add(2);
+                }
+            } else {
+                let tag = if v { tt } else { tf };
+                let tw = varint_len(tag);
+                self.ensure(tw);
+                // SAFETY: `self.ensure(tw)` guarantees `tw` writable bytes at `self.ptr`.
+                unsafe {
+                    self.write_tag_unchecked(tag);
+                }
+            }
+        }
+
+        #[inline(always)]
+        fn write_varint_with_wt(&mut self, field_num: u32, wt: u8, v: u64) {
+            let tag = (u64::from(field_num) << 4) | u64::from(wt);
+            let tw = varint_len(tag);
+            self.ensure(tw + 9);
+            // SAFETY: `self.ensure(tw + 9)` guarantees `tw` tag bytes plus at least 9 varint bytes.
+            unsafe {
+                self.write_tag_unchecked(tag);
+                let vn = put_varint_raw(self.ptr, v);
+                self.ptr = self.ptr.add(vn);
+            }
+        }
+
+        /// Writes a `WireUint` field.
+        #[inline(always)]
+        pub fn write_uint(&mut self, field_num: u32, v: u64) {
+            self.write_varint_with_wt(field_num, WIRE_UINT, v);
+        }
+
+        /// Writes a `WireSint` (ZigZag-encoded) field.
+        #[inline(always)]
+        pub fn write_sint(&mut self, field_num: u32, v: i64) {
+            self.write_varint_with_wt(field_num, WIRE_SINT, encode_zigzag(v));
+        }
+
+        #[inline(always)]
+        fn write_fixed32_with_wt(&mut self, field_num: u32, wt: u8, v: u32) {
+            let tag = (u64::from(field_num) << 4) | u64::from(wt);
+            let tw = varint_len(tag);
+            self.ensure(tw + 4);
+            // SAFETY: `self.ensure(tw + 4)` guarantees `tw + 4` writable bytes at `self.ptr`.
+            unsafe {
+                self.write_tag_unchecked(tag);
+                core::ptr::write_unaligned(self.ptr.cast::<u32>(), v.to_le());
+                self.ptr = self.ptr.add(4);
+            }
+        }
+
+        #[inline(always)]
+        fn write_fixed64_with_wt(&mut self, field_num: u32, wt: u8, v: u64) {
+            let tag = (u64::from(field_num) << 4) | u64::from(wt);
+            let tw = varint_len(tag);
+            self.ensure(tw + 8);
+            // SAFETY: `self.ensure(tw + 8)` guarantees `tw + 8` writable bytes at `self.ptr`.
+            unsafe {
+                self.write_tag_unchecked(tag);
+                core::ptr::write_unaligned(self.ptr.cast::<u64>(), v.to_le());
+                self.ptr = self.ptr.add(8);
+            }
+        }
+
+        /// Writes a `WireFixed32` field.
+        #[inline(always)]
+        pub fn write_fixed32(&mut self, field_num: u32, v: u32) {
+            self.write_fixed32_with_wt(field_num, WIRE_FIXED32, v);
+        }
+
+        /// Writes a `WireFixed64` field.
+        #[inline(always)]
+        pub fn write_fixed64(&mut self, field_num: u32, v: u64) {
+            self.write_fixed64_with_wt(field_num, WIRE_FIXED64, v);
+        }
+
+        /// Writes a `WireSfixed32` field.
+        #[inline(always)]
+        pub fn write_sfixed32(&mut self, field_num: u32, v: i32) {
+            self.write_fixed32_with_wt(field_num, WIRE_SFIXED32, v as u32);
+        }
+
+        /// Writes a `WireSfixed64` field.
+        #[inline(always)]
+        pub fn write_sfixed64(&mut self, field_num: u32, v: i64) {
+            self.write_fixed64_with_wt(field_num, WIRE_SFIXED64, v as u64);
+        }
+
+        /// Writes a `WireFloat32` field.
+        #[inline(always)]
+        pub fn write_float32(&mut self, field_num: u32, v: f32) {
+            self.write_fixed32_with_wt(field_num, WIRE_FLOAT32, v.to_bits());
+        }
+
+        /// Writes a `WireFloat64` field.
+        #[inline(always)]
+        pub fn write_float64(&mut self, field_num: u32, v: f64) {
+            self.write_fixed64_with_wt(field_num, WIRE_FLOAT64, v.to_bits());
+        }
+
+        #[inline(always)]
+        fn write_bytes_with_wt(&mut self, field_num: u32, wt: u8, b: &[u8]) {
+            let tag = (u64::from(field_num) << 4) | u64::from(wt);
+            let tw = varint_len(tag);
+            let blen = b.len();
+            let needed = blen.checked_add(tw + 9).expect("capacity overflow");
+            self.ensure(needed);
+            // SAFETY: `self.ensure(tw + 9 + blen)` guarantees enough writable bytes for tag,
+            // length varint, and payload; `b` is disjoint from `self.dst`.
+            unsafe {
+                self.write_tag_unchecked(tag);
+                let dst_ptr = if blen <= 127 {
+                    *self.ptr = ((blen as u8) << 1) | 1;
+                    self.ptr.add(1)
+                } else {
+                    self.ptr.add(put_varint_raw(self.ptr, blen as u64))
+                };
+                copy_bytes_fast(b.as_ptr(), dst_ptr, blen);
+                self.ptr = dst_ptr.add(blen);
+            }
+        }
+
+        /// Writes a `WireString` field.
+        #[inline(always)]
+        pub fn write_string(&mut self, field_num: u32, s: &str) {
+            self.write_bytes_with_wt(field_num, WIRE_STRING, s.as_bytes());
+        }
+
+        /// Writes a `WireBytes` field.
+        #[inline(always)]
+        pub fn write_bytes(&mut self, field_num: u32, b: &[u8]) {
+            self.write_bytes_with_wt(field_num, WIRE_BYTES, b);
+        }
+
+        /// Writes a `buffa::EnumValue<E>` field as `WireSint`.
+        #[cfg(feature = "buffa")]
+        #[inline(always)]
+        pub fn write_buffa_enum<E: ::buffa::Enumeration>(
+            &mut self,
+            field_num: u32,
+            val: &::buffa::EnumValue<E>,
+        ) {
+            self.write_sint(field_num, i64::from(val.to_i32()));
+        }
+    }
+
     #[inline(always)]
     fn begin_tagged_container(dst: &mut Vec<u8>, field_num: u32, wire_type: u8) -> usize {
         let tag = (u64::from(field_num) << 4) | u64::from(wire_type & 0x0F);
         if tag <= 127 {
             let b0 = ((tag as u8) << 1) | 1;
-            let len_pos = dst.len() + 1;
-            dst.extend_from_slice(&[b0, 0, 0]);
-            len_pos
+            let len = dst.len();
+            if dst.capacity() - len < 3 {
+                dst.reserve(3);
+            }
+            // SAFETY: At least 3 writable bytes exist at `len`.
+            unsafe {
+                let ptr = dst.as_mut_ptr().add(len);
+                *ptr = b0;
+                *ptr.add(1) = 0;
+                *ptr.add(2) = 0;
+                dst.set_len(len + 3);
+            }
+            len + 1
         } else if tag <= 16_383 {
-            let tb = (((tag as u16) << 2) | 2).to_le_bytes();
-            let len_pos = dst.len() + 2;
-            dst.extend_from_slice(&[tb[0], tb[1], 0, 0]);
-            len_pos
+            let u = ((tag as u16) << 2) | 2;
+            let len = dst.len();
+            if dst.capacity() - len < 4 {
+                dst.reserve(4);
+            }
+            // SAFETY: At least 4 writable bytes exist at `len`.
+            unsafe {
+                let ptr = dst.as_mut_ptr().add(len);
+                core::ptr::write_unaligned(ptr.cast::<u16>(), u.to_le());
+                *ptr.add(2) = 0;
+                *ptr.add(3) = 0;
+                dst.set_len(len + 4);
+            }
+            len + 2
         } else {
             append_tag(dst, field_num, wire_type);
             let len_pos = dst.len();
@@ -820,11 +1105,13 @@ pub mod codec {
     #[inline(always)]
     fn begin_tagged_array(dst: &mut Vec<u8>, field_num: u32, elem_wt: u8, count: usize) -> usize {
         let tag = (u64::from(field_num) << 4) | u64::from(WIRE_ARRAY);
-        dst.reserve(9 + 3 + 9);
-        // SAFETY: `dst.reserve(21)` guarantees space for up to 9 tag bytes, 3 header bytes,
-        // and up to 9 count varint bytes; all written bytes are initialized before `set_len`.
+        let len = dst.len();
+        if dst.capacity() - len < 21 {
+            dst.reserve(21);
+        }
+        // SAFETY: At least 21 writable bytes exist at `len` (up to 9 tag bytes, 3 header bytes,
+        // and up to 9 count varint bytes); all written bytes are initialized before `set_len`.
         unsafe {
-            let len = dst.len();
             let ptr = dst.as_mut_ptr().add(len);
             let tn = put_varint_raw(ptr, tag);
             let len_pos = len + tn;
@@ -906,7 +1193,14 @@ pub mod codec {
     pub fn assign_str(slot: &mut String, s: &str) {
         if slot.capacity() == 0 {
             if !s.is_empty() {
-                *slot = s.to_owned();
+                let n = s.len();
+                let mut v = Vec::<u8>::with_capacity(n);
+                // SAFETY: `v` has capacity `n`, `s` is valid UTF-8 and disjoint from `v`.
+                unsafe {
+                    copy_bytes_fast(s.as_ptr(), v.as_mut_ptr(), n);
+                    v.set_len(n);
+                    *slot = String::from_utf8_unchecked(v);
+                }
             }
         } else {
             assign_str_reuse(slot, s);
@@ -923,7 +1217,7 @@ pub mod codec {
     pub fn assign_bytes(slot: &mut Vec<u8>, b: &[u8]) {
         if slot.capacity() == 0 {
             if !b.is_empty() {
-                *slot = b.to_vec();
+                *slot = bytes_to_owned_vec(b);
             }
         } else {
             assign_bytes_reuse(slot, b);
@@ -1098,14 +1392,14 @@ pub mod codec {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn write_sub_msg_field<M: Message>(
         dst: &mut Vec<u8>,
         field_num: u32,
         msg: &M,
         deterministic: bool,
     ) -> Result<()> {
-        if dst.capacity() > 16_383 {
+        if M::HAS_NESTED_CONTAINERS && dst.capacity() > 16_383 {
             let min_body = msg.min_wire_size();
             if min_body > 16_383 {
                 dst.reserve(min_body.saturating_add(16));
@@ -1117,11 +1411,12 @@ pub mod codec {
         }
         let len_pos = begin_tagged_container(dst, field_num, WIRE_SUB_MSG);
         msg.encode_omnibuf_append(dst, deterministic)?;
-        backpatch_container_len(dst, len_pos);
+        // SAFETY: `begin_tagged_container` appended the 2-byte length slot at `len_pos`.
+        unsafe { backpatch_container_len_fast(dst, len_pos) };
         Ok(())
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn read_sub_msg_field<M: Message>(
         msg: &mut M,
         data: &[u8],
@@ -1129,7 +1424,7 @@ pub mod codec {
         depth: usize,
         merge: bool,
     ) -> Result<usize> {
-        let (sub_bytes, next_pos) = read_len_slice(data, pos, 0)?;
+        let (sub_bytes, next_pos) = read_container_slice(data, pos, 0)?;
         msg.decode_omnibuf_at_depth(sub_bytes, depth + 1, merge)?;
         Ok(next_pos)
     }
@@ -1152,11 +1447,12 @@ pub mod codec {
         depth: usize,
         merge: bool,
     ) -> Result<usize> {
-        let (sub_bytes, next_pos) = read_len_slice(data, pos, 0)?;
+        let (sub_bytes, next_pos) = read_container_slice(data, pos, 0)?;
         match slot {
             None => {
-                let msg = slot.insert(M::default());
+                let mut msg = M::default();
                 msg.decode_omnibuf_at_depth(sub_bytes, depth + 1, true)?;
+                *slot = Some(msg);
             }
             Some(msg) => {
                 decode_existing_sub_msg(msg, sub_bytes, depth + 1, merge)?;
@@ -1173,7 +1469,7 @@ pub mod codec {
         depth: usize,
         merge: bool,
     ) -> Result<usize> {
-        let (sub_bytes, next_pos) = read_len_slice(data, pos, 0)?;
+        let (sub_bytes, next_pos) = read_container_slice(data, pos, 0)?;
         match slot {
             Some(msg) => msg.decode_omnibuf_at_depth(sub_bytes, depth + 1, merge)?,
             None => {
@@ -1296,6 +1592,583 @@ pub mod codec {
         Ok(())
     }
 
+    #[inline(always)]
+    fn write_le_fixed_vec_field<T: Copy>(
+        dst: &mut Vec<u8>,
+        field_num: u32,
+        elem_wt: u8,
+        items: &[T],
+        #[cfg(not(target_endian = "little"))] write_le: fn(*mut u8, T),
+    ) -> Result<()> {
+        let count = items.len();
+        let elem_size = core::mem::size_of::<T>();
+        let payload_bytes = count.checked_mul(elem_size).expect("capacity overflow");
+        let cn = varint_len(count as u64);
+        let sub_len = 1usize
+            .checked_add(cn)
+            .and_then(|n| n.checked_add(payload_bytes))
+            .expect("capacity overflow");
+        let tag = (u64::from(field_num) << 4) | u64::from(WIRE_ARRAY);
+        let tw = varint_len(tag);
+        let lw = container_len_width(sub_len);
+        let exact = tw
+            .checked_add(lw)
+            .and_then(|n| n.checked_add(sub_len))
+            .expect("capacity overflow");
+        let need = exact.checked_add(8).expect("capacity overflow");
+        let start_len = dst.len();
+        if dst.capacity() - start_len < need {
+            dst.reserve(need);
+        }
+        // SAFETY: At least `exact + 8` writable bytes exist at `start_len` (providing at least
+        // 9 writable bytes at every `put_varint_raw` / `put_container_len_raw` call), `items` is
+        // disjoint from `dst`, and exactly `exact` bytes are initialized before `set_len`.
+        unsafe {
+            let mut ptr = dst.as_mut_ptr().add(start_len);
+            ptr = ptr.add(put_varint_raw(ptr, tag));
+            ptr = ptr.add(put_container_len_raw(ptr, sub_len));
+            *ptr = elem_wt;
+            ptr = ptr.add(1);
+            ptr = ptr.add(put_varint_raw(ptr, count as u64));
+            if payload_bytes > 0 {
+                #[cfg(target_endian = "little")]
+                {
+                    core::ptr::copy_nonoverlapping(items.as_ptr().cast::<u8>(), ptr, payload_bytes);
+                }
+                #[cfg(not(target_endian = "little"))]
+                {
+                    for &item in items {
+                        write_le(ptr, item);
+                        ptr = ptr.add(elem_size);
+                    }
+                }
+            }
+            dst.set_len(start_len + exact);
+        }
+        Ok(())
+    }
+
+    /// Encodes `Vec<f64>` as `WireArray(WireFloat64)` with exact length calculation and bulk copy.
+    #[inline(always)]
+    pub fn write_float64_vec_field(dst: &mut Vec<u8>, field_num: u32, items: &[f64]) -> Result<()> {
+        write_le_fixed_vec_field(
+            dst,
+            field_num,
+            WIRE_FLOAT64,
+            items,
+            #[cfg(not(target_endian = "little"))]
+            |ptr, v| {
+                // SAFETY: Caller guarantees 8 writable bytes at `ptr`.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(v.to_bits().to_le_bytes().as_ptr(), ptr, 8);
+                }
+            },
+        )
+    }
+
+    /// Encodes `Vec<f32>` as `WireArray(WireFloat32)` with exact length calculation and bulk copy.
+    #[inline(always)]
+    pub fn write_float32_vec_field(dst: &mut Vec<u8>, field_num: u32, items: &[f32]) -> Result<()> {
+        write_le_fixed_vec_field(
+            dst,
+            field_num,
+            WIRE_FLOAT32,
+            items,
+            #[cfg(not(target_endian = "little"))]
+            |ptr, v| {
+                // SAFETY: Caller guarantees 4 writable bytes at `ptr`.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(v.to_bits().to_le_bytes().as_ptr(), ptr, 4);
+                }
+            },
+        )
+    }
+
+    /// Encodes `Vec<u64>` as `WireArray(WireFixed64)` with exact length calculation and bulk copy.
+    #[inline(always)]
+    pub fn write_fixed64_vec_field(dst: &mut Vec<u8>, field_num: u32, items: &[u64]) -> Result<()> {
+        write_le_fixed_vec_field(
+            dst,
+            field_num,
+            WIRE_FIXED64,
+            items,
+            #[cfg(not(target_endian = "little"))]
+            |ptr, v| {
+                // SAFETY: Caller guarantees 8 writable bytes at `ptr`.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(v.to_le_bytes().as_ptr(), ptr, 8);
+                }
+            },
+        )
+    }
+
+    /// Encodes `Vec<i64>` as `WireArray(WireSfixed64)` with exact length calculation and bulk copy.
+    #[inline(always)]
+    pub fn write_sfixed64_vec_field(
+        dst: &mut Vec<u8>,
+        field_num: u32,
+        items: &[i64],
+    ) -> Result<()> {
+        write_le_fixed_vec_field(
+            dst,
+            field_num,
+            WIRE_SFIXED64,
+            items,
+            #[cfg(not(target_endian = "little"))]
+            |ptr, v| {
+                // SAFETY: Caller guarantees 8 writable bytes at `ptr`.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(v.to_le_bytes().as_ptr(), ptr, 8);
+                }
+            },
+        )
+    }
+
+    /// Encodes `Vec<u32>` as `WireArray(WireFixed32)` with exact length calculation and bulk copy.
+    #[inline(always)]
+    pub fn write_fixed32_vec_field(dst: &mut Vec<u8>, field_num: u32, items: &[u32]) -> Result<()> {
+        write_le_fixed_vec_field(
+            dst,
+            field_num,
+            WIRE_FIXED32,
+            items,
+            #[cfg(not(target_endian = "little"))]
+            |ptr, v| {
+                // SAFETY: Caller guarantees 4 writable bytes at `ptr`.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(v.to_le_bytes().as_ptr(), ptr, 4);
+                }
+            },
+        )
+    }
+
+    /// Encodes `Vec<i32>` as `WireArray(WireSfixed32)` with exact length calculation and bulk copy.
+    #[inline(always)]
+    pub fn write_sfixed32_vec_field(
+        dst: &mut Vec<u8>,
+        field_num: u32,
+        items: &[i32],
+    ) -> Result<()> {
+        write_le_fixed_vec_field(
+            dst,
+            field_num,
+            WIRE_SFIXED32,
+            items,
+            #[cfg(not(target_endian = "little"))]
+            |ptr, v| {
+                // SAFETY: Caller guarantees 4 writable bytes at `ptr`.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(v.to_le_bytes().as_ptr(), ptr, 4);
+                }
+            },
+        )
+    }
+
+    /// Encodes `Vec<bool>` as `WireArray(WireBoolFalse)` with exact length calculation and bulk copy.
+    #[inline(always)]
+    pub fn write_bool_vec_field(dst: &mut Vec<u8>, field_num: u32, items: &[bool]) -> Result<()> {
+        write_le_fixed_vec_field(
+            dst,
+            field_num,
+            WIRE_BOOL_FALSE,
+            items,
+            #[cfg(not(target_endian = "little"))]
+            |ptr, v| {
+                // SAFETY: Caller guarantees 1 writable byte at `ptr`.
+                unsafe {
+                    *ptr = u8::from(v);
+                }
+            },
+        )
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn grow_raw_cursor(
+        dst: &mut Vec<u8>,
+        ptr: &mut *mut u8,
+        end: &mut *mut u8,
+        needed: usize,
+    ) {
+        // SAFETY: Caller guarantees `*ptr` is within `dst`'s allocation and initialized up to `*ptr`.
+        unsafe {
+            let written = (*ptr).offset_from(dst.as_ptr()) as usize;
+            dst.set_len(written);
+            dst.reserve(needed);
+            let base = dst.as_mut_ptr();
+            *ptr = base.add(written);
+            *end = base.add(dst.capacity());
+        }
+    }
+
+    /// Encodes `Vec<String>` as `WireArray(WireString)` in a single-pass raw-pointer loop.
+    #[inline(always)]
+    pub fn write_string_vec_field(
+        dst: &mut Vec<u8>,
+        field_num: u32,
+        items: &[String],
+    ) -> Result<()> {
+        let count = items.len();
+        let len_pos = begin_tagged_array(dst, field_num, WIRE_STRING, count);
+        let cur_len = dst.len();
+        // SAFETY: `cur_len <= dst.capacity()` always holds.
+        let (mut ptr, mut end) = unsafe {
+            let base = dst.as_mut_ptr();
+            (base.add(cur_len), base.add(dst.capacity()))
+        };
+        for s in items {
+            let b = s.as_bytes();
+            let n = b.len();
+            let need = n.checked_add(9).expect("capacity overflow");
+            if (end as usize).wrapping_sub(ptr as usize) < need {
+                // SAFETY: Every byte up to `ptr` has been initialized within `dst`.
+                unsafe {
+                    grow_raw_cursor(dst, &mut ptr, &mut end, need);
+                }
+            }
+            // SAFETY: At least `n + 9` writable bytes remain at `ptr`, and `b` is disjoint from `dst`.
+            unsafe {
+                if n <= 127 {
+                    *ptr = ((n as u8) << 1) | 1;
+                    ptr = ptr.add(1);
+                } else {
+                    ptr = ptr.add(put_varint_raw(ptr, n as u64));
+                }
+                copy_bytes_fast(b.as_ptr(), ptr, n);
+                ptr = ptr.add(n);
+            }
+        }
+        // SAFETY: Every byte up to `ptr` has been initialized, and `len_pos + 2 <= new_len`.
+        unsafe {
+            let new_len = ptr.offset_from(dst.as_ptr()) as usize;
+            dst.set_len(new_len);
+            backpatch_container_len_fast(dst, len_pos);
+        }
+        Ok(())
+    }
+
+    /// Encodes `Vec<Vec<u8>>` as `WireArray(WireBytes)` in a single-pass raw-pointer loop.
+    #[inline(always)]
+    pub fn write_bytes_vec_field(
+        dst: &mut Vec<u8>,
+        field_num: u32,
+        items: &[Vec<u8>],
+    ) -> Result<()> {
+        let count = items.len();
+        let len_pos = begin_tagged_array(dst, field_num, WIRE_BYTES, count);
+        let cur_len = dst.len();
+        // SAFETY: `cur_len <= dst.capacity()` always holds.
+        let (mut ptr, mut end) = unsafe {
+            let base = dst.as_mut_ptr();
+            (base.add(cur_len), base.add(dst.capacity()))
+        };
+        for b in items {
+            let n = b.len();
+            let need = n.checked_add(9).expect("capacity overflow");
+            if (end as usize).wrapping_sub(ptr as usize) < need {
+                // SAFETY: Every byte up to `ptr` has been initialized within `dst`.
+                unsafe {
+                    grow_raw_cursor(dst, &mut ptr, &mut end, need);
+                }
+            }
+            // SAFETY: At least `n + 9` writable bytes remain at `ptr`, and `b` is disjoint from `dst`.
+            unsafe {
+                if n <= 127 {
+                    *ptr = ((n as u8) << 1) | 1;
+                    ptr = ptr.add(1);
+                } else {
+                    ptr = ptr.add(put_varint_raw(ptr, n as u64));
+                }
+                copy_bytes_fast(b.as_ptr(), ptr, n);
+                ptr = ptr.add(n);
+            }
+        }
+        // SAFETY: Every byte up to `ptr` has been initialized, and `len_pos + 2 <= new_len`.
+        unsafe {
+            let new_len = ptr.offset_from(dst.as_ptr()) as usize;
+            dst.set_len(new_len);
+            backpatch_container_len_fast(dst, len_pos);
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn all_valid_bool_bytes(bytes: &[u8]) -> bool {
+        let n = bytes.len();
+        let ptr = bytes.as_ptr();
+        let mut i = 0usize;
+        while i + 8 <= n {
+            // SAFETY: `i + 8 <= n`.
+            let w = unsafe { core::ptr::read_unaligned(ptr.add(i).cast::<u64>()) };
+            if (w & !0x0101_0101_0101_0101u64) != 0 {
+                return false;
+            }
+            i += 8;
+        }
+        if i < n && n >= 8 {
+            // SAFETY: `n >= 8`, so the trailing 8-byte window is in bounds.
+            let w = unsafe { core::ptr::read_unaligned(ptr.add(n - 8).cast::<u64>()) };
+            return (w & !0x0101_0101_0101_0101u64) == 0;
+        }
+        while i < n {
+            // SAFETY: `i < n`.
+            if unsafe { *ptr.add(i) } > 1 {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    #[inline(always)]
+    fn read_le_fixed_vec_field<T: Copy>(
+        items: &mut Vec<T>,
+        data: &[u8],
+        pos: usize,
+        depth: usize,
+        elem_wt: u8,
+        reset: bool,
+        #[cfg(not(target_endian = "little"))] read_le: fn(*const u8) -> T,
+    ) -> Result<usize> {
+        if depth + 1 > MAX_NESTING_DEPTH {
+            return Err(Error::DepthLimitExceeded(depth + 1));
+        }
+        let (body, next_pos) = read_container_slice(data, pos, 2)?;
+        if reset {
+            items.clear();
+        }
+        let (count, p) = parse_array_header_typed(body, elem_wt)
+            .ok_or_else(|| cold_parse_err("invalid WireArray header"))?;
+        let nbytes = body.len() - p;
+        super::charge_typed_alloc(nbytes)?;
+        if count > 0 {
+            let base = items.len();
+            let total = base.saturating_add(count);
+            if items.capacity() < total {
+                items.reserve(grow_capacity(items.capacity(), total) - base);
+            }
+            #[cfg(target_endian = "little")]
+            // SAFETY: `parse_array_header_typed` verified `nbytes == count * size_of::<T>()`,
+            // `items` reserved space for `base + count` elements, `body` is disjoint from `items`,
+            // and `T` is a plain little-endian numeric type.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    body.as_ptr().add(p),
+                    items.as_mut_ptr().add(base).cast::<u8>(),
+                    nbytes,
+                );
+                items.set_len(base + count);
+            }
+            #[cfg(not(target_endian = "little"))]
+            // SAFETY: `parse_array_header_typed` verified `nbytes == count * size_of::<T>()` and
+            // `items` reserved space for `base + count` elements.
+            unsafe {
+                let src = body.as_ptr().add(p);
+                let dst = items.as_mut_ptr().add(base);
+                let elem_size = core::mem::size_of::<T>();
+                for i in 0..count {
+                    dst.add(i).write(read_le(src.add(i * elem_size)));
+                }
+                items.set_len(base + count);
+            }
+        }
+        Ok(next_pos)
+    }
+
+    /// Decodes `WireArray(WireFloat64)` directly into `Vec<f64>` using a single bulk copy.
+    #[inline(always)]
+    pub fn read_float64_vec_field(
+        items: &mut Vec<f64>,
+        data: &[u8],
+        pos: usize,
+        depth: usize,
+        reset: bool,
+    ) -> Result<usize> {
+        read_le_fixed_vec_field(
+            items,
+            data,
+            pos,
+            depth,
+            WIRE_FLOAT64,
+            reset,
+            #[cfg(not(target_endian = "little"))]
+            |p| {
+                // SAFETY: Caller guarantees 8 readable bytes at `p`.
+                let raw = unsafe { core::ptr::read_unaligned(p.cast::<[u8; 8]>()) };
+                f64::from_bits(u64::from_le_bytes(raw))
+            },
+        )
+    }
+
+    /// Decodes `WireArray(WireFloat32)` directly into `Vec<f32>` using a single bulk copy.
+    #[inline(always)]
+    pub fn read_float32_vec_field(
+        items: &mut Vec<f32>,
+        data: &[u8],
+        pos: usize,
+        depth: usize,
+        reset: bool,
+    ) -> Result<usize> {
+        read_le_fixed_vec_field(
+            items,
+            data,
+            pos,
+            depth,
+            WIRE_FLOAT32,
+            reset,
+            #[cfg(not(target_endian = "little"))]
+            |p| {
+                // SAFETY: Caller guarantees 4 readable bytes at `p`.
+                let raw = unsafe { core::ptr::read_unaligned(p.cast::<[u8; 4]>()) };
+                f32::from_bits(u32::from_le_bytes(raw))
+            },
+        )
+    }
+
+    /// Decodes `WireArray(WireFixed64)` directly into `Vec<u64>` using a single bulk copy.
+    #[inline(always)]
+    pub fn read_fixed64_vec_field(
+        items: &mut Vec<u64>,
+        data: &[u8],
+        pos: usize,
+        depth: usize,
+        reset: bool,
+    ) -> Result<usize> {
+        read_le_fixed_vec_field(
+            items,
+            data,
+            pos,
+            depth,
+            WIRE_FIXED64,
+            reset,
+            #[cfg(not(target_endian = "little"))]
+            |p| {
+                // SAFETY: Caller guarantees 8 readable bytes at `p`.
+                let raw = unsafe { core::ptr::read_unaligned(p.cast::<[u8; 8]>()) };
+                u64::from_le_bytes(raw)
+            },
+        )
+    }
+
+    /// Decodes `WireArray(WireSfixed64)` directly into `Vec<i64>` using a single bulk copy.
+    #[inline(always)]
+    pub fn read_sfixed64_vec_field(
+        items: &mut Vec<i64>,
+        data: &[u8],
+        pos: usize,
+        depth: usize,
+        reset: bool,
+    ) -> Result<usize> {
+        read_le_fixed_vec_field(
+            items,
+            data,
+            pos,
+            depth,
+            WIRE_SFIXED64,
+            reset,
+            #[cfg(not(target_endian = "little"))]
+            |p| {
+                // SAFETY: Caller guarantees 8 readable bytes at `p`.
+                let raw = unsafe { core::ptr::read_unaligned(p.cast::<[u8; 8]>()) };
+                i64::from_le_bytes(raw)
+            },
+        )
+    }
+
+    /// Decodes `WireArray(WireFixed32)` directly into `Vec<u32>` using a single bulk copy.
+    #[inline(always)]
+    pub fn read_fixed32_vec_field(
+        items: &mut Vec<u32>,
+        data: &[u8],
+        pos: usize,
+        depth: usize,
+        reset: bool,
+    ) -> Result<usize> {
+        read_le_fixed_vec_field(
+            items,
+            data,
+            pos,
+            depth,
+            WIRE_FIXED32,
+            reset,
+            #[cfg(not(target_endian = "little"))]
+            |p| {
+                // SAFETY: Caller guarantees 4 readable bytes at `p`.
+                let raw = unsafe { core::ptr::read_unaligned(p.cast::<[u8; 4]>()) };
+                u32::from_le_bytes(raw)
+            },
+        )
+    }
+
+    /// Decodes `WireArray(WireSfixed32)` directly into `Vec<i32>` using a single bulk copy.
+    #[inline(always)]
+    pub fn read_sfixed32_vec_field(
+        items: &mut Vec<i32>,
+        data: &[u8],
+        pos: usize,
+        depth: usize,
+        reset: bool,
+    ) -> Result<usize> {
+        read_le_fixed_vec_field(
+            items,
+            data,
+            pos,
+            depth,
+            WIRE_SFIXED32,
+            reset,
+            #[cfg(not(target_endian = "little"))]
+            |p| {
+                // SAFETY: Caller guarantees 4 readable bytes at `p`.
+                let raw = unsafe { core::ptr::read_unaligned(p.cast::<[u8; 4]>()) };
+                i32::from_le_bytes(raw)
+            },
+        )
+    }
+
+    /// Decodes `WireArray(WireBoolFalse)` into `Vec<bool>` after validating every byte is `0` or `1`.
+    #[inline(always)]
+    pub fn read_bool_vec_field(
+        items: &mut Vec<bool>,
+        data: &[u8],
+        pos: usize,
+        depth: usize,
+        reset: bool,
+    ) -> Result<usize> {
+        if depth + 1 > MAX_NESTING_DEPTH {
+            return Err(Error::DepthLimitExceeded(depth + 1));
+        }
+        let (body, next_pos) = read_container_slice(data, pos, 2)?;
+        if reset {
+            items.clear();
+        }
+        let (count, p) = parse_array_header_typed(body, WIRE_BOOL_FALSE)
+            .ok_or_else(|| cold_parse_err("invalid WireArray(WireBool) header"))?;
+        super::charge_typed_alloc(count)?;
+        if count > 0 {
+            let payload = &body[p..];
+            if !all_valid_bool_bytes(payload) {
+                return Err(cold_parse_err("invalid bool byte"));
+            }
+            let base = items.len();
+            let total = base.saturating_add(count);
+            if items.capacity() < total {
+                items.reserve(grow_capacity(items.capacity(), total) - base);
+            }
+            // SAFETY: `parse_array_header_typed` verified `payload.len() == count`,
+            // `all_valid_bool_bytes` verified every byte is `0u8` or `1u8` (valid Rust `bool`),
+            // `items` reserved space for `base + count` elements, and `payload` is disjoint from `items`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    payload.as_ptr(),
+                    items.as_mut_ptr().add(base).cast::<u8>(),
+                    count,
+                );
+                items.set_len(base + count);
+            }
+        }
+        Ok(next_pos)
+    }
+
     /// Encodes a `WireArray` of scalar elements using `write_elem`.
     #[inline]
     pub fn write_scalar_vec_field<T, F>(
@@ -1399,7 +2272,7 @@ pub mod codec {
         if depth + 1 > MAX_NESTING_DEPTH {
             return Err(Error::DepthLimitExceeded(depth + 1));
         }
-        let (body, next_pos) = read_len_slice(data, pos, 2)?;
+        let (body, next_pos) = read_container_slice(data, pos, 2)?;
         if reset {
             items.clear();
         }
@@ -1450,7 +2323,7 @@ pub mod codec {
         if depth + 1 > MAX_NESTING_DEPTH {
             return Err(Error::DepthLimitExceeded(depth + 1));
         }
-        let (body, next_pos) = read_len_slice(data, pos, 2)?;
+        let (body, next_pos) = read_container_slice(data, pos, 2)?;
         if reset {
             items.clear();
         }
@@ -1499,7 +2372,7 @@ pub mod codec {
         if depth + 1 > MAX_NESTING_DEPTH {
             return Err(Error::DepthLimitExceeded(depth + 1));
         }
-        let (body, next_pos) = read_len_slice(data, pos, 2)?;
+        let (body, next_pos) = read_container_slice(data, pos, 2)?;
         if reset {
             items.clear();
         }
@@ -1520,15 +2393,34 @@ pub mod codec {
             len: base,
         };
         let ptr = guard.vec.as_mut_ptr();
+        let body_len = body.len();
+        let body_ptr = body.as_ptr();
         for _ in 0..count {
-            let Some((raw, next_p)) = read_len_slice_opt(body, p, 0) else {
+            let (raw, next_p) = if p < body_len {
+                // SAFETY: `p < body_len`.
+                let b0 = unsafe { *body_ptr.add(p) };
+                if (b0 & 1) != 0 {
+                    let slen = usize::from(b0 >> 1);
+                    let start = p + 1;
+                    if slen <= body_len - start {
+                        // SAFETY: `start + slen <= body_len`.
+                        (
+                            unsafe { core::slice::from_raw_parts(body_ptr.add(start), slen) },
+                            start + slen,
+                        )
+                    } else {
+                        return Err(cold_parse_err("invalid container byteLen"));
+                    }
+                } else {
+                    let Some(pair) = read_len_slice_opt(body, p, 0) else {
+                        return Err(cold_parse_err("invalid container byteLen"));
+                    };
+                    pair
+                }
+            } else {
                 return Err(cold_parse_err("invalid container byteLen"));
             };
-            if !is_valid_utf8(raw) {
-                return Err(Error::InvalidUtf8);
-            }
-            // SAFETY: `is_valid_utf8(raw)` verified `raw` is valid UTF-8.
-            let s = unsafe { core::str::from_utf8_unchecked(raw) }.to_owned();
+            let s = bytes_to_owned_utf8(raw)?;
             // SAFETY: `items` reserved space for at least `base + count` elements.
             unsafe {
                 ptr.add(guard.len).write(s);
@@ -1537,7 +2429,81 @@ pub mod codec {
             p = next_p;
         }
         drop(guard);
-        if p != body.len() {
+        if p != body_len {
+            return Err(cold_parse_err("WireArray trailing bytes"));
+        }
+        Ok(next_pos)
+    }
+
+    /// Decodes a `WireArray(WireBytes)` directly into `Vec<Vec<u8>>` with zero closure overhead.
+    #[inline(always)]
+    pub fn read_bytes_vec_field(
+        items: &mut Vec<Vec<u8>>,
+        data: &[u8],
+        pos: usize,
+        depth: usize,
+        reset: bool,
+    ) -> Result<usize> {
+        if depth + 1 > MAX_NESTING_DEPTH {
+            return Err(Error::DepthLimitExceeded(depth + 1));
+        }
+        let (body, next_pos) = read_container_slice(data, pos, 2)?;
+        if reset {
+            items.clear();
+        }
+        let (count, mut p) = parse_array_header_typed(body, WIRE_BYTES)
+            .ok_or_else(|| cold_parse_err("invalid WireArray(WireBytes) header"))?;
+        super::charge_typed_alloc(count.saturating_mul(core::mem::size_of::<Vec<u8>>()))?;
+        if count > 4096 {
+            read_scalar_vec_large(items, body, p, count, read_elem_bytes)?;
+            return Ok(next_pos);
+        }
+        let base = items.len();
+        let total = base.saturating_add(count);
+        if items.capacity() < total {
+            items.reserve(grow_capacity(items.capacity(), total) - base);
+        }
+        let mut guard = SetLenOnDrop {
+            vec: items,
+            len: base,
+        };
+        let ptr = guard.vec.as_mut_ptr();
+        let body_len = body.len();
+        let body_ptr = body.as_ptr();
+        for _ in 0..count {
+            let (raw, next_p) = if p < body_len {
+                // SAFETY: `p < body_len`.
+                let b0 = unsafe { *body_ptr.add(p) };
+                if (b0 & 1) != 0 {
+                    let blen = usize::from(b0 >> 1);
+                    let start = p + 1;
+                    if blen <= body_len - start {
+                        // SAFETY: `start + blen <= body_len`.
+                        (
+                            unsafe { core::slice::from_raw_parts(body_ptr.add(start), blen) },
+                            start + blen,
+                        )
+                    } else {
+                        return Err(cold_parse_err("invalid container byteLen"));
+                    }
+                } else {
+                    let Some(pair) = read_len_slice_opt(body, p, 0) else {
+                        return Err(cold_parse_err("invalid container byteLen"));
+                    };
+                    pair
+                }
+            } else {
+                return Err(cold_parse_err("invalid container byteLen"));
+            };
+            // SAFETY: `items` reserved space for at least `base + count` elements.
+            unsafe {
+                ptr.add(guard.len).write(bytes_to_owned_vec(raw));
+            }
+            guard.len += 1;
+            p = next_p;
+        }
+        drop(guard);
+        if p != body_len {
             return Err(cold_parse_err("WireArray trailing bytes"));
         }
         Ok(next_pos)
@@ -1560,7 +2526,7 @@ pub mod codec {
         if depth + 1 > MAX_NESTING_DEPTH {
             return Err(Error::DepthLimitExceeded(depth + 1));
         }
-        let (body, next_pos) = read_len_slice(data, pos, 2)?;
+        let (body, next_pos) = read_container_slice(data, pos, 2)?;
         if reset {
             items.clear();
         }
@@ -1606,58 +2572,47 @@ pub mod codec {
         deterministic: bool,
     ) -> Result<()> {
         let count = items.len();
-        if dst.capacity() > 16_383 && count > 0 {
-            if count <= 32 {
-                let mut elem_mins = [0usize; 32];
-                let mut elems_min = 0usize;
-                for (slot, m) in elem_mins[..count].iter_mut().zip(items.iter()) {
-                    let em = m.min_wire_size();
-                    *slot = em;
-                    elems_min =
-                        elems_min.saturating_add(container_len_width(em).saturating_add(em));
+        if dst.capacity() > 16_383 && (count >= 32 || (M::HAS_NESTED_CONTAINERS && count > 0)) {
+            let mut elems_min = 0usize;
+            for m in items {
+                let em = m.min_wire_size();
+                elems_min = elems_min.saturating_add(container_len_width(em).saturating_add(em));
+                if elems_min > 16_383 {
+                    break;
                 }
-                let min_body = 1usize
-                    .saturating_add(varint_len(count as u64))
-                    .saturating_add(elems_min);
-                if min_body > 16_383 {
-                    dst.reserve(min_body.saturating_add(64));
-                    let len_pos = begin_tagged_array_4b(dst, field_num, WIRE_SUB_MSG, count);
-                    for (item, &em) in items.iter().zip(elem_mins[..count].iter()) {
-                        write_sub_msg_elem_with_min(dst, item, em, deterministic)?;
-                    }
-                    backpatch_container_len_4b(dst, len_pos);
-                    return Ok(());
+            }
+            let min_body = 1usize
+                .saturating_add(varint_len(count as u64))
+                .saturating_add(elems_min);
+            if min_body > 16_383 {
+                dst.reserve(min_body.saturating_add(64));
+                let len_pos = begin_tagged_array_4b(dst, field_num, WIRE_SUB_MSG, count);
+                for item in items {
+                    write_sub_msg_elem(dst, item, deterministic)?;
                 }
-            } else {
-                let elems_min: usize = items
-                    .iter()
-                    .map(|m| {
-                        let em = m.min_wire_size();
-                        container_len_width(em).saturating_add(em)
-                    })
-                    .fold(0usize, usize::saturating_add);
-                let min_body = 1usize
-                    .saturating_add(varint_len(count as u64))
-                    .saturating_add(elems_min);
-                if min_body > 16_383 {
-                    dst.reserve(min_body.saturating_add(64));
-                    let len_pos = begin_tagged_array_4b(dst, field_num, WIRE_SUB_MSG, count);
-                    for item in items {
-                        write_sub_msg_elem(dst, item, deterministic)?;
-                    }
-                    backpatch_container_len_4b(dst, len_pos);
-                    return Ok(());
-                }
+                backpatch_container_len_4b(dst, len_pos);
+                return Ok(());
             }
         }
         let len_pos = begin_tagged_array(dst, field_num, WIRE_SUB_MSG, count);
         for item in items {
             let elem_pos = dst.len();
-            dst.extend_from_slice(&[0u8, 0u8]);
+            if dst.capacity() - elem_pos < 2 {
+                dst.reserve(2);
+            }
+            // SAFETY: At least 2 writable bytes exist at `elem_pos`.
+            unsafe {
+                let ptr = dst.as_mut_ptr().add(elem_pos);
+                *ptr = 0;
+                *ptr.add(1) = 0;
+                dst.set_len(elem_pos + 2);
+            }
             item.encode_omnibuf_append(dst, deterministic)?;
-            backpatch_container_len(dst, elem_pos);
+            // SAFETY: We just wrote the 2-byte length slot at `elem_pos`.
+            unsafe { backpatch_container_len_fast(dst, elem_pos) };
         }
-        backpatch_container_len(dst, len_pos);
+        // SAFETY: `begin_tagged_array` wrote the 2-byte length slot at `len_pos`.
+        unsafe { backpatch_container_len_fast(dst, len_pos) };
         Ok(())
     }
 
@@ -1670,58 +2625,47 @@ pub mod codec {
         deterministic: bool,
     ) -> Result<()> {
         let count = items.len();
-        if dst.capacity() > 16_383 && count > 0 {
-            if count <= 32 {
-                let mut elem_mins = [0usize; 32];
-                let mut elems_min = 0usize;
-                for (slot, m) in elem_mins[..count].iter_mut().zip(items.iter()) {
-                    let em = m.min_wire_size();
-                    *slot = em;
-                    elems_min =
-                        elems_min.saturating_add(container_len_width(em).saturating_add(em));
+        if dst.capacity() > 16_383 && (count >= 32 || (M::HAS_NESTED_CONTAINERS && count > 0)) {
+            let mut elems_min = 0usize;
+            for m in items {
+                let em = m.min_wire_size();
+                elems_min = elems_min.saturating_add(container_len_width(em).saturating_add(em));
+                if elems_min > 16_383 {
+                    break;
                 }
-                let min_body = 1usize
-                    .saturating_add(varint_len(count as u64))
-                    .saturating_add(elems_min);
-                if min_body > 16_383 {
-                    dst.reserve(min_body.saturating_add(24));
-                    let len_pos = begin_tagged_array_4b(dst, field_num, WIRE_SUB_MSG, count);
-                    for (item, &em) in items.iter().zip(elem_mins[..count].iter()) {
-                        write_sub_msg_elem_with_min(dst, item.as_ref(), em, deterministic)?;
-                    }
-                    backpatch_container_len_4b(dst, len_pos);
-                    return Ok(());
+            }
+            let min_body = 1usize
+                .saturating_add(varint_len(count as u64))
+                .saturating_add(elems_min);
+            if min_body > 16_383 {
+                dst.reserve(min_body.saturating_add(24));
+                let len_pos = begin_tagged_array_4b(dst, field_num, WIRE_SUB_MSG, count);
+                for item in items {
+                    write_sub_msg_elem(dst, item.as_ref(), deterministic)?;
                 }
-            } else {
-                let elems_min: usize = items
-                    .iter()
-                    .map(|m| {
-                        let em = m.min_wire_size();
-                        container_len_width(em).saturating_add(em)
-                    })
-                    .fold(0usize, usize::saturating_add);
-                let min_body = 1usize
-                    .saturating_add(varint_len(count as u64))
-                    .saturating_add(elems_min);
-                if min_body > 16_383 {
-                    dst.reserve(min_body.saturating_add(24));
-                    let len_pos = begin_tagged_array_4b(dst, field_num, WIRE_SUB_MSG, count);
-                    for item in items {
-                        write_sub_msg_elem(dst, item.as_ref(), deterministic)?;
-                    }
-                    backpatch_container_len_4b(dst, len_pos);
-                    return Ok(());
-                }
+                backpatch_container_len_4b(dst, len_pos);
+                return Ok(());
             }
         }
         let len_pos = begin_tagged_array(dst, field_num, WIRE_SUB_MSG, count);
         for item in items {
             let elem_pos = dst.len();
-            dst.extend_from_slice(&[0u8, 0u8]);
+            if dst.capacity() - elem_pos < 2 {
+                dst.reserve(2);
+            }
+            // SAFETY: At least 2 writable bytes exist at `elem_pos`.
+            unsafe {
+                let ptr = dst.as_mut_ptr().add(elem_pos);
+                *ptr = 0;
+                *ptr.add(1) = 0;
+                dst.set_len(elem_pos + 2);
+            }
             item.encode_omnibuf_append(dst, deterministic)?;
-            backpatch_container_len(dst, elem_pos);
+            // SAFETY: We just wrote the 2-byte length slot at `elem_pos`.
+            unsafe { backpatch_container_len_fast(dst, elem_pos) };
         }
-        backpatch_container_len(dst, len_pos);
+        // SAFETY: `begin_tagged_array` wrote the 2-byte length slot at `len_pos`.
+        unsafe { backpatch_container_len_fast(dst, len_pos) };
         Ok(())
     }
 
@@ -1740,7 +2684,7 @@ pub mod codec {
             items.reserve(grow_capacity(items.capacity(), total) - base);
         }
         for _ in 0..count {
-            let (elem_bytes, next_p) = read_len_slice(body, p, 0)?;
+            let (elem_bytes, next_p) = read_container_slice(body, p, 0)?;
             let mut elem = M::default();
             elem.decode_omnibuf_at_depth(elem_bytes, depth + 2, true)?;
             items.push(elem);
@@ -1764,12 +2708,18 @@ pub mod codec {
         if depth + 1 > MAX_NESTING_DEPTH {
             return Err(Error::DepthLimitExceeded(depth + 1));
         }
-        let (body, next_pos) = read_len_slice(data, pos, 2)?;
+        let (body, next_pos) = read_container_slice(data, pos, 2)?;
         if reset {
             items.clear();
         }
         let (count, mut p) = parse_array_header_typed(body, WIRE_SUB_MSG)
             .ok_or_else(|| cold_parse_err("invalid WireArray(WireSubMsg) header"))?;
+        if count == 0 {
+            if p != body.len() {
+                return Err(cold_parse_err("WireArray(WireSubMsg) trailing bytes"));
+            }
+            return Ok(next_pos);
+        }
         super::charge_typed_alloc(count.saturating_mul(core::mem::size_of::<M>()))?;
         if count > 4096 {
             read_sub_msg_vec_large(items, body, p, count, depth)?;
@@ -1786,18 +2736,16 @@ pub mod codec {
         };
         let ptr = guard.vec.as_mut_ptr();
         for _ in 0..count {
-            let Some((elem_bytes, next_p)) = read_len_slice_opt(body, p, 0) else {
+            let Some((elem_bytes, next_p)) = read_container_slice_opt(body, p, 0) else {
                 return Err(cold_parse_err("invalid container byteLen"));
             };
+            let mut elem = M::default();
+            elem.decode_omnibuf_at_depth(elem_bytes, depth + 2, true)?;
             // SAFETY: `items` reserved space for at least `base + count` elements.
-            // We write `M::default()` and advance `guard.len` before decoding so any
-            // error or panic cleanly drops the initialized element.
             unsafe {
-                let slot = ptr.add(guard.len);
-                slot.write(M::default());
-                guard.len += 1;
-                (*slot).decode_omnibuf_at_depth(elem_bytes, depth + 2, true)?;
+                ptr.add(guard.len).write(elem);
             }
+            guard.len += 1;
             p = next_p;
         }
         drop(guard);
@@ -1818,7 +2766,7 @@ pub mod codec {
         if depth + 1 > MAX_NESTING_DEPTH {
             return Err(Error::DepthLimitExceeded(depth + 1));
         }
-        let (body, next_pos) = read_len_slice(data, pos, 2)?;
+        let (body, next_pos) = read_container_slice(data, pos, 2)?;
         if reset {
             items.clear();
         }
@@ -1837,7 +2785,7 @@ pub mod codec {
             items.reserve(grow_capacity(items.capacity(), total) - base);
         }
         for _ in 0..count {
-            let (elem_bytes, next_p) = read_len_slice(body, p, 0)?;
+            let (elem_bytes, next_p) = read_container_slice(body, p, 0)?;
             let mut elem = Box::new(M::default());
             elem.decode_omnibuf_at_depth(elem_bytes, depth + 2, true)?;
             items.push(elem);
@@ -1864,9 +2812,19 @@ pub mod codec {
             backpatch_container_len_4b(dst, elem_pos);
         } else {
             let elem_pos = dst.len();
-            dst.extend_from_slice(&[0, 0]);
+            if dst.capacity() - elem_pos < 2 {
+                dst.reserve(2);
+            }
+            // SAFETY: At least 2 writable bytes exist at `elem_pos`.
+            unsafe {
+                let ptr = dst.as_mut_ptr().add(elem_pos);
+                *ptr = 0;
+                *ptr.add(1) = 0;
+                dst.set_len(elem_pos + 2);
+            }
             msg.encode_omnibuf_append(dst, deterministic)?;
-            backpatch_container_len(dst, elem_pos);
+            // SAFETY: We just wrote the 2-byte length slot at `elem_pos`.
+            unsafe { backpatch_container_len_fast(dst, elem_pos) };
         }
         Ok(())
     }
@@ -1878,7 +2836,7 @@ pub mod codec {
         msg: &M,
         deterministic: bool,
     ) -> Result<()> {
-        let min_sub = if dst.capacity() > 16_383 {
+        let min_sub = if M::HAS_NESTED_CONTAINERS && dst.capacity() > 16_383 {
             msg.min_wire_size()
         } else {
             0
@@ -1893,7 +2851,7 @@ pub mod codec {
         p: usize,
         depth: usize,
     ) -> Result<(M, usize)> {
-        let (elem_bytes, next_p) = read_len_slice(body, p, 0)?;
+        let (elem_bytes, next_p) = read_container_slice(body, p, 0)?;
         let mut elem = M::default();
         elem.decode_omnibuf_at_depth(elem_bytes, depth + 1, true)?;
         Ok((elem, next_p))
@@ -1906,7 +2864,7 @@ pub mod codec {
         p: usize,
         depth: usize,
     ) -> Result<(Box<M>, usize)> {
-        let (elem_bytes, next_p) = read_len_slice(body, p, 0)?;
+        let (elem_bytes, next_p) = read_container_slice(body, p, 0)?;
         super::charge_typed_alloc(core::mem::size_of::<M>())?;
         let mut elem = Box::new(M::default());
         elem.decode_omnibuf_at_depth(elem_bytes, depth + 1, true)?;
@@ -1962,7 +2920,7 @@ pub mod codec {
         if depth + 1 > MAX_NESTING_DEPTH {
             return Err(Error::DepthLimitExceeded(depth + 1));
         }
-        let (body, next_pos) = read_len_slice(data, pos, 2)?;
+        let (body, next_pos) = read_container_slice(data, pos, 2)?;
         if reset {
             items.clear();
         }
@@ -2024,7 +2982,7 @@ pub mod codec {
         if depth + 1 > MAX_NESTING_DEPTH {
             return Err(Error::DepthLimitExceeded(depth + 1));
         }
-        let (body, next_pos) = read_len_slice(data, pos, 2)?;
+        let (body, next_pos) = read_container_slice(data, pos, 2)?;
         let (elem_wt, count, mut p) =
             parse_array_header(body).ok_or_else(|| cold_parse_err("invalid WireArray header"))?;
         if elem_wt != exp_elem_wt {
@@ -2072,28 +3030,22 @@ pub mod codec {
 
     #[inline(always)]
     pub fn read_elem_fixed32(body: &[u8], p: usize) -> Result<(u32, usize)> {
-        let end = p
-            .checked_add(4)
-            .ok_or_else(|| cold_parse_err("truncated fixed32 element"))?;
-        let raw: [u8; 4] = body
-            .get(p..end)
-            .ok_or_else(|| cold_parse_err("truncated fixed32 element"))?
-            .try_into()
-            .unwrap();
-        Ok((u32::from_le_bytes(raw), end))
+        if body.len().saturating_sub(p) < 4 {
+            return Err(cold_parse_err("truncated fixed32 element"));
+        }
+        // SAFETY: `body.len() - p >= 4`, so 4 bytes at `p` are in bounds.
+        let v = unsafe { core::ptr::read_unaligned(body.as_ptr().add(p).cast::<u32>()) }.to_le();
+        Ok((v, p + 4))
     }
 
     #[inline(always)]
     pub fn read_elem_fixed64(body: &[u8], p: usize) -> Result<(u64, usize)> {
-        let end = p
-            .checked_add(8)
-            .ok_or_else(|| cold_parse_err("truncated fixed64 element"))?;
-        let raw: [u8; 8] = body
-            .get(p..end)
-            .ok_or_else(|| cold_parse_err("truncated fixed64 element"))?
-            .try_into()
-            .unwrap();
-        Ok((u64::from_le_bytes(raw), end))
+        if body.len().saturating_sub(p) < 8 {
+            return Err(cold_parse_err("truncated fixed64 element"));
+        }
+        // SAFETY: `body.len() - p >= 8`, so 8 bytes at `p` are in bounds.
+        let v = unsafe { core::ptr::read_unaligned(body.as_ptr().add(p).cast::<u64>()) }.to_le();
+        Ok((v, p + 8))
     }
 
     #[inline(always)]
@@ -2122,14 +3074,14 @@ pub mod codec {
 
     #[inline(always)]
     pub fn read_elem_string(body: &[u8], p: usize) -> Result<(String, usize)> {
-        let (s, next_p) = read_str_slice(body, p)?;
-        Ok((s.to_owned(), next_p))
+        let (raw, next_p) = read_len_slice(body, p, 0)?;
+        Ok((bytes_to_owned_utf8(raw)?, next_p))
     }
 
     #[inline(always)]
     pub fn read_elem_bytes(body: &[u8], p: usize) -> Result<(Vec<u8>, usize)> {
         let (b, next_p) = read_len_slice(body, p, 0)?;
-        Ok((b.to_vec(), next_p))
+        Ok((bytes_to_owned_vec(b), next_p))
     }
 
     #[inline(always)]
@@ -2150,7 +3102,7 @@ pub mod codec {
         depth: usize,
         merge: bool,
     ) -> Result<usize> {
-        let (sub_bytes, next_pos) = read_len_slice(data, pos, 0)?;
+        let (sub_bytes, next_pos) = read_container_slice(data, pos, 0)?;
         match slot {
             Some(msg) => msg.decode_omnibuf_borrowed_at_depth(sub_bytes, depth + 1, merge)?,
             None => {
@@ -2170,7 +3122,7 @@ pub mod codec {
         depth: usize,
         merge: bool,
     ) -> Result<usize> {
-        let (sub_bytes, next_pos) = read_len_slice(data, pos, 0)?;
+        let (sub_bytes, next_pos) = read_container_slice(data, pos, 0)?;
         match slot {
             Some(msg) => msg.decode_omnibuf_borrowed_at_depth(sub_bytes, depth + 1, merge)?,
             None => {
@@ -2212,7 +3164,7 @@ pub mod codec {
         if depth + 1 > MAX_NESTING_DEPTH {
             return Err(Error::DepthLimitExceeded(depth + 1));
         }
-        let (body, next_pos) = read_len_slice(data, pos, 2)?;
+        let (body, next_pos) = read_container_slice(data, pos, 2)?;
         if reset {
             items.clear();
         }
@@ -2250,7 +3202,7 @@ pub mod codec {
         if depth + 1 > MAX_NESTING_DEPTH {
             return Err(Error::DepthLimitExceeded(depth + 1));
         }
-        let (body, next_pos) = read_len_slice(data, pos, 2)?;
+        let (body, next_pos) = read_container_slice(data, pos, 2)?;
         if reset {
             items.clear();
         }
@@ -2267,7 +3219,7 @@ pub mod codec {
             items.reserve(grow_capacity(items.capacity(), total) - base);
         }
         for _ in 0..count {
-            let (elem_bytes, next_p) = read_len_slice(body, p, 0)?;
+            let (elem_bytes, next_p) = read_container_slice(body, p, 0)?;
             let mut elem = M::default();
             elem.decode_omnibuf_borrowed_at_depth(elem_bytes, depth + 2, true)?;
             items.push(elem);
@@ -2326,7 +3278,7 @@ pub mod codec {
         if ctx.depth + 1 > MAX_NESTING_DEPTH {
             return Err(Error::DepthLimitExceeded(ctx.depth + 1));
         }
-        let (body, next_pos) = read_len_slice(ctx.data, ctx.pos, 3)?;
+        let (body, next_pos) = read_container_slice(ctx.data, ctx.pos, 3)?;
         let (key_wt, val_wt, count, mut p) =
             parse_map_header(body).ok_or_else(|| Error::parse("invalid WireMap header"))?;
         if key_wt != ctx.wire_types.key || val_wt != ctx.wire_types.val {
@@ -2464,7 +3416,7 @@ pub mod codec {
         if ctx.depth + 1 > MAX_NESTING_DEPTH {
             return Err(Error::DepthLimitExceeded(ctx.depth + 1));
         }
-        let (body, next_pos) = read_len_slice(ctx.data, ctx.pos, 3)?;
+        let (body, next_pos) = read_container_slice(ctx.data, ctx.pos, 3)?;
         let (key_wt, val_wt, count, mut p) =
             parse_map_header(body).ok_or_else(|| Error::parse("invalid WireMap header"))?;
         if key_wt != ctx.wire_types.key || val_wt != ctx.wire_types.val {
@@ -2507,7 +3459,7 @@ pub mod codec {
         if ctx.depth + 1 > MAX_NESTING_DEPTH {
             return Err(Error::DepthLimitExceeded(ctx.depth + 1));
         }
-        let (body, next_pos) = read_len_slice(ctx.data, ctx.pos, 3)?;
+        let (body, next_pos) = read_container_slice(ctx.data, ctx.pos, 3)?;
         let (key_wt, val_wt, count, mut p) =
             parse_map_header(body).ok_or_else(|| Error::parse("invalid WireMap header"))?;
         if key_wt != ctx.wire_types.key || val_wt != ctx.wire_types.val {
@@ -2696,7 +3648,7 @@ pub mod codec {
         depth: usize,
         merge: bool,
     ) -> Result<usize> {
-        let (sub_bytes, next_pos) = read_len_slice(data, pos, 0)?;
+        let (sub_bytes, next_pos) = read_container_slice(data, pos, 0)?;
         if !merge || !slot.is_set() {
             super::charge_typed_alloc(core::mem::size_of::<M>())?;
             let mut m = M::default();

@@ -185,6 +185,139 @@ pub fn write_fixed_tagged<const N: usize, const W: usize>(
     }
 }
 
+/// Copies `n` bytes from `src` to `dst`, avoiding a `memcpy` call for short slices (`<= 32` bytes).
+///
+/// # Safety
+/// `src` must be valid for reads of `n` bytes, `dst` must be valid for writes of `n` bytes,
+/// and the two regions must not overlap.
+#[inline(always)]
+pub(crate) unsafe fn copy_bytes_fast(src: *const u8, dst: *mut u8, n: usize) {
+    // SAFETY: Caller guarantees non-overlapping valid `src` and `dst` of `n` bytes.
+    unsafe {
+        if n <= 16 {
+            if n >= 8 {
+                let lo = core::ptr::read_unaligned(src.cast::<u64>());
+                let hi = core::ptr::read_unaligned(src.add(n - 8).cast::<u64>());
+                core::ptr::write_unaligned(dst.cast::<u64>(), lo);
+                core::ptr::write_unaligned(dst.add(n - 8).cast::<u64>(), hi);
+            } else if n >= 4 {
+                let lo = core::ptr::read_unaligned(src.cast::<u32>());
+                let hi = core::ptr::read_unaligned(src.add(n - 4).cast::<u32>());
+                core::ptr::write_unaligned(dst.cast::<u32>(), lo);
+                core::ptr::write_unaligned(dst.add(n - 4).cast::<u32>(), hi);
+            } else if n > 0 {
+                let b0 = *src;
+                let bm = *src.add(n >> 1);
+                let b1 = *src.add(n - 1);
+                *dst = b0;
+                *dst.add(n >> 1) = bm;
+                *dst.add(n - 1) = b1;
+            }
+        } else if n <= 32 {
+            let v0 = core::ptr::read_unaligned(src.cast::<u128>());
+            let v1 = core::ptr::read_unaligned(src.add(n - 16).cast::<u128>());
+            core::ptr::write_unaligned(dst.cast::<u128>(), v0);
+            core::ptr::write_unaligned(dst.add(n - 16).cast::<u128>(), v1);
+        } else {
+            core::ptr::copy_nonoverlapping(src, dst, n);
+        }
+    }
+}
+
+/// Validates `raw` as UTF-8 and allocates an owned `String`, fusing the ASCII fast path
+/// with register-level writes for short strings (`<= 16` bytes) to avoid redundant loads
+/// and `memcpy` calls.
+#[inline(always)]
+pub(crate) fn bytes_to_owned_utf8(raw: &[u8]) -> Result<String> {
+    let n = raw.len();
+    if n == 0 {
+        return Ok(String::new());
+    }
+    let src = raw.as_ptr();
+    if n <= 16 {
+        if n >= 8 {
+            // SAFETY: `n >= 8`, so both 0..8 and (n-8)..n are in bounds.
+            let (lo, hi) = unsafe {
+                (
+                    core::ptr::read_unaligned(src.cast::<u64>()),
+                    core::ptr::read_unaligned(src.add(n - 8).cast::<u64>()),
+                )
+            };
+            if ((lo | hi) & 0x8080_8080_8080_8080) == 0 {
+                let mut v = Vec::<u8>::with_capacity(n);
+                // SAFETY: `v` has capacity `n` and `lo`/`hi` are validated ASCII bytes.
+                unsafe {
+                    let dst = v.as_mut_ptr();
+                    core::ptr::write_unaligned(dst.cast::<u64>(), lo);
+                    core::ptr::write_unaligned(dst.add(n - 8).cast::<u64>(), hi);
+                    v.set_len(n);
+                    return Ok(String::from_utf8_unchecked(v));
+                }
+            }
+        } else if n >= 4 {
+            // SAFETY: `n >= 4`, so both 0..4 and (n-4)..n are in bounds.
+            let (lo, hi) = unsafe {
+                (
+                    core::ptr::read_unaligned(src.cast::<u32>()),
+                    core::ptr::read_unaligned(src.add(n - 4).cast::<u32>()),
+                )
+            };
+            if ((lo | hi) & 0x8080_8080) == 0 {
+                let mut v = Vec::<u8>::with_capacity(n);
+                // SAFETY: `v` has capacity `n` and `lo`/`hi` are validated ASCII bytes.
+                unsafe {
+                    let dst = v.as_mut_ptr();
+                    core::ptr::write_unaligned(dst.cast::<u32>(), lo);
+                    core::ptr::write_unaligned(dst.add(n - 4).cast::<u32>(), hi);
+                    v.set_len(n);
+                    return Ok(String::from_utf8_unchecked(v));
+                }
+            }
+        } else {
+            // SAFETY: `1 <= n <= 3`.
+            let (b0, bm, b1) = unsafe { (*src, *src.add(n >> 1), *src.add(n - 1)) };
+            if (b0 | bm | b1) < 0x80 {
+                let mut v = Vec::<u8>::with_capacity(n);
+                // SAFETY: `v` has capacity `n` and `b0`/`bm`/`b1` are validated ASCII bytes.
+                unsafe {
+                    let dst = v.as_mut_ptr();
+                    *dst = b0;
+                    *dst.add(n >> 1) = bm;
+                    *dst.add(n - 1) = b1;
+                    v.set_len(n);
+                    return Ok(String::from_utf8_unchecked(v));
+                }
+            }
+        }
+    }
+    if !is_valid_utf8(raw) {
+        return Err(Error::InvalidUtf8);
+    }
+    let mut v = Vec::<u8>::with_capacity(n);
+    // SAFETY: `v` has capacity `n`, `raw` is validated UTF-8 and disjoint from `v`.
+    unsafe {
+        copy_bytes_fast(src, v.as_mut_ptr(), n);
+        v.set_len(n);
+        Ok(String::from_utf8_unchecked(v))
+    }
+}
+
+/// Allocates an owned `Vec<u8>` copy of `raw`, avoiding `memcpy` calls for short slices.
+#[inline(always)]
+pub(crate) fn bytes_to_owned_vec(raw: &[u8]) -> Vec<u8> {
+    let n = raw.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut v = Vec::<u8>::with_capacity(n);
+    // SAFETY: `v` has capacity `n` and `raw` is disjoint from `v`.
+    unsafe {
+        copy_bytes_fast(raw.as_ptr(), v.as_mut_ptr(), n);
+        v.set_len(n);
+    }
+    v
+}
+
 /// Appends a pre-encoded tag followed by a length-prefixed byte or UTF-8 slice in a single capacity check.
 #[inline(always)]
 pub fn write_bytes_tagged<const N: usize>(dst: &mut Vec<u8>, tag: [u8; N], b: &[u8]) {
@@ -193,15 +326,17 @@ pub fn write_bytes_tagged<const N: usize>(dst: &mut Vec<u8>, tag: [u8; N], b: &[
     }
     let blen = b.len();
     let needed = blen.checked_add(N + 9).expect("capacity overflow");
-    dst.reserve(needed);
-    // SAFETY: `dst.reserve(N + 9 + blen)` guarantees enough writable bytes at `dst.len()`;
+    let len = dst.len();
+    if dst.capacity() - len < needed {
+        dst.reserve(needed);
+    }
+    // SAFETY: At least `N + 9 + blen` writable bytes exist at `len`;
     // `tag` and `b` are disjoint from `dst` (`&mut Vec<u8>` guarantees exclusive access).
     unsafe {
-        let len = dst.len();
         let ptr = dst.as_mut_ptr().add(len);
         core::ptr::copy_nonoverlapping(tag.as_ptr(), ptr, N);
         let vn = put_varint_raw(ptr.add(N), blen as u64);
-        core::ptr::copy_nonoverlapping(b.as_ptr(), ptr.add(N + vn), blen);
+        copy_bytes_fast(b.as_ptr(), ptr.add(N + vn), blen);
         dst.set_len(len + N + vn + blen);
     }
 }
@@ -211,14 +346,16 @@ pub fn write_bytes_tagged<const N: usize>(dst: &mut Vec<u8>, tag: [u8; N], b: &[
 pub fn append_bytes_elem(dst: &mut Vec<u8>, b: &[u8]) {
     let blen = b.len();
     let needed = blen.checked_add(9).expect("capacity overflow");
-    dst.reserve(needed);
-    // SAFETY: `dst.reserve(9 + blen)` guarantees enough writable bytes at `dst.len()`;
+    let len = dst.len();
+    if dst.capacity() - len < needed {
+        dst.reserve(needed);
+    }
+    // SAFETY: At least `9 + blen` writable bytes exist at `len`;
     // `b` is disjoint from `dst` (`&mut Vec<u8>` guarantees exclusive access).
     unsafe {
-        let len = dst.len();
         let ptr = dst.as_mut_ptr().add(len);
         let vn = put_varint_raw(ptr, blen as u64);
-        core::ptr::copy_nonoverlapping(b.as_ptr(), ptr.add(vn), blen);
+        copy_bytes_fast(b.as_ptr(), ptr.add(vn), blen);
         dst.set_len(len + vn + blen);
     }
 }
@@ -273,7 +410,28 @@ pub fn backpatch_container_len(dst: &mut Vec<u8>, len_pos: usize) {
     };
     if sub_len <= 16_383 {
         let u = ((sub_len as u16) << 2) | 2;
-        dst[len_pos..header_end].copy_from_slice(&u.to_le_bytes());
+        // SAFETY: `header_end = len_pos + 2 <= dst.len()`, so 2 bytes at `len_pos` are in bounds.
+        unsafe {
+            core::ptr::write_unaligned(dst.as_mut_ptr().add(len_pos).cast::<u16>(), u.to_le());
+        }
+    } else {
+        backpatch_large_container_len(dst, len_pos, sub_len);
+    }
+}
+
+/// Fast-path container length backpatch when the caller guarantees `len_pos + 2 <= dst.len()`.
+///
+/// # Safety
+/// `len_pos + 2 <= dst.len()` must hold.
+#[inline(always)]
+pub(crate) unsafe fn backpatch_container_len_fast(dst: &mut Vec<u8>, len_pos: usize) {
+    let sub_len = dst.len() - (len_pos + 2);
+    if sub_len <= 16_383 {
+        let u = ((sub_len as u16) << 2) | 2;
+        // SAFETY: Caller guarantees `len_pos + 2 <= dst.len()`.
+        unsafe {
+            core::ptr::write_unaligned(dst.as_mut_ptr().add(len_pos).cast::<u16>(), u.to_le());
+        }
     } else {
         backpatch_large_container_len(dst, len_pos, sub_len);
     }
@@ -810,6 +968,52 @@ pub(crate) fn read_len_slice_opt(
 #[inline(always)]
 pub fn read_len_slice(data: &[u8], pos: usize, min_len: usize) -> Result<(&[u8], usize)> {
     read_len_slice_opt(data, pos, min_len)
+        .ok_or_else(|| cold_parse_err("invalid container byteLen"))
+}
+
+/// Reads a container length-prefixed sub-slice starting at `data[pos]` with `byte_len >= min_len`.
+///
+/// Checks the canonical 2-byte container length header (`(u & 3) == 2`) first before falling
+/// back to 1-byte or multi-byte length varints.
+#[inline(always)]
+pub(crate) fn read_container_slice_opt(
+    data: &[u8],
+    pos: usize,
+    min_len: usize,
+) -> Option<(&[u8], usize)> {
+    let n = data.len();
+    if n.saturating_sub(pos) >= 2 {
+        // SAFETY: `n - pos >= 2`, so 2 bytes at `pos` are in bounds.
+        let u = unsafe { core::ptr::read_unaligned(data.as_ptr().add(pos).cast::<u16>()) }.to_le();
+        if (u & 3) == 2 {
+            let len = usize::from(u >> 2);
+            let start = pos + 2;
+            if len >= min_len && len <= n - start {
+                let end = start + len;
+                // SAFETY: `start <= end <= n`.
+                return Some((unsafe { data.get_unchecked(start..end) }, end));
+            }
+            return None;
+        }
+        if (u & 1) != 0 {
+            let len = usize::from((u as u8) >> 1);
+            let start = pos + 1;
+            if len >= min_len && len <= n - start {
+                let end = start + len;
+                // SAFETY: `start <= end <= n`.
+                return Some((unsafe { data.get_unchecked(start..end) }, end));
+            }
+            return None;
+        }
+        return read_len_slice_slow_opt(data, pos, min_len);
+    }
+    read_len_slice_opt(data, pos, min_len)
+}
+
+/// Reads a container length-prefixed sub-slice starting at `data[pos]` with `byte_len >= min_len`.
+#[inline(always)]
+pub fn read_container_slice(data: &[u8], pos: usize, min_len: usize) -> Result<(&[u8], usize)> {
+    read_container_slice_opt(data, pos, min_len)
         .ok_or_else(|| cold_parse_err("invalid container byteLen"))
 }
 
@@ -2238,15 +2442,20 @@ impl<'a> Decoder<'a> {
         if self.pos >= n {
             return Ok(None);
         }
-        let b0 = self.data[self.pos];
+        // SAFETY: `self.pos < n`.
+        let b0 = unsafe { *self.data.get_unchecked(self.pos) };
         if (b0 & 1) != 0 {
             self.pos += 1;
             return Ok(Some(u64::from(b0 >> 1)));
         }
         if (b0 & 2) != 0 && n - self.pos >= 2 {
-            let raw: [u8; 2] = self.data[self.pos..self.pos + 2].try_into().unwrap();
+            // SAFETY: `n - self.pos >= 2`.
+            let u = unsafe {
+                core::ptr::read_unaligned(self.data.as_ptr().add(self.pos).cast::<u16>())
+            }
+            .to_le();
             self.pos += 2;
-            return Ok(Some(u64::from(u16::from_le_bytes(raw) >> 2)));
+            return Ok(Some(u64::from(u >> 2)));
         }
         self.next_raw_tag_slow()
     }
@@ -2270,15 +2479,20 @@ impl<'a> Decoder<'a> {
         if self.pos >= n {
             return Ok(None);
         }
-        let b0 = self.data[self.pos];
+        // SAFETY: `self.pos < n`.
+        let b0 = unsafe { *self.data.get_unchecked(self.pos) };
         if (b0 & 1) != 0 {
             self.pos += 1;
             return Ok(Some((u32::from(b0 >> 5), (b0 >> 1) & 0x0F)));
         }
-        if (b0 & 2) != 0 && self.pos + 2 <= n {
-            let raw: [u8; 2] = self.data[self.pos..self.pos + 2].try_into().unwrap();
+        if (b0 & 2) != 0 && n - self.pos >= 2 {
+            // SAFETY: `n - self.pos >= 2`.
+            let u = unsafe {
+                core::ptr::read_unaligned(self.data.as_ptr().add(self.pos).cast::<u16>())
+            }
+            .to_le()
+                >> 2;
             self.pos += 2;
-            let u = u16::from_le_bytes(raw) >> 2;
             return Ok(Some((u32::from(u >> 4), (u & 0x0F) as u8)));
         }
         let Some(tag) = self.next_raw_tag_slow()? else {
@@ -2308,10 +2522,12 @@ impl<'a> Decoder<'a> {
         if n.saturating_sub(self.pos) < 4 {
             return Err(cold_parse_err("truncated fixed32"));
         }
-        let end = self.pos + 4;
-        let raw: [u8; 4] = self.data[self.pos..end].try_into().unwrap();
-        self.pos = end;
-        Ok(u32::from_le_bytes(raw))
+        // SAFETY: `n - self.pos >= 4`, so 4 bytes at `self.pos` are in bounds.
+        let val =
+            unsafe { core::ptr::read_unaligned(self.data.as_ptr().add(self.pos).cast::<u32>()) }
+                .to_le();
+        self.pos += 4;
+        Ok(val)
     }
 
     /// Reads an 8-byte little-endian `u64`.
@@ -2321,10 +2537,12 @@ impl<'a> Decoder<'a> {
         if n.saturating_sub(self.pos) < 8 {
             return Err(cold_parse_err("truncated fixed64"));
         }
-        let end = self.pos + 8;
-        let raw: [u8; 8] = self.data[self.pos..end].try_into().unwrap();
-        self.pos = end;
-        Ok(u64::from_le_bytes(raw))
+        // SAFETY: `n - self.pos >= 8`, so 8 bytes at `self.pos` are in bounds.
+        let val =
+            unsafe { core::ptr::read_unaligned(self.data.as_ptr().add(self.pos).cast::<u64>()) }
+                .to_le();
+        self.pos += 8;
+        Ok(val)
     }
 
     /// Reads a 4-byte little-endian `i32`.
@@ -2359,6 +2577,40 @@ impl<'a> Decoder<'a> {
         Ok(s)
     }
 
+    /// Reads a `WireString` field directly into `slot`, fusing UTF-8 validation and short-string copy
+    /// when `slot` has no existing heap capacity.
+    #[inline(always)]
+    pub fn read_str_into(&mut self, slot: &mut String) -> Result<()> {
+        let (raw, next_pos) = read_len_slice(self.data, self.pos, 0)?;
+        if slot.capacity() == 0 {
+            if !raw.is_empty() {
+                *slot = bytes_to_owned_utf8(raw)?;
+            }
+        } else {
+            let s = validate_utf8(raw)?;
+            slot.clear();
+            slot.push_str(s);
+        }
+        self.pos = next_pos;
+        Ok(())
+    }
+
+    /// Reads a `WireBytes` field directly into `slot`, avoiding `memcpy` calls for short slices.
+    #[inline(always)]
+    pub fn read_bytes_into(&mut self, slot: &mut Vec<u8>) -> Result<()> {
+        let (raw, next_pos) = read_len_slice(self.data, self.pos, 0)?;
+        if slot.capacity() == 0 {
+            if !raw.is_empty() {
+                *slot = bytes_to_owned_vec(raw);
+            }
+        } else {
+            slot.clear();
+            slot.extend_from_slice(raw);
+        }
+        self.pos = next_pos;
+        Ok(())
+    }
+
     /// Reads a zero-copy `&'a [u8]` byte slice directly from the input buffer.
     #[inline(always)]
     pub fn read_bytes(&mut self) -> Result<&'a [u8]> {
@@ -2368,9 +2620,9 @@ impl<'a> Decoder<'a> {
     }
 
     /// Reads a length-prefixed container slice with at least `min_len` bytes.
-    #[inline]
+    #[inline(always)]
     pub fn read_container(&mut self, min_len: usize) -> Result<&'a [u8]> {
-        let (b, next_pos) = read_len_slice(self.data, self.pos, min_len)?;
+        let (b, next_pos) = read_container_slice(self.data, self.pos, min_len)?;
         self.pos = next_pos;
         Ok(b)
     }

@@ -58,6 +58,8 @@ impl ConformanceRequest {
 }
 
 impl ::omnibuf::Message for ConformanceRequest {
+    const HAS_NESTED_CONTAINERS: bool = false;
+
     #[inline]
     fn encode_omnibuf_append(
         &self,
@@ -65,15 +67,25 @@ impl ::omnibuf::Message for ConformanceRequest {
         deterministic: bool,
     ) -> ::omnibuf::Result<()> {
         let _ = deterministic;
-        ::omnibuf::codec::write_string_field(dst, 1, self.test_name.as_str());
-        ::omnibuf::codec::write_string_field(dst, 2, self.message_type.as_str());
-        ::omnibuf::codec::write_sint_field(dst, 3, i64::from(self.tier));
-        ::omnibuf::codec::write_sint_field(dst, 4, i64::from(self.requested_output_format));
-        ::omnibuf::codec::write_bytes_field(dst, 5, self.omnibuf_payload.as_slice());
-        ::omnibuf::codec::write_string_field(dst, 6, self.json_payload.as_str());
-        ::omnibuf::codec::write_bool_field(dst, 7, self.self_describing);
-        ::omnibuf::codec::write_bool_field(dst, 8, self.test_opaque_splice);
-        ::omnibuf::codec::write_bool_field(dst, 9, self.test_opaque_splice_shrink);
+        {
+            let mut __w = ::omnibuf::codec::RawBufWriter::new(
+                dst,
+                ((((65usize).saturating_add(self.test_name.len()))
+                    .saturating_add(self.message_type.len()))
+                .saturating_add(self.omnibuf_payload.len()))
+                .saturating_add(self.json_payload.len()),
+            );
+            __w.write_string(1, self.test_name.as_str());
+            __w.write_string(2, self.message_type.as_str());
+            __w.write_sint(3, i64::from(self.tier));
+            __w.write_sint(4, i64::from(self.requested_output_format));
+            __w.write_bytes(5, self.omnibuf_payload.as_slice());
+            __w.write_string(6, self.json_payload.as_str());
+            __w.write_bool(7, self.self_describing);
+            __w.write_bool(8, self.test_opaque_splice);
+            __w.write_bool(9, self.test_opaque_splice_shrink);
+            __w.finish();
+        }
         ::core::result::Result::Ok(())
     }
 
@@ -89,12 +101,10 @@ impl ::omnibuf::Message for ConformanceRequest {
             self.clear_omnibuf();
         }
         if dec.consume_tag1(53) {
-            let s = dec.read_str()?;
-            ::omnibuf::codec::assign_str(&mut self.test_name, s);
+            dec.read_str_into(&mut self.test_name)?;
         }
         if dec.consume_tag1(85) {
-            let s = dec.read_str()?;
-            ::omnibuf::codec::assign_str(&mut self.message_type, s);
+            dec.read_str_into(&mut self.message_type)?;
         }
         if dec.consume_tag1(99) {
             self.tier = dec.read_sint()? as i32;
@@ -103,12 +113,10 @@ impl ::omnibuf::Message for ConformanceRequest {
             self.requested_output_format = dec.read_sint()? as i32;
         }
         if dec.consume_tag1(183) {
-            let b = dec.read_bytes()?;
-            ::omnibuf::codec::assign_bytes(&mut self.omnibuf_payload, b);
+            dec.read_bytes_into(&mut self.omnibuf_payload)?;
         }
         if dec.consume_tag1(213) {
-            let s = dec.read_str()?;
-            ::omnibuf::codec::assign_str(&mut self.json_payload, s);
+            dec.read_str_into(&mut self.json_payload)?;
         }
         if let ::core::option::Option::Some(__b) = dec.consume_bool_tag1(229, 231) {
             self.self_describing = __b;
@@ -136,12 +144,10 @@ impl ::omnibuf::Message for ConformanceRequest {
             while let ::core::option::Option::Some(raw_tag) = dec.next_raw_tag()? {
                 match raw_tag {
                     26 => {
-                        let s = dec.read_str()?;
-                        ::omnibuf::codec::assign_str(&mut this.test_name, s);
+                        dec.read_str_into(&mut this.test_name)?;
                     }
                     42 => {
-                        let s = dec.read_str()?;
-                        ::omnibuf::codec::assign_str(&mut this.message_type, s);
+                        dec.read_str_into(&mut this.message_type)?;
                     }
                     49 => {
                         this.tier = dec.read_sint()? as i32;
@@ -150,12 +156,10 @@ impl ::omnibuf::Message for ConformanceRequest {
                         this.requested_output_format = dec.read_sint()? as i32;
                     }
                     91 => {
-                        let b = dec.read_bytes()?;
-                        ::omnibuf::codec::assign_bytes(&mut this.omnibuf_payload, b);
+                        dec.read_bytes_into(&mut this.omnibuf_payload)?;
                     }
                     106 => {
-                        let s = dec.read_str()?;
-                        ::omnibuf::codec::assign_str(&mut this.json_payload, s);
+                        dec.read_str_into(&mut this.json_payload)?;
                     }
                     114 => {
                         this.self_describing = false;
@@ -690,19 +694,33 @@ impl ConformanceResponse {
 }
 
 impl ::omnibuf::Message for ConformanceResponse {
-    #[inline]
+    const HAS_NESTED_CONTAINERS: bool = false;
+
+    #[inline(always)]
     fn encode_omnibuf_append(
         &self,
         dst: &mut ::std::vec::Vec<u8>,
         deterministic: bool,
     ) -> ::omnibuf::Result<()> {
         let _ = deterministic;
-        ::omnibuf::codec::write_string_field(dst, 1, self.parse_error.as_str());
-        ::omnibuf::codec::write_string_field(dst, 2, self.serialize_error.as_str());
-        ::omnibuf::codec::write_string_field(dst, 3, self.runtime_error.as_str());
-        ::omnibuf::codec::write_string_field(dst, 4, self.skipped.as_str());
-        ::omnibuf::codec::write_bytes_field(dst, 5, self.omnibuf_payload.as_slice());
-        ::omnibuf::codec::write_string_field(dst, 6, self.json_payload.as_str());
+        {
+            let mut __w = ::omnibuf::codec::RawBufWriter::new(
+                dst,
+                ((((((60usize).saturating_add(self.parse_error.len()))
+                    .saturating_add(self.serialize_error.len()))
+                .saturating_add(self.runtime_error.len()))
+                .saturating_add(self.skipped.len()))
+                .saturating_add(self.omnibuf_payload.len()))
+                .saturating_add(self.json_payload.len()),
+            );
+            __w.write_string(1, self.parse_error.as_str());
+            __w.write_string(2, self.serialize_error.as_str());
+            __w.write_string(3, self.runtime_error.as_str());
+            __w.write_string(4, self.skipped.as_str());
+            __w.write_bytes(5, self.omnibuf_payload.as_slice());
+            __w.write_string(6, self.json_payload.as_str());
+            __w.finish();
+        }
         ::core::result::Result::Ok(())
     }
 
@@ -718,28 +736,22 @@ impl ::omnibuf::Message for ConformanceResponse {
             self.clear_omnibuf();
         }
         if dec.consume_tag1(53) {
-            let s = dec.read_str()?;
-            ::omnibuf::codec::assign_str(&mut self.parse_error, s);
+            dec.read_str_into(&mut self.parse_error)?;
         }
         if dec.consume_tag1(85) {
-            let s = dec.read_str()?;
-            ::omnibuf::codec::assign_str(&mut self.serialize_error, s);
+            dec.read_str_into(&mut self.serialize_error)?;
         }
         if dec.consume_tag1(117) {
-            let s = dec.read_str()?;
-            ::omnibuf::codec::assign_str(&mut self.runtime_error, s);
+            dec.read_str_into(&mut self.runtime_error)?;
         }
         if dec.consume_tag1(149) {
-            let s = dec.read_str()?;
-            ::omnibuf::codec::assign_str(&mut self.skipped, s);
+            dec.read_str_into(&mut self.skipped)?;
         }
         if dec.consume_tag1(183) {
-            let b = dec.read_bytes()?;
-            ::omnibuf::codec::assign_bytes(&mut self.omnibuf_payload, b);
+            dec.read_bytes_into(&mut self.omnibuf_payload)?;
         }
         if dec.consume_tag1(213) {
-            let s = dec.read_str()?;
-            ::omnibuf::codec::assign_str(&mut self.json_payload, s);
+            dec.read_str_into(&mut self.json_payload)?;
         }
         if dec.is_empty() {
             return ::core::result::Result::Ok(());
@@ -758,28 +770,22 @@ impl ::omnibuf::Message for ConformanceResponse {
             while let ::core::option::Option::Some(raw_tag) = dec.next_raw_tag()? {
                 match raw_tag {
                     26 => {
-                        let s = dec.read_str()?;
-                        ::omnibuf::codec::assign_str(&mut this.parse_error, s);
+                        dec.read_str_into(&mut this.parse_error)?;
                     }
                     42 => {
-                        let s = dec.read_str()?;
-                        ::omnibuf::codec::assign_str(&mut this.serialize_error, s);
+                        dec.read_str_into(&mut this.serialize_error)?;
                     }
                     58 => {
-                        let s = dec.read_str()?;
-                        ::omnibuf::codec::assign_str(&mut this.runtime_error, s);
+                        dec.read_str_into(&mut this.runtime_error)?;
                     }
                     74 => {
-                        let s = dec.read_str()?;
-                        ::omnibuf::codec::assign_str(&mut this.skipped, s);
+                        dec.read_str_into(&mut this.skipped)?;
                     }
                     91 => {
-                        let b = dec.read_bytes()?;
-                        ::omnibuf::codec::assign_bytes(&mut this.omnibuf_payload, b);
+                        dec.read_bytes_into(&mut this.omnibuf_payload)?;
                     }
                     106 => {
-                        let s = dec.read_str()?;
-                        ::omnibuf::codec::assign_str(&mut this.json_payload, s);
+                        dec.read_str_into(&mut this.json_payload)?;
                     }
                     _ => dec.skip_unknown((raw_tag >> 4) as u32, (raw_tag & 0x0F) as u8)?,
                 }
@@ -1203,17 +1209,26 @@ impl AllTypesSubMsg {
 }
 
 impl ::omnibuf::Message for AllTypesSubMsg {
-    #[inline]
+    const HAS_NESTED_CONTAINERS: bool = false;
+
+    #[inline(always)]
     fn encode_omnibuf_append(
         &self,
         dst: &mut ::std::vec::Vec<u8>,
         deterministic: bool,
     ) -> ::omnibuf::Result<()> {
         let _ = deterministic;
-        ::omnibuf::codec::write_uint_field(dst, 1, u64::from(self.id));
-        ::omnibuf::codec::write_string_field(dst, 2, self.label.as_str());
-        ::omnibuf::codec::write_bool_field(dst, 3, self.flag);
-        ::omnibuf::codec::write_sint_field(dst, 4, self.score);
+        {
+            let mut __w = ::omnibuf::codec::RawBufWriter::new(
+                dst,
+                (31usize).saturating_add(self.label.len()),
+            );
+            __w.write_uint(1, u64::from(self.id));
+            __w.write_string(2, self.label.as_str());
+            __w.write_bool(3, self.flag);
+            __w.write_sint(4, self.score);
+            __w.finish();
+        }
         ::core::result::Result::Ok(())
     }
 
@@ -1232,8 +1247,7 @@ impl ::omnibuf::Message for AllTypesSubMsg {
             self.id = dec.read_uint()? as u32;
         }
         if dec.consume_tag1(85) {
-            let s = dec.read_str()?;
-            ::omnibuf::codec::assign_str(&mut self.label, s);
+            dec.read_str_into(&mut self.label)?;
         }
         if let ::core::option::Option::Some(__b) = dec.consume_bool_tag1(101, 103) {
             self.flag = __b;
@@ -1261,8 +1275,7 @@ impl ::omnibuf::Message for AllTypesSubMsg {
                         this.id = dec.read_uint()? as u32;
                     }
                     42 => {
-                        let s = dec.read_str()?;
-                        ::omnibuf::codec::assign_str(&mut this.label, s);
+                        dec.read_str_into(&mut this.label)?;
                     }
                     50 => {
                         this.flag = false;
@@ -1670,6 +1683,8 @@ impl TestAllTypes {
 }
 
 impl ::omnibuf::Message for TestAllTypes {
+    const HAS_NESTED_CONTAINERS: bool = true;
+
     #[inline]
     fn encode_omnibuf_append(
         &self,
@@ -1677,20 +1692,25 @@ impl ::omnibuf::Message for TestAllTypes {
         deterministic: bool,
     ) -> ::omnibuf::Result<()> {
         let _ = deterministic;
-        ::omnibuf::codec::write_uint_field(dst, 1, u64::from(self.f1_uint32));
-        ::omnibuf::codec::write_uint_field(dst, 2, self.f2_uint64);
-        ::omnibuf::codec::write_sint_field(dst, 3, i64::from(self.f3_sint32));
-        ::omnibuf::codec::write_sint_field(dst, 4, self.f4_sint64);
-        ::omnibuf::codec::write_bool_field(dst, 5, self.f5_bool);
-        ::omnibuf::codec::write_string_field(dst, 6, self.f6_string.as_str());
-        ::omnibuf::codec::write_bytes_field(dst, 7, self.f7_bytes.as_slice());
+        {
+            let mut __w = ::omnibuf::codec::RawBufWriter::new(
+                dst,
+                ((61usize).saturating_add(self.f6_string.len()))
+                    .saturating_add(self.f7_bytes.len()),
+            );
+            __w.write_uint(1, u64::from(self.f1_uint32));
+            __w.write_uint(2, self.f2_uint64);
+            __w.write_sint(3, i64::from(self.f3_sint32));
+            __w.write_sint(4, self.f4_sint64);
+            __w.write_bool(5, self.f5_bool);
+            __w.write_string(6, self.f6_string.as_str());
+            __w.write_bytes(7, self.f7_bytes.as_slice());
+            __w.finish();
+        }
         if let ::core::option::Option::Some(ref sub) = self.f8_sub_msg {
             ::omnibuf::codec::write_sub_msg_field(dst, 8, sub, deterministic)?;
         }
-        ::omnibuf::codec::write_scalar_vec_field(dst, 9, 10, &self.f9_string_arr, |dst, item| {
-            ::omnibuf::wire::append_bytes_elem(dst, (item).as_bytes());
-            ::core::result::Result::Ok(())
-        })?;
+        ::omnibuf::codec::write_string_vec_field(dst, 9, &self.f9_string_arr)?;
         ::omnibuf::codec::write_varint_vec_field(dst, 10, 0, &self.f10_uint32_arr, |item| {
             u64::from(*item)
         })?;
@@ -1711,11 +1731,18 @@ impl ::omnibuf::Message for TestAllTypes {
                 ::core::result::Result::Ok(())
             },
         )?;
-        ::omnibuf::codec::write_float32_field(dst, 13, self.f13_float32);
-        ::omnibuf::codec::write_float64_field(dst, 14, self.f14_float64);
-        ::omnibuf::codec::write_fixed32_field(dst, 15, self.f15_fixed32);
-        ::omnibuf::codec::write_fixed64_field(dst, 16, self.f16_fixed64);
-        ::omnibuf::codec::write_string_field(dst, 20, self.f20_overflow_str.as_str());
+        {
+            let mut __w = ::omnibuf::codec::RawBufWriter::new(
+                dst,
+                (43usize).saturating_add(self.f20_overflow_str.len()),
+            );
+            __w.write_float32(13, self.f13_float32);
+            __w.write_float64(14, self.f14_float64);
+            __w.write_fixed32(15, self.f15_fixed32);
+            __w.write_fixed64(16, self.f16_fixed64);
+            __w.write_string(20, self.f20_overflow_str.as_str());
+            __w.finish();
+        }
         ::core::result::Result::Ok(())
     }
 
@@ -1746,12 +1773,10 @@ impl ::omnibuf::Message for TestAllTypes {
             self.f5_bool = __b;
         }
         if dec.consume_tag1(213) {
-            let s = dec.read_str()?;
-            ::omnibuf::codec::assign_str(&mut self.f6_string, s);
+            dec.read_str_into(&mut self.f6_string)?;
         }
         if dec.consume_tag1(247) {
-            let b = dec.read_bytes()?;
-            ::omnibuf::codec::assign_bytes(&mut self.f7_bytes, b);
+            dec.read_bytes_into(&mut self.f7_bytes)?;
         }
         if dec.consume_tag2(562) {
             let pos = dec.position();
@@ -1826,8 +1851,7 @@ impl ::omnibuf::Message for TestAllTypes {
             self.f16_fixed64 = dec.read_fixed64()?;
         }
         if dec.consume_tag2(1322) {
-            let s = dec.read_str()?;
-            ::omnibuf::codec::assign_str(&mut self.f20_overflow_str, s);
+            dec.read_str_into(&mut self.f20_overflow_str)?;
         }
         if dec.is_empty() {
             return ::core::result::Result::Ok(());
@@ -1864,12 +1888,10 @@ impl ::omnibuf::Message for TestAllTypes {
                         this.f5_bool = true;
                     }
                     106 => {
-                        let s = dec.read_str()?;
-                        ::omnibuf::codec::assign_str(&mut this.f6_string, s);
+                        dec.read_str_into(&mut this.f6_string)?;
                     }
                     123 => {
-                        let b = dec.read_bytes()?;
-                        ::omnibuf::codec::assign_bytes(&mut this.f7_bytes, b);
+                        dec.read_bytes_into(&mut this.f7_bytes)?;
                     }
                     140 => {
                         let pos = dec.position();
@@ -1944,8 +1966,7 @@ impl ::omnibuf::Message for TestAllTypes {
                         this.f16_fixed64 = dec.read_fixed64()?;
                     }
                     330 => {
-                        let s = dec.read_str()?;
-                        ::omnibuf::codec::assign_str(&mut this.f20_overflow_str, s);
+                        dec.read_str_into(&mut this.f20_overflow_str)?;
                     }
                     _ => dec.skip_unknown((raw_tag >> 4) as u32, (raw_tag & 0x0F) as u8)?,
                 }
@@ -2897,17 +2918,7 @@ impl<'a> OpaqueTestAllTypes<'a> {
                 }
             }
             9 => {
-                ::omnibuf::codec::write_scalar_vec_field(
-                    dst,
-                    9,
-                    10,
-                    &__dirty.f_f9_string_arr,
-                    |dst, item| {
-                        ::omnibuf::wire::append_bytes_elem(dst, (item).as_bytes());
-                        ::core::result::Result::Ok(())
-                    },
-                )
-                .unwrap();
+                ::omnibuf::codec::write_string_vec_field(dst, 9, &__dirty.f_f9_string_arr).unwrap();
             }
             10 => {
                 ::omnibuf::codec::write_varint_vec_field(

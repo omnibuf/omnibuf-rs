@@ -33,19 +33,30 @@ impl Location {
 }
 
 impl ::omnibuf::Message for Location {
-    #[inline]
+    const HAS_NESTED_CONTAINERS: bool = false;
+
+    #[inline(always)]
     fn encode_omnibuf_append(
         &self,
         dst: &mut ::std::vec::Vec<u8>,
         deterministic: bool,
     ) -> ::omnibuf::Result<()> {
         let _ = deterministic;
-        ::omnibuf::codec::write_string_field(dst, 1, self.region.as_str());
-        ::omnibuf::codec::write_string_field(dst, 2, self.datacenter.as_str());
-        ::omnibuf::codec::write_string_field(dst, 3, self.city.as_str());
-        ::omnibuf::codec::write_uint_field(dst, 4, u64::from(self.rack));
-        ::omnibuf::codec::write_float32_field(dst, 5, self.latitude);
-        ::omnibuf::codec::write_float32_field(dst, 6, self.longitude);
+        {
+            let mut __w = ::omnibuf::codec::RawBufWriter::new(
+                dst,
+                (((50usize).saturating_add(self.region.len()))
+                    .saturating_add(self.datacenter.len()))
+                .saturating_add(self.city.len()),
+            );
+            __w.write_string(1, self.region.as_str());
+            __w.write_string(2, self.datacenter.as_str());
+            __w.write_string(3, self.city.as_str());
+            __w.write_uint(4, u64::from(self.rack));
+            __w.write_float32(5, self.latitude);
+            __w.write_float32(6, self.longitude);
+            __w.finish();
+        }
         ::core::result::Result::Ok(())
     }
 
@@ -61,16 +72,13 @@ impl ::omnibuf::Message for Location {
             self.clear_omnibuf();
         }
         if dec.consume_tag1(53) {
-            let s = dec.read_str()?;
-            ::omnibuf::codec::assign_str(&mut self.region, s);
+            dec.read_str_into(&mut self.region)?;
         }
         if dec.consume_tag1(85) {
-            let s = dec.read_str()?;
-            ::omnibuf::codec::assign_str(&mut self.datacenter, s);
+            dec.read_str_into(&mut self.datacenter)?;
         }
         if dec.consume_tag1(117) {
-            let s = dec.read_str()?;
-            ::omnibuf::codec::assign_str(&mut self.city, s);
+            dec.read_str_into(&mut self.city)?;
         }
         if dec.consume_tag1(129) {
             self.rack = dec.read_uint()? as u32;
@@ -98,16 +106,13 @@ impl ::omnibuf::Message for Location {
             while let ::core::option::Option::Some(raw_tag) = dec.next_raw_tag()? {
                 match raw_tag {
                     26 => {
-                        let s = dec.read_str()?;
-                        ::omnibuf::codec::assign_str(&mut this.region, s);
+                        dec.read_str_into(&mut this.region)?;
                     }
                     42 => {
-                        let s = dec.read_str()?;
-                        ::omnibuf::codec::assign_str(&mut this.datacenter, s);
+                        dec.read_str_into(&mut this.datacenter)?;
                     }
                     58 => {
-                        let s = dec.read_str()?;
-                        ::omnibuf::codec::assign_str(&mut this.city, s);
+                        dec.read_str_into(&mut this.city)?;
                     }
                     64 => {
                         this.rack = dec.read_uint()? as u32;
@@ -529,17 +534,26 @@ impl Neighbor {
 }
 
 impl ::omnibuf::Message for Neighbor {
-    #[inline]
+    const HAS_NESTED_CONTAINERS: bool = false;
+
+    #[inline(always)]
     fn encode_omnibuf_append(
         &self,
         dst: &mut ::std::vec::Vec<u8>,
         deterministic: bool,
     ) -> ::omnibuf::Result<()> {
         let _ = deterministic;
-        ::omnibuf::codec::write_uint_field(dst, 1, u64::from(self.peer_asn));
-        ::omnibuf::codec::write_string_field(dst, 2, self.router.as_str());
-        ::omnibuf::codec::write_uint_field(dst, 3, u64::from(self.latency_us));
-        ::omnibuf::codec::write_bool_field(dst, 4, self.established);
+        {
+            let mut __w = ::omnibuf::codec::RawBufWriter::new(
+                dst,
+                (31usize).saturating_add(self.router.len()),
+            );
+            __w.write_uint(1, u64::from(self.peer_asn));
+            __w.write_string(2, self.router.as_str());
+            __w.write_uint(3, u64::from(self.latency_us));
+            __w.write_bool(4, self.established);
+            __w.finish();
+        }
         ::core::result::Result::Ok(())
     }
 
@@ -558,8 +572,7 @@ impl ::omnibuf::Message for Neighbor {
             self.peer_asn = dec.read_uint()? as u32;
         }
         if dec.consume_tag1(85) {
-            let s = dec.read_str()?;
-            ::omnibuf::codec::assign_str(&mut self.router, s);
+            dec.read_str_into(&mut self.router)?;
         }
         if dec.consume_tag1(97) {
             self.latency_us = dec.read_uint()? as u32;
@@ -587,8 +600,7 @@ impl ::omnibuf::Message for Neighbor {
                         this.peer_asn = dec.read_uint()? as u32;
                     }
                     42 => {
-                        let s = dec.read_str()?;
-                        ::omnibuf::codec::assign_str(&mut this.router, s);
+                        dec.read_str_into(&mut this.router)?;
                     }
                     48 => {
                         this.latency_us = dec.read_uint()? as u32;
@@ -982,6 +994,8 @@ impl PeerUpdate {
 }
 
 impl ::omnibuf::Message for PeerUpdate {
+    const HAS_NESTED_CONTAINERS: bool = true;
+
     #[inline]
     fn encode_omnibuf_append(
         &self,
@@ -989,16 +1003,20 @@ impl ::omnibuf::Message for PeerUpdate {
         deterministic: bool,
     ) -> ::omnibuf::Result<()> {
         let _ = deterministic;
-        ::omnibuf::codec::write_uint_field(dst, 1, u64::from(self.asn));
-        ::omnibuf::codec::write_string_field(dst, 2, self.router_id.as_str());
-        ::omnibuf::codec::write_bool_field(dst, 3, self.active);
-        ::omnibuf::codec::write_uint_field(dst, 4, self.uptime_sec);
-        ::omnibuf::codec::write_sint_field(dst, 5, i64::from(self.rssi_dbm));
-        ::omnibuf::codec::write_float64_field(dst, 6, self.cpu_load);
-        ::omnibuf::codec::write_scalar_vec_field(dst, 7, 10, &self.tags, |dst, item| {
-            ::omnibuf::wire::append_bytes_elem(dst, (item).as_bytes());
-            ::core::result::Result::Ok(())
-        })?;
+        {
+            let mut __w = ::omnibuf::codec::RawBufWriter::new(
+                dst,
+                (50usize).saturating_add(self.router_id.len()),
+            );
+            __w.write_uint(1, u64::from(self.asn));
+            __w.write_string(2, self.router_id.as_str());
+            __w.write_bool(3, self.active);
+            __w.write_uint(4, self.uptime_sec);
+            __w.write_sint(5, i64::from(self.rssi_dbm));
+            __w.write_float64(6, self.cpu_load);
+            __w.finish();
+        }
+        ::omnibuf::codec::write_string_vec_field(dst, 7, &self.tags)?;
         ::omnibuf::codec::write_varint_vec_field(dst, 8, 0, &self.prefixes, |item| {
             u64::from(*item)
         })?;
@@ -1025,8 +1043,7 @@ impl ::omnibuf::Message for PeerUpdate {
             self.asn = dec.read_uint()? as u32;
         }
         if dec.consume_tag1(85) {
-            let s = dec.read_str()?;
-            ::omnibuf::codec::assign_str(&mut self.router_id, s);
+            dec.read_str_into(&mut self.router_id)?;
         }
         if let ::core::option::Option::Some(__b) = dec.consume_bool_tag1(101, 103) {
             self.active = __b;
@@ -1107,8 +1124,7 @@ impl ::omnibuf::Message for PeerUpdate {
                         this.asn = dec.read_uint()? as u32;
                     }
                     42 => {
-                        let s = dec.read_str()?;
-                        ::omnibuf::codec::assign_str(&mut this.router_id, s);
+                        dec.read_str_into(&mut this.router_id)?;
                     }
                     50 => {
                         this.active = false;
@@ -1915,17 +1931,7 @@ impl<'a> OpaquePeerUpdate<'a> {
                 ::omnibuf::codec::write_float64_field(dst, 6, __dirty.f_cpu_load);
             }
             7 => {
-                ::omnibuf::codec::write_scalar_vec_field(
-                    dst,
-                    7,
-                    10,
-                    &__dirty.f_tags,
-                    |dst, item| {
-                        ::omnibuf::wire::append_bytes_elem(dst, (item).as_bytes());
-                        ::core::result::Result::Ok(())
-                    },
-                )
-                .unwrap();
+                ::omnibuf::codec::write_string_vec_field(dst, 7, &__dirty.f_tags).unwrap();
             }
             8 => {
                 ::omnibuf::codec::write_varint_vec_field(dst, 8, 0, &__dirty.f_prefixes, |item| {

@@ -236,7 +236,6 @@ fn expand_struct(
     let num_fields = compiled.len();
     let type_name_lit = &cfg.type_name;
 
-    let mut encode_stmts = Vec::with_capacity(num_fields);
     let mut min_size_stmts = Vec::with_capacity(num_fields);
     let mut decode_arms = Vec::with_capacity(num_fields + 2);
     let mut fallback_oneof_tries = Vec::new();
@@ -247,9 +246,11 @@ fn expand_struct(
     let mut schema_cyclic_stmts = Vec::new();
     let mut value_schema_child_stmts = Vec::new();
 
+    let encode_stmts = gen_encode_fields_batched(krate, &compiled);
+    let has_nested_containers = !compiled.iter().all(is_flat_compiled_field);
+
     for cf in &compiled {
         let f_ident = &cf.ident;
-        encode_stmts.push(gen_encode_field(krate, cf));
         min_size_stmts.push(gen_min_wire_size_field(krate, cf));
         if let FieldShape::Oneof { ty, tags } = &cf.shape {
             if tags.is_empty() {
@@ -366,6 +367,7 @@ fn expand_struct(
     } else {
         quote!(#[inline])
     };
+    let encode_inline_attr = decode_inline_attr.clone();
 
     Ok(quote! {
         impl #impl_generics #krate::codec::IsEmpty for #ident #ty_generics #where_clause {
@@ -377,6 +379,8 @@ fn expand_struct(
         }
 
         impl #impl_generics #krate::Message for #ident #ty_generics #where_clause {
+            const HAS_NESTED_CONTAINERS: bool = #has_nested_containers;
+
             #[inline]
             fn min_wire_size_bounded(&self, depth_rem: usize) -> usize {
                 let _ = depth_rem;
@@ -385,7 +389,7 @@ fn expand_struct(
                 __sz
             }
 
-            #[inline]
+            #encode_inline_attr
             fn encode_omnibuf_append(
                 &self,
                 dst: &mut ::std::vec::Vec<u8>,
@@ -483,6 +487,8 @@ fn expand_empty_struct(input: &DeriveInput, cfg: &ContainerConfig) -> Result<Tok
         }
 
         impl #impl_generics #krate::Message for #ident #ty_generics #where_clause {
+            const HAS_NESTED_CONTAINERS: bool = false;
+
             fn encode_omnibuf_append(
                 &self,
                 _dst: &mut ::std::vec::Vec<u8>,
@@ -631,7 +637,7 @@ fn expand_oneof_enum(
                     });
                     decode_arms.push(quote! {
                         #v_id if wt == #WIRE_SUB_MSG => {
-                            let (__sb, __np) = #krate::wire::read_len_slice(data, pos, 0)?;
+                            let (__sb, __np) = #krate::wire::read_container_slice(data, pos, 0)?;
                             if let ::core::option::Option::Some(Self::#v_ident(ref mut __existing)) = *slot {
                                 <#ty as #krate::Message>::decode_omnibuf_at_depth(&mut **__existing, __sb, depth + 1, true)?;
                             } else {
@@ -666,7 +672,7 @@ fn expand_oneof_enum(
                     });
                     decode_arms.push(quote! {
                         #v_id if wt == #WIRE_SUB_MSG => {
-                            let (__sb, __np) = #krate::wire::read_len_slice(data, pos, 0)?;
+                            let (__sb, __np) = #krate::wire::read_container_slice(data, pos, 0)?;
                             if let ::core::option::Option::Some(Self::#v_ident(ref mut __existing)) = *slot {
                                 <#ty as #krate::Message>::decode_omnibuf_at_depth(__existing, __sb, depth + 1, true)?;
                             } else {
@@ -1914,6 +1920,150 @@ fn gen_elem_reader_closure(krate: &syn::Path, shape: &ElemShape) -> TokenStream2
     }
 }
 
+fn is_flat_compiled_field(cf: &CompiledField) -> bool {
+    matches!(
+        cf.shape,
+        FieldShape::Scalar { .. }
+            | FieldShape::OptScalar { .. }
+            | FieldShape::BuffaEnum { .. }
+            | FieldShape::OptBuffaEnum { .. }
+    )
+}
+
+fn gen_raw_write_scalar_expr(
+    f_id: u32,
+    scalar: ScalarType,
+    wire_wt: u8,
+    val_expr: TokenStream2,
+) -> TokenStream2 {
+    match (scalar, wire_wt) {
+        (ScalarType::Bool, _) => quote! { __w.write_bool(#f_id, *#val_expr); },
+        (ScalarType::String, _) => quote! { __w.write_string(#f_id, (#val_expr).as_str()); },
+        (ScalarType::Bytes, _) => quote! { __w.write_bytes(#f_id, (#val_expr).as_slice()); },
+        (ScalarType::F32, _) => quote! { __w.write_float32(#f_id, *#val_expr); },
+        (ScalarType::F64, _) => quote! { __w.write_float64(#f_id, *#val_expr); },
+        (_, WIRE_UINT) => quote! { __w.write_uint(#f_id, (*#val_expr) as u64); },
+        (_, WIRE_SINT) => quote! { __w.write_sint(#f_id, (*#val_expr) as i64); },
+        (_, WIRE_FIXED32) => quote! { __w.write_fixed32(#f_id, (*#val_expr) as u32); },
+        (_, WIRE_FIXED64) => quote! { __w.write_fixed64(#f_id, (*#val_expr) as u64); },
+        (_, WIRE_SFIXED32) => quote! { __w.write_sfixed32(#f_id, (*#val_expr) as i32); },
+        (_, WIRE_SFIXED64) => quote! { __w.write_sfixed64(#f_id, (*#val_expr) as i64); },
+        _ => unreachable!(),
+    }
+}
+
+fn gen_raw_encode_field(krate: &syn::Path, cf: &CompiledField) -> TokenStream2 {
+    let f_ident = &cf.ident;
+    let f_id = cf.id;
+    let body = match &cf.shape {
+        FieldShape::Scalar { scalar, wire_wt } => {
+            gen_raw_write_scalar_expr(f_id, *scalar, *wire_wt, quote!(&self.#f_ident))
+        }
+        FieldShape::OptScalar { scalar, wire_wt } => {
+            let write_inner = gen_raw_write_scalar_expr(f_id, *scalar, *wire_wt, quote!(val));
+            return quote! {
+                if let ::core::option::Option::Some(ref val) = self.#f_ident {
+                    #write_inner
+                }
+            };
+        }
+        FieldShape::BuffaEnum { .. } => quote! {
+            __w.write_buffa_enum(#f_id, &self.#f_ident);
+        },
+        FieldShape::OptBuffaEnum { .. } => {
+            return quote! {
+                if let ::core::option::Option::Some(ref val) = self.#f_ident {
+                    __w.write_buffa_enum(#f_id, val);
+                }
+            };
+        }
+        _ => unreachable!(),
+    };
+    if cf.omit_empty {
+        quote! {
+            if !#krate::codec::IsEmpty::is_omnibuf_empty(&self.#f_ident) {
+                #body
+            }
+        }
+    } else {
+        body
+    }
+}
+
+fn gen_encode_fields_batched(krate: &syn::Path, compiled: &[CompiledField]) -> Vec<TokenStream2> {
+    let mut out = Vec::with_capacity(compiled.len());
+    let mut i = 0usize;
+    while i < compiled.len() {
+        if !is_flat_compiled_field(&compiled[i]) {
+            out.push(gen_encode_field(krate, &compiled[i]));
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < compiled.len() && is_flat_compiled_field(&compiled[i]) {
+            i += 1;
+        }
+        let run = &compiled[start..i];
+        if run.len() < 2 {
+            out.push(gen_encode_field(krate, &run[0]));
+            continue;
+        }
+        let mut fixed_max = 0usize;
+        let mut dyn_exprs = Vec::new();
+        let mut write_stmts = Vec::with_capacity(run.len());
+        for cf in run {
+            let f_ident = &cf.ident;
+            match &cf.shape {
+                FieldShape::Scalar { scalar, wire_wt } => {
+                    let tw = tag_varint_width(cf.id, *wire_wt);
+                    match (scalar, *wire_wt) {
+                        (ScalarType::Bool, _) => fixed_max += tw,
+                        (_, WIRE_FIXED32 | WIRE_SFIXED32 | WIRE_FLOAT32) => fixed_max += tw + 4,
+                        (_, WIRE_FIXED64 | WIRE_SFIXED64 | WIRE_FLOAT64) => fixed_max += tw + 8,
+                        (ScalarType::String | ScalarType::Bytes, _) => {
+                            fixed_max += tw + 9;
+                            dyn_exprs.push(quote!(self.#f_ident.len()));
+                        }
+                        _ => fixed_max += tw + 9,
+                    }
+                }
+                FieldShape::OptScalar { scalar, wire_wt } => {
+                    let tw = tag_varint_width(cf.id, *wire_wt);
+                    match (scalar, *wire_wt) {
+                        (ScalarType::Bool, _) => fixed_max += tw,
+                        (_, WIRE_FIXED32 | WIRE_SFIXED32 | WIRE_FLOAT32) => fixed_max += tw + 4,
+                        (_, WIRE_FIXED64 | WIRE_SFIXED64 | WIRE_FLOAT64) => fixed_max += tw + 8,
+                        (ScalarType::String | ScalarType::Bytes, _) => {
+                            let hdr = tw + 9;
+                            dyn_exprs.push(quote!(
+                                self.#f_ident.as_ref().map_or(0usize, |__v| #hdr + __v.len())
+                            ));
+                        }
+                        _ => fixed_max += tw + 9,
+                    }
+                }
+                FieldShape::BuffaEnum { .. } | FieldShape::OptBuffaEnum { .. } => {
+                    fixed_max += tag_varint_width(cf.id, WIRE_SINT) + 9;
+                }
+                _ => unreachable!(),
+            }
+            write_stmts.push(gen_raw_encode_field(krate, cf));
+        }
+        let mut max_expr = quote!(#fixed_max);
+        for d in dyn_exprs {
+            max_expr = quote!((#max_expr).saturating_add(#d));
+        }
+        out.push(quote! {
+            {
+                let mut __w = #krate::codec::RawBufWriter::new(dst, #max_expr);
+                #(#write_stmts)*
+                __w.finish();
+            }
+        });
+    }
+    out
+}
+
 fn gen_encode_field(krate: &syn::Path, cf: &CompiledField) -> TokenStream2 {
     let f_ident = &cf.ident;
     let f_id = cf.id;
@@ -1973,8 +2123,35 @@ fn gen_encode_field(krate: &syn::Path, cf: &CompiledField) -> TokenStream2 {
         }
         FieldShape::ScalarVec { scalar, elem_wt } => {
             let item_ident = Ident::new("__item", Span::call_site());
-            if *elem_wt == WIRE_UINT {
-                quote! {
+            match (*scalar, *elem_wt) {
+                (ScalarType::F64, WIRE_FLOAT64) => quote! {
+                    #krate::codec::write_float64_vec_field(dst, #f_id, &self.#f_ident)?;
+                },
+                (ScalarType::F32, WIRE_FLOAT32) => quote! {
+                    #krate::codec::write_float32_vec_field(dst, #f_id, &self.#f_ident)?;
+                },
+                (ScalarType::U64, WIRE_FIXED64) => quote! {
+                    #krate::codec::write_fixed64_vec_field(dst, #f_id, &self.#f_ident)?;
+                },
+                (ScalarType::I64, WIRE_SFIXED64) => quote! {
+                    #krate::codec::write_sfixed64_vec_field(dst, #f_id, &self.#f_ident)?;
+                },
+                (ScalarType::U32, WIRE_FIXED32) => quote! {
+                    #krate::codec::write_fixed32_vec_field(dst, #f_id, &self.#f_ident)?;
+                },
+                (ScalarType::I32, WIRE_SFIXED32) => quote! {
+                    #krate::codec::write_sfixed32_vec_field(dst, #f_id, &self.#f_ident)?;
+                },
+                (ScalarType::Bool, WIRE_BOOL_FALSE) => quote! {
+                    #krate::codec::write_bool_vec_field(dst, #f_id, &self.#f_ident)?;
+                },
+                (ScalarType::String, WIRE_STRING) => quote! {
+                    #krate::codec::write_string_vec_field(dst, #f_id, &self.#f_ident)?;
+                },
+                (ScalarType::Bytes, WIRE_BYTES) => quote! {
+                    #krate::codec::write_bytes_vec_field(dst, #f_id, &self.#f_ident)?;
+                },
+                (_, WIRE_UINT) => quote! {
                     #krate::codec::write_varint_vec_field(
                         dst,
                         #f_id,
@@ -1982,9 +2159,8 @@ fn gen_encode_field(krate: &syn::Path, cf: &CompiledField) -> TokenStream2 {
                         &self.#f_ident,
                         |#item_ident| (*#item_ident) as u64,
                     )?;
-                }
-            } else if *elem_wt == WIRE_SINT {
-                quote! {
+                },
+                (_, WIRE_SINT) => quote! {
                     #krate::codec::write_varint_vec_field(
                         dst,
                         #f_id,
@@ -1992,20 +2168,22 @@ fn gen_encode_field(krate: &syn::Path, cf: &CompiledField) -> TokenStream2 {
                         &self.#f_ident,
                         |#item_ident| #krate::wire::encode_zigzag((*#item_ident) as i64),
                     )?;
-                }
-            } else {
-                let write_elem = gen_write_elem_payload_expr(krate, *scalar, *elem_wt, &item_ident);
-                quote! {
-                    #krate::codec::write_scalar_vec_field(
-                        dst,
-                        #f_id,
-                        #elem_wt,
-                        &self.#f_ident,
-                        |dst, #item_ident| {
-                            #write_elem
-                            ::core::result::Result::Ok(())
-                        },
-                    )?;
+                },
+                _ => {
+                    let write_elem =
+                        gen_write_elem_payload_expr(krate, *scalar, *elem_wt, &item_ident);
+                    quote! {
+                        #krate::codec::write_scalar_vec_field(
+                            dst,
+                            #f_id,
+                            #elem_wt,
+                            &self.#f_ident,
+                            |dst, #item_ident| {
+                                #write_elem
+                                ::core::result::Result::Ok(())
+                            },
+                        )?;
+                    }
                 }
             }
         }
@@ -2380,8 +2558,7 @@ fn gen_fast_decode_stmt(krate: &syn::Path, cf: &CompiledField) -> Option<TokenSt
         } => wrap_tag(
             *wire_wt,
             quote! {
-                let s = dec.read_str()?;
-                #krate::codec::assign_str(&mut self.#f_ident, s);
+                dec.read_str_into(&mut self.#f_ident)?;
             },
         ),
         FieldShape::Scalar {
@@ -2390,8 +2567,7 @@ fn gen_fast_decode_stmt(krate: &syn::Path, cf: &CompiledField) -> Option<TokenSt
         } => wrap_tag(
             *wire_wt,
             quote! {
-                let b = dec.read_bytes()?;
-                #krate::codec::assign_bytes(&mut self.#f_ident, b);
+                dec.read_bytes_into(&mut self.#f_ident)?;
             },
         ),
         FieldShape::Scalar { scalar, wire_wt } => {
@@ -2472,75 +2648,9 @@ fn gen_fast_decode_stmt(krate: &syn::Path, cf: &CompiledField) -> Option<TokenSt
                 dec.set_position(next_pos);
             },
         ),
-        FieldShape::ScalarVec {
-            scalar: ScalarType::U32,
-            elem_wt: WIRE_UINT,
-        } => wrap_tag(
-            WIRE_ARRAY,
-            quote! {
-                let pos = dec.position();
-                let next_pos = #krate::codec::read_uint32_vec_field(
-                    &mut self.#f_ident,
-                    dec.data(),
-                    pos,
-                    depth,
-                    false,
-                )?;
-                dec.set_position(next_pos);
-            },
-        ),
-        FieldShape::ScalarVec {
-            scalar: ScalarType::U64,
-            elem_wt: WIRE_UINT,
-        } => wrap_tag(
-            WIRE_ARRAY,
-            quote! {
-                let pos = dec.position();
-                let next_pos = #krate::codec::read_uint64_vec_field(
-                    &mut self.#f_ident,
-                    dec.data(),
-                    pos,
-                    depth,
-                    false,
-                )?;
-                dec.set_position(next_pos);
-            },
-        ),
-        FieldShape::ScalarVec {
-            scalar: ScalarType::String,
-            ..
-        } => wrap_tag(
-            WIRE_ARRAY,
-            quote! {
-                let pos = dec.position();
-                let next_pos = #krate::codec::read_string_vec_field(
-                    &mut self.#f_ident,
-                    dec.data(),
-                    pos,
-                    depth,
-                    false,
-                )?;
-                dec.set_position(next_pos);
-            },
-        ),
         FieldShape::ScalarVec { scalar, elem_wt } => {
-            let read_elem = gen_read_elem_payload_expr(krate, *scalar, *elem_wt);
-            wrap_tag(
-                WIRE_ARRAY,
-                quote! {
-                    let pos = dec.position();
-                    let next_pos = #krate::codec::read_scalar_vec_field(
-                        &mut self.#f_ident,
-                        dec.data(),
-                        pos,
-                        depth,
-                        #elem_wt,
-                        false,
-                        |b, p| #read_elem,
-                    )?;
-                    dec.set_position(next_pos);
-                },
-            )
+            let body = gen_read_scalar_vec_body(krate, f_ident, *scalar, *elem_wt);
+            wrap_tag(WIRE_ARRAY, body)
         }
         FieldShape::BuffaEnumVec { enum_ty } => wrap_tag(
             WIRE_ARRAY,
@@ -2637,6 +2747,56 @@ fn gen_fast_decode_stmt(krate: &syn::Path, cf: &CompiledField) -> Option<TokenSt
     }
 }
 
+fn gen_read_scalar_vec_body(
+    krate: &syn::Path,
+    f_ident: &Ident,
+    scalar: ScalarType,
+    elem_wt: u8,
+) -> TokenStream2 {
+    let specialized = match (scalar, elem_wt) {
+        (ScalarType::U32, WIRE_UINT) => Some(quote!(read_uint32_vec_field)),
+        (ScalarType::U64, WIRE_UINT) => Some(quote!(read_uint64_vec_field)),
+        (ScalarType::F64, WIRE_FLOAT64) => Some(quote!(read_float64_vec_field)),
+        (ScalarType::F32, WIRE_FLOAT32) => Some(quote!(read_float32_vec_field)),
+        (ScalarType::U64, WIRE_FIXED64) => Some(quote!(read_fixed64_vec_field)),
+        (ScalarType::I64, WIRE_SFIXED64) => Some(quote!(read_sfixed64_vec_field)),
+        (ScalarType::U32, WIRE_FIXED32) => Some(quote!(read_fixed32_vec_field)),
+        (ScalarType::I32, WIRE_SFIXED32) => Some(quote!(read_sfixed32_vec_field)),
+        (ScalarType::Bool, WIRE_BOOL_FALSE) => Some(quote!(read_bool_vec_field)),
+        (ScalarType::String, WIRE_STRING) => Some(quote!(read_string_vec_field)),
+        (ScalarType::Bytes, WIRE_BYTES) => Some(quote!(read_bytes_vec_field)),
+        _ => None,
+    };
+    if let Some(fn_ident) = specialized {
+        quote! {
+            let pos = dec.position();
+            let next_pos = #krate::codec::#fn_ident(
+                &mut self.#f_ident,
+                dec.data(),
+                pos,
+                depth,
+                false,
+            )?;
+            dec.set_position(next_pos);
+        }
+    } else {
+        let read_elem = gen_read_elem_payload_expr(krate, scalar, elem_wt);
+        quote! {
+            let pos = dec.position();
+            let next_pos = #krate::codec::read_scalar_vec_field(
+                &mut self.#f_ident,
+                dec.data(),
+                pos,
+                depth,
+                #elem_wt,
+                false,
+                |b, p| #read_elem,
+            )?;
+            dec.set_position(next_pos);
+        }
+    }
+}
+
 fn gen_decode_arm(krate: &syn::Path, cf: &CompiledField) -> TokenStream2 {
     let f_ident = &cf.ident;
     let f_id = cf.id;
@@ -2668,8 +2828,7 @@ fn gen_decode_arm(krate: &syn::Path, cf: &CompiledField) -> TokenStream2 {
         } => {
             quote! {
                 #f_id if wt == #wire_wt => {
-                    let s = dec.read_str()?;
-                    #krate::codec::assign_str(&mut self.#f_ident, s);
+                    dec.read_str_into(&mut self.#f_ident)?;
                 }
             }
         }
@@ -2679,8 +2838,7 @@ fn gen_decode_arm(krate: &syn::Path, cf: &CompiledField) -> TokenStream2 {
         } => {
             quote! {
                 #f_id if wt == #wire_wt => {
-                    let b = dec.read_bytes()?;
-                    #krate::codec::assign_bytes(&mut self.#f_ident, b);
+                    dec.read_bytes_into(&mut self.#f_ident)?;
                 }
             }
         }
@@ -2769,20 +2927,10 @@ fn gen_decode_arm(krate: &syn::Path, cf: &CompiledField) -> TokenStream2 {
             }
         }
         FieldShape::ScalarVec { scalar, elem_wt } => {
-            let read_elem = gen_read_elem_payload_expr(krate, *scalar, *elem_wt);
+            let body = gen_read_scalar_vec_body(krate, f_ident, *scalar, *elem_wt);
             quote! {
                 #f_id if wt == #WIRE_ARRAY => {
-                    let pos = dec.position();
-                    let next_pos = #krate::codec::read_scalar_vec_field(
-                        &mut self.#f_ident,
-                        dec.data(),
-                        pos,
-                        depth,
-                        #elem_wt,
-                        false,
-                        |b, p| #read_elem,
-                    )?;
-                    dec.set_position(next_pos);
+                    #body
                 }
             }
         }
