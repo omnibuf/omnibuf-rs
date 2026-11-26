@@ -62,6 +62,10 @@ fmt-check:
     cargo fmt --all -- --check
     buf format -d --exit-code
 
+# Check public API semver compatibility against crates.io
+semver:
+    cargo semver-checks --workspace --all-features
+
 # Verify crate packaging and rustdoc for crates.io
 publish-check:
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --exclude conformance-rs --exclude omnibuf-bench --all-features
