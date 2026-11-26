@@ -1,4 +1,10 @@
 #[path = "omnibuf/conformance/conformance_omnibuf.rs"]
 pub mod conformance_omnibuf;
+#[path = "omnibuf/conformance/editions_2023_omnibuf.rs"]
+pub mod editions_2023_omnibuf;
+#[path = "omnibuf/conformance/editions_2024_omnibuf.rs"]
+pub mod editions_2024_omnibuf;
+#[path = "omnibuf/conformance/editions_2026_omnibuf.rs"]
+pub mod editions_2026_omnibuf;
 #[path = "omnibuf/bench/peer_omnibuf.rs"]
 pub mod peer_omnibuf;

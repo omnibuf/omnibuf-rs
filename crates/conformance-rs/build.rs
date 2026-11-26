@@ -11,24 +11,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         proto_root.join("omnibuf/bench/peer.proto"),
         proto_root.join("omnibuf/conformance/conformance.proto"),
     ];
+    let editions_protos = [
+        proto_root.join("omnibuf/conformance/editions_2023.proto"),
+        proto_root.join("omnibuf/conformance/editions_2024.proto"),
+        proto_root.join("omnibuf/conformance/editions_2026.proto"),
+    ];
 
     println!(
         "cargo:rerun-if-changed={}",
         repo_root.join("buf.yaml").display()
     );
-    for proto in &protos {
+    for proto in protos.iter().chain(editions_protos.iter()) {
         println!("cargo:rerun-if-changed={}", proto.display());
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     let descriptor_path = out_dir.join("file_descriptor_set.bin");
+    let editions_descriptor_path = out_dir.join("editions_descriptor_set.bin");
 
+    // Keep prost/prost-reflect descriptor set strictly proto3 (prost-reflect 0.16 cannot parse editions).
     let built_with_buf = Command::new("buf")
         .current_dir(&repo_root)
-        .args(["build", "-o"])
+        .args([
+            "build",
+            "--path",
+            "proto/omnibuf/bench/peer.proto",
+            "--path",
+            "proto/omnibuf/conformance/conformance.proto",
+            "-o",
+        ])
         .arg(&descriptor_path)
         .status()
         .is_ok_and(|s| s.success());
+
+    // Build separate Editions 2023/2024/2026 FileDescriptorSet for buffa_descriptor::DescriptorPool.
+    let editions_built_with_buf = Command::new("buf")
+        .current_dir(&repo_root)
+        .args([
+            "build",
+            "--path",
+            "proto/omnibuf/conformance/editions_2023.proto",
+            "--path",
+            "proto/omnibuf/conformance/editions_2024.proto",
+            "--path",
+            "proto/omnibuf/conformance/editions_2026.proto",
+            "-o",
+        ])
+        .arg(&editions_descriptor_path)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !editions_built_with_buf {
+        let status = Command::new("protoc")
+            .arg("-I")
+            .arg(&proto_root)
+            .arg("-o")
+            .arg(&editions_descriptor_path)
+            .args(&editions_protos)
+            .status()?;
+        if !status.success() {
+            return Err("failed to compile Editions FileDescriptorSet via buf or protoc".into());
+        }
+    }
 
     let mut config = prost_build::Config::new();
     if built_with_buf {

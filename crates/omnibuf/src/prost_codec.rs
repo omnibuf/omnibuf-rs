@@ -1,3 +1,11 @@
+//! Bridge between OmniBuf wire packets and [`prost`] / [`prost_reflect`] Protobuf messages.
+//!
+//! Note on Protobuf Editions: `prost-reflect` 0.16 only parses `proto2` and `proto3` descriptors;
+//! passing a `syntax = "editions"` `FileDescriptorSet` to `prost_reflect::DescriptorPool::decode`
+//! hits an upstream out-of-bounds panic while constructing `DescriptorErrorKind::UnknownSyntax`.
+//! For Protobuf Editions 2023, 2024, and 2026 dynamic reflection, use [`crate::buffa_codec`] with
+//! `buffa-descriptor`.
+
 use std::collections::HashSet;
 
 use prost::bytes::Bytes;

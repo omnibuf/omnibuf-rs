@@ -1,3 +1,6 @@
+mod editions;
+pub use editions::generate_request_bytes;
+
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
@@ -42,6 +45,32 @@ struct GlobalRegistry {
     map_entries: HashMap<String, MapEntryInfo>,
     messages: HashMap<String, RegisteredMsg>,
     enums: HashMap<String, (String, String)>,
+    enum_zero_values: HashMap<String, HashSet<String>>,
+}
+
+pub(crate) fn is_option_extendee(extendee: &str) -> bool {
+    let name = extendee.strip_prefix('.').unwrap_or(extendee);
+    matches!(
+        name,
+        "google.protobuf.FileOptions"
+            | "google.protobuf.MessageOptions"
+            | "google.protobuf.FieldOptions"
+            | "google.protobuf.OneofOptions"
+            | "google.protobuf.EnumOptions"
+            | "google.protobuf.EnumValueOptions"
+            | "google.protobuf.ServiceOptions"
+            | "google.protobuf.MethodOptions"
+            | "google.protobuf.ExtensionRangeOptions"
+            | "google.protobuf.FeatureSet"
+    )
+}
+
+fn collect_enum_zero_values(e: &EnumDescriptorProto) -> HashSet<String> {
+    e.value
+        .iter()
+        .filter(|v| v.number == Some(0))
+        .filter_map(|v| v.name.clone())
+        .collect()
 }
 
 /// Executes code generation for a `protoc` [`CodeGeneratorRequest`].
@@ -100,11 +129,13 @@ fn build_registry(proto_files: &[FileDescriptorProto]) -> Result<GlobalRegistry,
                 "unsupported protobuf syntax {syntax:?} ({file_name})"
             ));
         }
-        if !file.extension.is_empty() {
-            let ext_name = file.extension[0].name.as_deref().unwrap_or("extension");
-            return Err(format!(
-                "proto2 extensions are not supported by OmniBuf ({file_name}: {ext_name})"
-            ));
+        for ext in &file.extension {
+            if !is_option_extendee(ext.extendee.as_deref().unwrap_or("")) {
+                let ext_name = ext.name.as_deref().unwrap_or("extension");
+                return Err(format!(
+                    "proto2 extensions are not supported by OmniBuf ({file_name}: {ext_name})"
+                ));
+            }
         }
         let pkg_prefix = match file.package.as_deref() {
             Some(pkg) if !pkg.is_empty() => format!(".{pkg}"),
@@ -114,10 +145,10 @@ fn build_registry(proto_files: &[FileDescriptorProto]) -> Result<GlobalRegistry,
         for e in &file.enum_type {
             let ename = e.name.as_deref().unwrap_or("UnknownEnum");
             let rust_name = allocate_unique_type_name(&to_pascal_case(ename), &mut used_type_names);
-            reg.enums.insert(
-                format!("{pkg_prefix}.{ename}"),
-                (file_name.to_owned(), rust_name),
-            );
+            let fq_enum = format!("{pkg_prefix}.{ename}");
+            reg.enum_zero_values
+                .insert(fq_enum.clone(), collect_enum_zero_values(e));
+            reg.enums.insert(fq_enum, (file_name.to_owned(), rust_name));
         }
         // Reserve top-level message names first so nested messages never steal a top-level name.
         let mut top_names: Vec<String> = Vec::with_capacity(file.message_type.len());
@@ -187,7 +218,18 @@ fn collect_file_messages(
         let mname = m.name.as_deref().unwrap_or("UnknownMsg");
         let fq = format!("{fq_parent}.{mname}");
 
-        if !m.extension.is_empty() || !m.extension_range.is_empty() {
+        for ext in &m.extension {
+            if !is_option_extendee(ext.extendee.as_deref().unwrap_or("")) {
+                let ext_name = ext.name.as_deref().unwrap_or("extension");
+                return Err(format!(
+                    "proto2 extensions are not supported by OmniBuf ({file_name}: {mname}.{ext_name})"
+                ));
+            }
+        }
+        if !m.extension_range.is_empty()
+            && !is_option_extendee(&fq)
+            && file_name != "google/protobuf/descriptor.proto"
+        {
             return Err(format!(
                 "proto2 extensions are not supported by OmniBuf ({file_name}: {mname})"
             ));
@@ -242,10 +284,11 @@ fn collect_file_messages(
             let ename = e.name.as_deref().unwrap_or("UnknownEnum");
             let cand = format!("{rust_name}{}", to_pascal_case(ename));
             let enum_rust_name = allocate_unique_type_name(&cand, used_type_names);
-            reg.enums.insert(
-                format!("{fq}.{ename}"),
-                (file_name.to_owned(), enum_rust_name),
-            );
+            let fq_enum = format!("{fq}.{ename}");
+            reg.enum_zero_values
+                .insert(fq_enum.clone(), collect_enum_zero_values(e));
+            reg.enums
+                .insert(fq_enum, (file_name.to_owned(), enum_rust_name));
         }
 
         collect_file_messages(
@@ -705,7 +748,12 @@ fn is_reserved_opaque_stem(stem: &str) -> bool {
     )
 }
 
-fn is_zero_default_value(ftype: Type, def: &str) -> bool {
+fn is_zero_default_value(
+    ftype: Type,
+    type_name: Option<&str>,
+    def: &str,
+    reg: &GlobalRegistry,
+) -> bool {
     match ftype {
         Type::Bool => def == "false",
         Type::String | Type::Bytes => def.is_empty(),
@@ -719,7 +767,10 @@ fn is_zero_default_value(ftype: Type, def: &str) -> bool {
         | Type::Uint64
         | Type::Fixed32
         | Type::Fixed64 => def == "0",
-        Type::Float | Type::Double => def == "0" || def == "0.0",
+        Type::Float | Type::Double => def.parse::<f64>().is_ok_and(|v| v.to_bits() == 0),
+        Type::Enum => type_name
+            .and_then(|tn| reg.enum_zero_values.get(tn))
+            .is_some_and(|zeros| zeros.contains(def)),
         _ => false,
     }
 }
@@ -762,10 +813,10 @@ fn emit_message(
         let ftype = f.r#type();
         let is_proto3_opt = f.proto3_optional.unwrap_or(false);
         if let Some(def) = f.default_value.as_deref()
-            && !is_zero_default_value(ftype, def)
+            && !is_zero_default_value(ftype, f.type_name.as_deref(), def, reg)
         {
             return Err(format!(
-                "proto2 non-zero default values are not supported by OmniBuf ({rust_name}.{proto_name} = {def:?})"
+                "non-zero default values are not supported by OmniBuf ({rust_name}.{proto_name} = {def:?})"
             ));
         }
 
@@ -1369,16 +1420,40 @@ fn emit_message_trait_impl(
     for go in oneofs {
         let fident = &go.field_ident;
         let ename = &go.enum_name;
-        let has_sub = go
+        let sub_arms: Vec<&GenOneofArm> = go
             .arms
             .iter()
-            .any(|a| matches!(a.kind, OneofArmKind::SubMsg { .. }));
-        if has_sub {
+            .filter(|a| matches!(a.kind, OneofArmKind::SubMsg { .. }))
+            .collect();
+        if sub_arms.len() == 1 {
+            let arm = sub_arms[0];
+            if let OneofArmKind::SubMsg {
+                rust_type, boxed, ..
+            } = &arm.kind
+            {
+                let fnum = arm.number;
+                let vident = &arm.variant_ident;
+                let sub_ref = if *boxed { "&**__v" } else { "__v" };
+                let body = if go.arms.len() == 1 {
+                    format!(
+                        "{{ let {ename}::{vident}(__v) = __ov; <{rust_type} as ::omnibuf::Message>::build_value_schema_meta({sub_ref}, depth + 2) }}"
+                    )
+                } else {
+                    format!(
+                        "if let {ename}::{vident}(__v) = __ov {{ <{rust_type} as ::omnibuf::Message>::build_value_schema_meta({sub_ref}, depth + 2) }} else {{ ::core::option::Option::None }}"
+                    )
+                };
+                let _ = writeln!(
+                    child_code,
+                    "            if let ::core::option::Option::Some(__c) = self.{fident}.as_ref().and_then(|__ov| {body}) {{ meta.children.insert({fnum}, __c); }}"
+                );
+            }
+        } else if sub_arms.len() > 1 {
             let _ = writeln!(
                 child_code,
                 "            if let ::core::option::Option::Some(ref __ov) = self.{fident} {{ match __ov {{"
             );
-            for arm in &go.arms {
+            for arm in &sub_arms {
                 if let OneofArmKind::SubMsg {
                     rust_type, boxed, ..
                 } = &arm.kind
@@ -1392,7 +1467,9 @@ fn emit_message_trait_impl(
                     );
                 }
             }
-            let _ = writeln!(child_code, "                _ => {{}}");
+            if sub_arms.len() < go.arms.len() {
+                let _ = writeln!(child_code, "                _ => {{}}");
+            }
             let _ = writeln!(child_code, "            }} }}");
         }
     }
@@ -1829,7 +1906,7 @@ fn emit_encode_stmt(code: &mut String, gf: &GenField, prefix: &str, fallible: bo
                 ),
                 MapValKind::SubMsg { .. } => (
                     WIRE_SUB_MSG,
-                    "let p = dst.len(); if ::omnibuf::Message::min_wire_size(v) > 16_383 { dst.extend_from_slice(&[0, 0, 0, 0]); v.encode_omnibuf_append(dst, det)?; ::omnibuf::wire::backpatch_container_len_4b(dst, p); } else { dst.extend_from_slice(&[0, 0]); v.encode_omnibuf_append(dst, det)?; ::omnibuf::wire::backpatch_container_len(dst, p); } ::core::result::Result::Ok(())".to_owned(),
+                    "let p = dst.len(); if ::omnibuf::Message::min_wire_size(v) > 16_383 { dst.extend_from_slice(&[0, 0, 0, 0]); ::omnibuf::Message::encode_omnibuf_append(v, dst, det)?; ::omnibuf::wire::backpatch_container_len_4b(dst, p); } else { dst.extend_from_slice(&[0, 0]); ::omnibuf::Message::encode_omnibuf_append(v, dst, det)?; ::omnibuf::wire::backpatch_container_len(dst, p); } ::core::result::Result::Ok(())".to_owned(),
                 ),
             };
             let _ = writeln!(

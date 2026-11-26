@@ -141,13 +141,281 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use buffa::editions::FieldPresence;
-use buffa::{Message as BuffaMessage, MessageName};
+use buffa::editions::{EnumType, FieldPresence, Utf8Validation};
+use buffa::{Enumeration as _, Message as BuffaMessage, MessageName, UnknownFieldData};
+use buffa_descriptor::features::{self, ResolvedFeatures};
+use buffa_descriptor::generated::descriptor::{
+    DescriptorProto, FieldDescriptorProto, FileDescriptorProto,
+    field_descriptor_proto::{Label as ProtoLabel, Type as ProtoType},
+};
 use buffa_descriptor::{
     DescriptorPool, DynamicMessage, FieldDescriptor, FieldKind, MapKey, MapKeyRef, MapValue,
     MessageDescriptor, MessageIndex, ReflectMessage, ReflectMessageMut, Reflectable, ScalarType,
     SingularKind, Value, ValueRef,
 };
+
+const EDITION_2023: i32 = 1000;
+const EDITION_2024: i32 = 1001;
+const EDITION_2026: i32 = 1002;
+
+fn is_option_message_name(full_name: &str) -> bool {
+    let name = full_name.strip_prefix('.').unwrap_or(full_name);
+    matches!(
+        name,
+        "google.protobuf.FileOptions"
+            | "google.protobuf.MessageOptions"
+            | "google.protobuf.FieldOptions"
+            | "google.protobuf.OneofOptions"
+            | "google.protobuf.EnumOptions"
+            | "google.protobuf.EnumValueOptions"
+            | "google.protobuf.ServiceOptions"
+            | "google.protobuf.MethodOptions"
+            | "google.protobuf.ExtensionRangeOptions"
+            | "google.protobuf.FeatureSet"
+    )
+}
+
+fn file_is_editions(pool: &DescriptorPool, full_name: &str) -> bool {
+    pool.file_containing_symbol(full_name)
+        .is_some_and(|f| f.syntax.as_deref() == Some("editions"))
+}
+
+fn file_raw_edition(file: &FileDescriptorProto) -> Option<i32> {
+    if let Some(ed) = file.edition {
+        return Some(ed.to_i32());
+    }
+    // `buffa-descriptor 0.9.2` knows up to `EDITION_2024` (1001). Because `Edition` is a closed
+    // enum in `descriptor.proto`, newer values such as `EDITION_2026` (1002) are preserved in
+    // unknown field #14 as a varint.
+    file.__buffa_unknown_fields.iter().rev().find_map(|uf| {
+        if uf.number == 14
+            && let UnknownFieldData::Varint(v) = uf.data
+        {
+            return Some(v as i32);
+        }
+        None
+    })
+}
+
+fn find_raw_message_in_file<'a>(
+    file: &'a FileDescriptorProto,
+    full_name: &str,
+) -> Option<(&'a DescriptorProto, ResolvedFeatures)> {
+    let mut feats = features::for_file(file);
+    let pkg = file.package.as_deref().unwrap_or("");
+    let rel = if pkg.is_empty() {
+        full_name
+    } else {
+        full_name.strip_prefix(pkg)?.strip_prefix('.')?
+    };
+    let mut segments = rel.split('.');
+    let first = segments.next()?;
+    let mut cur = file
+        .message_type
+        .iter()
+        .find(|m| m.name.as_deref() == Some(first))?;
+    feats = features::resolve_child(&feats, features::message_features(cur));
+    for seg in segments {
+        cur = cur
+            .nested_type
+            .iter()
+            .find(|m| m.name.as_deref() == Some(seg))?;
+        feats = features::resolve_child(&feats, features::message_features(cur));
+    }
+    Some((cur, feats))
+}
+
+fn is_buffa_zero_default(pool: &DescriptorPool, rf: &FieldDescriptorProto, def: &str) -> bool {
+    match rf.r#type {
+        Some(ProtoType::TYPE_BOOL) => def == "false",
+        Some(ProtoType::TYPE_STRING | ProtoType::TYPE_BYTES) => def.is_empty(),
+        Some(
+            ProtoType::TYPE_INT32
+            | ProtoType::TYPE_INT64
+            | ProtoType::TYPE_SINT32
+            | ProtoType::TYPE_SINT64
+            | ProtoType::TYPE_SFIXED32
+            | ProtoType::TYPE_SFIXED64
+            | ProtoType::TYPE_UINT32
+            | ProtoType::TYPE_UINT64
+            | ProtoType::TYPE_FIXED32
+            | ProtoType::TYPE_FIXED64,
+        ) => def == "0",
+        Some(ProtoType::TYPE_FLOAT | ProtoType::TYPE_DOUBLE) => {
+            def.parse::<f64>().is_ok_and(|v| v.to_bits() == 0)
+        }
+        Some(ProtoType::TYPE_ENUM) => rf
+            .type_name
+            .as_deref()
+            .and_then(|tn| pool.enum_by_name(tn))
+            .and_then(|ed| ed.value_by_name(def))
+            .is_some_and(|ev| ev.number() == 0),
+        _ => false,
+    }
+}
+
+fn validate_buffa_message_for_omnibuf(
+    pool: &DescriptorPool,
+    md: &MessageDescriptor,
+    is_encode: bool,
+) -> Result<()> {
+    let make_err = |msg: String| {
+        if is_encode {
+            Error::serialize(msg)
+        } else {
+            Error::parse(msg)
+        }
+    };
+
+    let file = pool.file_containing_symbol(md.full_name());
+    let is_editions = file.is_some_and(|f| f.syntax.as_deref() == Some("editions"));
+
+    if !is_editions {
+        for fd in md.fields() {
+            if fd.is_delimited() {
+                return Err(make_err(format!(
+                    "delimited group fields are not supported by OmniBuf: {}.{}",
+                    md.full_name(),
+                    fd.name()
+                )));
+            }
+        }
+        return Ok(());
+    }
+
+    let file = file.expect("editions file present");
+    let raw_edition = file_raw_edition(file);
+    if !matches!(
+        raw_edition,
+        Some(EDITION_2023 | EDITION_2024 | EDITION_2026)
+    ) {
+        return Err(make_err(format!(
+            "unsupported protobuf edition {raw_edition:?} on {}",
+            md.full_name()
+        )));
+    }
+
+    if !md.extension_ranges().is_empty() && !is_option_message_name(md.full_name()) {
+        return Err(make_err(format!(
+            "editions non-option extensions are not supported by OmniBuf: {}",
+            md.full_name()
+        )));
+    }
+
+    for ext in &file.extension {
+        let extendee = ext.extendee.as_deref().unwrap_or("");
+        if !is_option_message_name(extendee) {
+            return Err(make_err(format!(
+                "editions non-option extensions are not supported by OmniBuf: {}",
+                ext.name.as_deref().unwrap_or("extension")
+            )));
+        }
+    }
+
+    for fd in md.fields() {
+        if fd.presence() == FieldPresence::LegacyRequired {
+            return Err(make_err(format!(
+                "editions LEGACY_REQUIRED is not supported by OmniBuf: {}.{}",
+                md.full_name(),
+                fd.name()
+            )));
+        }
+        if fd.enum_type() == Some(EnumType::Closed) {
+            return Err(make_err(format!(
+                "editions CLOSED enums are not supported by OmniBuf: {}.{}",
+                md.full_name(),
+                fd.name()
+            )));
+        }
+    }
+
+    if let Some((raw_md, msg_features)) = find_raw_message_in_file(file, md.full_name()) {
+        for ext in &raw_md.extension {
+            let extendee = ext.extendee.as_deref().unwrap_or("");
+            if !is_option_message_name(extendee) {
+                return Err(make_err(format!(
+                    "editions non-option extensions are not supported by OmniBuf: {}.{}",
+                    md.full_name(),
+                    ext.name.as_deref().unwrap_or("extension")
+                )));
+            }
+        }
+        for e in &raw_md.enum_type {
+            let ef = features::resolve_child(&msg_features, features::enum_features(e));
+            if ef.enum_type == EnumType::Closed {
+                return Err(make_err(format!(
+                    "editions CLOSED enums are not supported by OmniBuf: {}.{}",
+                    md.full_name(),
+                    e.name.as_deref().unwrap_or("")
+                )));
+            }
+        }
+        for rf in &raw_md.field {
+            let fname = rf.name.as_deref().unwrap_or("field");
+            let oneof_feats = rf
+                .oneof_index
+                .and_then(|i| usize::try_from(i).ok())
+                .and_then(|i| raw_md.oneof_decl.get(i))
+                .and_then(features::oneof_features);
+            let mut resolved = features::resolve_child(&msg_features, oneof_feats);
+            resolved = features::resolve_child(&resolved, features::field_features(rf));
+
+            if rf.label == Some(ProtoLabel::LABEL_REQUIRED)
+                || resolved.field_presence == FieldPresence::LegacyRequired
+            {
+                return Err(make_err(format!(
+                    "editions LEGACY_REQUIRED is not supported by OmniBuf: {}.{}",
+                    md.full_name(),
+                    fname
+                )));
+            }
+            if rf.r#type == Some(ProtoType::TYPE_STRING)
+                && resolved.utf8_validation == Utf8Validation::None
+            {
+                return Err(make_err(format!(
+                    "editions utf8_validation = NONE is not supported by OmniBuf: {}.{}",
+                    md.full_name(),
+                    fname
+                )));
+            }
+            if let Some(def) = rf.default_value.as_deref()
+                && !is_buffa_zero_default(pool, rf, def)
+            {
+                return Err(make_err(format!(
+                    "editions custom non-zero default values are not supported by OmniBuf: {}.{} = {def:?}",
+                    md.full_name(),
+                    fname
+                )));
+            }
+            if rf.label == Some(ProtoLabel::LABEL_REPEATED)
+                && rf.r#type == Some(ProtoType::TYPE_MESSAGE)
+                && let Some(entry_name) = rf.type_name.as_deref().and_then(|t| t.rsplit('.').next())
+                && let Some(entry) = raw_md.nested_type.iter().find(|n| {
+                    n.name.as_deref() == Some(entry_name)
+                        && n.options.as_option().and_then(|o| o.map_entry) == Some(true)
+                })
+            {
+                let entry_feats =
+                    features::resolve_child(&resolved, features::message_features(entry));
+                for ef in &entry.field {
+                    let ef_feats =
+                        features::resolve_child(&entry_feats, features::field_features(ef));
+                    if ef.r#type == Some(ProtoType::TYPE_STRING)
+                        && ef_feats.utf8_validation == Utf8Validation::None
+                    {
+                        return Err(make_err(format!(
+                            "editions utf8_validation = NONE is not supported by OmniBuf: {}.{}",
+                            md.full_name(),
+                            fname
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
 
 use crate::error::{Error, Result};
 use crate::field0::{SchemaMeta, merge_schema_meta, validate_field0};
@@ -214,8 +482,9 @@ fn build_buffa_schema_meta(
     active.insert(msg_idx);
     let mut cyclic = false;
 
+    let is_editions = file_is_editions(pool, md.full_name());
     for fd in md.fields() {
-        if fd.is_delimited() {
+        if fd.is_delimited() && !is_editions {
             continue;
         }
         let child_idx = match fd.kind() {
@@ -260,8 +529,9 @@ fn build_reflect_value_schema_meta(refl: &dyn ReflectMessage, depth: usize) -> O
         return Some(meta);
     }
 
+    let is_editions = file_is_editions(refl.pool(), md.full_name());
     for fd in md.fields() {
-        if fd.is_delimited() || !refl.has(fd) {
+        if (fd.is_delimited() && !is_editions) || !refl.has(fd) {
             continue;
         }
         let fnum = fd.number();
@@ -644,6 +914,7 @@ fn encode_reflect_body(
 ) -> Result<()> {
     let pool = refl.pool();
     let md = refl.message_descriptor();
+    validate_buffa_message_for_omnibuf(pool, md, true)?;
 
     if !md.extension_ranges().is_empty() {
         if let Some(msg_idx) = pool.message_index(md.full_name()) {
@@ -670,13 +941,6 @@ fn encode_reflect_body(
     ordered_fields.sort_by_key(|f| f.number());
 
     for fd in ordered_fields {
-        if fd.is_delimited() {
-            return Err(Error::serialize(format!(
-                "delimited group fields are not supported by OmniBuf: {}.{}",
-                md.full_name(),
-                fd.name()
-            )));
-        }
         let fnum = fd.number();
         match fd.kind() {
             FieldKind::Map { key, value } => {
@@ -901,16 +1165,7 @@ fn decode_buffa_dynamic_at_depth(
     let pool = Arc::clone(msg.pool());
     let msg_idx = msg.message_index();
     let md = pool.message(msg_idx);
-
-    for fd in md.fields() {
-        if fd.is_delimited() {
-            return Err(Error::parse(format!(
-                "delimited group fields are not supported by OmniBuf: {}.{}",
-                md.full_name(),
-                fd.name()
-            )));
-        }
-    }
+    validate_buffa_message_for_omnibuf(&pool, md, false)?;
 
     if !merge {
         *msg = DynamicMessage::new(Arc::clone(&pool), msg_idx);
@@ -1343,9 +1598,15 @@ fn encode_buffa_dynamic_to_proto_bytes(refl: &dyn ReflectMessage, dst: &mut Vec<
                             err = Some(e);
                             return;
                         }
-                        write_proto_varint(dst, (u64::from(fnum) << 3) | 2);
-                        write_proto_varint(dst, sub_buf.len() as u64);
-                        dst.extend_from_slice(&sub_buf);
+                        if fd.is_delimited() {
+                            write_proto_varint(dst, (u64::from(fnum) << 3) | 3);
+                            dst.extend_from_slice(&sub_buf);
+                            write_proto_varint(dst, (u64::from(fnum) << 3) | 4);
+                        } else {
+                            write_proto_varint(dst, (u64::from(fnum) << 3) | 2);
+                            write_proto_varint(dst, sub_buf.len() as u64);
+                            dst.extend_from_slice(&sub_buf);
+                        }
                     } else if let Err(e) = write_buffa_proto_tagged_scalar(dst, fnum, elem_sk, item)
                     {
                         err = Some(e);
@@ -1366,9 +1627,15 @@ fn encode_buffa_dynamic_to_proto_bytes(refl: &dyn ReflectMessage, dst: &mut Vec<
                     if let ValueRef::Message(sub_cow) = val {
                         let mut sub_buf = Vec::new();
                         encode_buffa_dynamic_to_proto_bytes(&*sub_cow, &mut sub_buf)?;
-                        write_proto_varint(dst, (u64::from(fnum) << 3) | 2);
-                        write_proto_varint(dst, sub_buf.len() as u64);
-                        dst.extend_from_slice(&sub_buf);
+                        if fd.is_delimited() {
+                            write_proto_varint(dst, (u64::from(fnum) << 3) | 3);
+                            dst.extend_from_slice(&sub_buf);
+                            write_proto_varint(dst, (u64::from(fnum) << 3) | 4);
+                        } else {
+                            write_proto_varint(dst, (u64::from(fnum) << 3) | 2);
+                            write_proto_varint(dst, sub_buf.len() as u64);
+                            dst.extend_from_slice(&sub_buf);
+                        }
                     } else {
                         write_buffa_proto_tagged_scalar(dst, fnum, sk, val)?;
                     }

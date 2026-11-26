@@ -47,6 +47,15 @@ pub mod buffa_types {
         )
     });
 
+    pub static EDITIONS_DESCRIPTOR_POOL: LazyLock<Arc<DescriptorPool>> = LazyLock::new(|| {
+        Arc::new(
+            DescriptorPool::decode(
+                include_bytes!(concat!(env!("OUT_DIR"), "/editions_descriptor_set.bin")).as_ref(),
+            )
+            .expect("valid embedded buffa Editions FileDescriptorSet"),
+        )
+    });
+
     include!(concat!(env!("OUT_DIR"), "/_buffa.rs"));
 }
 
@@ -434,6 +443,131 @@ fn handle_blind_tier(req: &ConformanceRequest) -> ConformanceResponse {
 // Tier 1: Plugin-Generated Code + Opaque Views & Splicing
 // ============================================================================
 
+macro_rules! handle_editions_plugin {
+    (
+        $req:expr,
+        $mod_name:ident,
+        $child:ident,
+        $opaque_child:ident,
+        $msg:ident,
+        $borrowed:ident,
+        $choice:ident,
+        $choice_borrowed:ident
+    ) => {{
+        use crate::generated::$mod_name::{
+            $borrowed, $child, $choice, $choice_borrowed, $msg, $opaque_child,
+        };
+
+        // Pre-populate every field with stale values to verify decode_omnibuf resets absent fields.
+        let mut msg = $msg {
+            explicit_int: Some(999),
+            explicit_bool: Some(true),
+            explicit_string: Some("stale-str".to_owned()),
+            explicit_bytes: Some(vec![0xfe]),
+            explicit_double: Some(123.5),
+            status: Some(2),
+            implicit_count: 999,
+            implicit_flag: true,
+            child: Some($child {
+                id: Some(777),
+                note: Some("stale-child".to_owned()),
+            }),
+            delimited_child: Some($child {
+                id: Some(888),
+                note: Some("stale-delim".to_owned()),
+            }),
+            packed_vals: vec![999],
+            expanded_vals: vec![888],
+            scores: [("stale".to_owned(), 999)].into_iter().collect(),
+            choice: Some($choice::ChoiceInt(999)),
+        };
+
+        if let Err(err) = msg.unmarshal_omnibuf(&$req.omnibuf_payload) {
+            return ConformanceResponse::parse_err(err.to_string());
+        }
+
+        // Verify zero-copy borrowed view parity.
+        let borrowed = match $borrowed::from_omnibuf(&$req.omnibuf_payload) {
+            Ok(b) => b,
+            Err(err) => return ConformanceResponse::parse_err(err.to_string()),
+        };
+        let borrowed_choice_ok = match (&msg.choice, &borrowed.choice) {
+            (None, None) => true,
+            (Some($choice::ChoiceInt(a)), Some($choice_borrowed::ChoiceInt(b))) => a == b,
+            (Some($choice::ChoiceText(a)), Some($choice_borrowed::ChoiceText(b))) => {
+                a.as_str() == *b
+            }
+            (Some($choice::ChoiceFlag(a)), Some($choice_borrowed::ChoiceFlag(b))) => a == b,
+            (Some($choice::ChoiceChild(a)), Some($choice_borrowed::ChoiceChild(b))) => {
+                a.id == b.id && a.note.as_deref() == b.note
+            }
+            _ => false,
+        };
+        if borrowed.explicit_int != msg.explicit_int
+            || borrowed.explicit_bool != msg.explicit_bool
+            || borrowed.explicit_string != msg.explicit_string.as_deref()
+            || borrowed.explicit_bytes != msg.explicit_bytes.as_deref()
+            || borrowed.explicit_double.map(float64_canonical_bits)
+                != msg.explicit_double.map(float64_canonical_bits)
+            || borrowed.status != msg.status
+            || borrowed.implicit_count != msg.implicit_count
+            || borrowed.implicit_flag != msg.implicit_flag
+            || borrowed.packed_vals != msg.packed_vals
+            || borrowed.expanded_vals != msg.expanded_vals
+            || borrowed.scores.len() != msg.scores.len()
+            || !borrowed_choice_ok
+        {
+            return ConformanceResponse::runtime_err(
+                "borrowed Editions view diverged from owned decoded struct",
+            );
+        }
+
+        // Verify Opaque* child view parity (presence, getters, and clean marshal) for present children.
+        let check_opaque_child = |c: &$child| -> Result<(), String> {
+            let child_wire = c.marshal_omnibuf();
+            let op = $opaque_child::try_new(&child_wire)
+                .map_err(|e| format!("opaque child try_new failed: {e}"))?;
+            if op.has_id() != c.id.is_some()
+                || op.get_id() != c.id.unwrap_or_default()
+                || op.has_note() != c.note.is_some()
+                || op.get_note() != c.note.as_deref().unwrap_or("")
+            {
+                return Err("opaque Editions child getter mismatch with decoded struct".to_owned());
+            }
+            let reencoded = op
+                .try_marshal()
+                .map_err(|e| format!("opaque child try_marshal failed: {e}"))?;
+            if reencoded != child_wire {
+                return Err("opaque Editions child clean marshal diverged".to_owned());
+            }
+            Ok(())
+        };
+        if let Some(ref c) = msg.child
+            && let Err(err) = check_opaque_child(c)
+        {
+            return ConformanceResponse::runtime_err(err);
+        }
+        if let Some(ref c) = msg.delimited_child
+            && let Err(err) = check_opaque_child(c)
+        {
+            return ConformanceResponse::runtime_err(err);
+        }
+        if let Some($choice::ChoiceChild(ref c)) = msg.choice
+            && let Err(err) = check_opaque_child(c)
+        {
+            return ConformanceResponse::runtime_err(err);
+        }
+
+        if $req.self_describing {
+            return match msg.encode_omnibuf_with_options(EncodeOptions::self_describing()) {
+                Ok(out) => ConformanceResponse::wire(out),
+                Err(err) => ConformanceResponse::serialize_err(err.to_string()),
+            };
+        }
+        ConformanceResponse::wire(msg.marshal_omnibuf())
+    }};
+}
+
 fn handle_plugin_tier(req: &ConformanceRequest) -> ConformanceResponse {
     use generated::conformance_omnibuf::{AllTypesSubMsg, OpaqueTestAllTypes, TestAllTypes};
     use generated::peer_omnibuf::{Location, Neighbor, OpaquePeerUpdate, PeerUpdate};
@@ -730,8 +864,41 @@ fn handle_plugin_tier(req: &ConformanceRequest) -> ConformanceResponse {
             ConformanceResponse::wire(msg.marshal_omnibuf())
         }
 
+        "omnibuf.conformance.TestEditions2023" => handle_editions_plugin!(
+            req,
+            editions_2023_omnibuf,
+            Editions2023Child,
+            OpaqueEditions2023Child,
+            TestEditions2023,
+            TestEditions2023Borrowed,
+            TestEditions2023Choice,
+            TestEditions2023ChoiceBorrowed
+        ),
+
+        "omnibuf.conformance.TestEditions2024" => handle_editions_plugin!(
+            req,
+            editions_2024_omnibuf,
+            Editions2024Child,
+            OpaqueEditions2024Child,
+            TestEditions2024,
+            TestEditions2024Borrowed,
+            TestEditions2024Choice,
+            TestEditions2024ChoiceBorrowed
+        ),
+
+        "omnibuf.conformance.TestEditions2026" => handle_editions_plugin!(
+            req,
+            editions_2026_omnibuf,
+            Editions2026Child,
+            OpaqueEditions2026Child,
+            TestEditions2026,
+            TestEditions2026Borrowed,
+            TestEditions2026Choice,
+            TestEditions2026ChoiceBorrowed
+        ),
+
         _ => ConformanceResponse::skipped_reason(
-            "plugin tier generated for PeerUpdate and TestAllTypes",
+            "plugin tier generated for PeerUpdate, TestAllTypes, and TestEditions2023/2024/2026",
         ),
     }
 }
@@ -992,8 +1159,48 @@ fn handle_protobuf_types_tier(req: &ConformanceRequest) -> ConformanceResponse {
             ConformanceResponse::wire(out)
         }
 
+        "omnibuf.conformance.TestEditions2023"
+        | "omnibuf.conformance.TestEditions2024"
+        | "omnibuf.conformance.TestEditions2026" => {
+            use std::sync::Arc;
+
+            use buffa_descriptor::{DynamicMessage, ReflectMessageMut, Value};
+
+            let pool = &*buffa_types::EDITIONS_DESCRIPTOR_POOL;
+            let Some(msg_idx) = pool.message_index(req.message_type.as_str()) else {
+                return ConformanceResponse::runtime_err(format!(
+                    "editions message {:?} missing from buffa descriptor pool",
+                    req.message_type
+                ));
+            };
+            let md = pool.message(msg_idx);
+            // Seed stale fields to confirm decode_buffa_dynamic resets absent fields cleanly.
+            let mut dyn_msg = DynamicMessage::new(Arc::clone(pool), msg_idx);
+            if let Some(fd) = md.field_by_name("explicit_int") {
+                dyn_msg.set(fd, Value::I32(999));
+            }
+            if let Some(fd) = md.field_by_name("explicit_bool") {
+                dyn_msg.set(fd, Value::Bool(true));
+            }
+            if let Some(fd) = md.field_by_name("implicit_count") {
+                dyn_msg.set(fd, Value::I32(999));
+            }
+            if let Some(fd) = md.field_by_name("choice_int") {
+                dyn_msg.set(fd, Value::I32(999));
+            }
+
+            if let Err(err) = buffa_codec::decode_buffa_dynamic(&req.omnibuf_payload, &mut dyn_msg)
+            {
+                return ConformanceResponse::parse_err(err.to_string());
+            }
+            match buffa_codec::encode_buffa_dynamic(&dyn_msg, opts) {
+                Ok(out) => ConformanceResponse::wire(out),
+                Err(err) => ConformanceResponse::serialize_err(err.to_string()),
+            }
+        }
+
         _ => ConformanceResponse::skipped_reason(
-            "protobuf types tier generated for PeerUpdate and TestAllTypes",
+            "protobuf types tier generated for PeerUpdate, TestAllTypes, and TestEditions2023/2024/2026",
         ),
     }
 }
