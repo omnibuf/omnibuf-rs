@@ -655,3 +655,111 @@ fn bulk_vec_helpers_raw_writer_and_container_slice_edge_cases() {
         (&b"zw"[..], 6)
     );
 }
+
+#[test]
+fn test_large_string_bytes_vecs_and_has_nested_containers() {
+    use omnibuf::Message;
+    use omnibuf::codec::{
+        read_bytes_vec_field, read_string_vec_field, write_bytes_vec_field, write_string_vec_field,
+    };
+
+    #[derive(Clone, Debug, Default, PartialEq, omnibuf::OmniBuf)]
+    struct FixedLeaf {
+        #[omnibuf(id = 1)]
+        a: u64,
+        #[omnibuf(id = 2)]
+        b: i32,
+        #[omnibuf(id = 3)]
+        c: f64,
+        #[omnibuf(id = 4)]
+        d: bool,
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq, omnibuf::OmniBuf)]
+    struct StringLeaf {
+        #[omnibuf(id = 1)]
+        label: String,
+        #[omnibuf(id = 2)]
+        count: u32,
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq, omnibuf::OmniBuf)]
+    struct BytesLeaf {
+        #[omnibuf(id = 1)]
+        payload: Vec<u8>,
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq, omnibuf::OmniBuf)]
+    struct LargeHolder {
+        #[omnibuf(id = 1)]
+        single: Option<StringLeaf>,
+        #[omnibuf(id = 2)]
+        items: Vec<StringLeaf>,
+        #[omnibuf(id = 3)]
+        many: Vec<StringLeaf>,
+        #[omnibuf(id = 4)]
+        fixed: FixedLeaf,
+    }
+
+    const {
+        assert!(!FixedLeaf::HAS_NESTED_CONTAINERS);
+        assert!(StringLeaf::HAS_NESTED_CONTAINERS);
+        assert!(BytesLeaf::HAS_NESTED_CONTAINERS);
+        assert!(LargeHolder::HAS_NESTED_CONTAINERS);
+    }
+
+    // >16 KiB StringLeaf in sub-message field and in both <=32 and >32 Vec<SubMsg> fields.
+    let big_str = "a".repeat(20_000);
+    let holder = LargeHolder {
+        single: Some(StringLeaf {
+            label: big_str.clone(),
+            count: 7,
+        }),
+        items: vec![
+            StringLeaf {
+                label: big_str.clone(),
+                count: 1,
+            },
+            StringLeaf {
+                label: "small".into(),
+                count: 2,
+            },
+        ],
+        many: (0..40)
+            .map(|i| StringLeaf {
+                label: format!("entry-{i:04}-{}", "x".repeat(500)),
+                count: i,
+            })
+            .collect(),
+        fixed: FixedLeaf {
+            a: 42,
+            b: -9,
+            c: 1.25,
+            d: true,
+        },
+    };
+    let wire = holder.encode_omnibuf().unwrap();
+    let decoded = LargeHolder::from_omnibuf(&wire).unwrap();
+    assert_eq!(decoded, holder);
+
+    // >16 KiB Vec<String> and Vec<Vec<u8>> with pre-sized >16 KiB destination buffer.
+    let big_strings: Vec<String> = (0..100)
+        .map(|i| format!("s{i:03}-{}", "z".repeat(250)))
+        .collect();
+    let mut dst = Vec::with_capacity(32_768);
+    write_string_vec_field(&mut dst, 1, &big_strings).unwrap();
+    let mut dec = Decoder::new(&dst);
+    assert_eq!(dec.next_tag().unwrap(), Some((1, WIRE_ARRAY)));
+    let mut got_strings = Vec::new();
+    read_string_vec_field(&mut got_strings, dec.data(), dec.position(), 0, false).unwrap();
+    assert_eq!(got_strings, big_strings);
+
+    let big_bytes: Vec<Vec<u8>> = (0..100).map(|i| vec![i as u8; 250]).collect();
+    dst.clear();
+    write_bytes_vec_field(&mut dst, 2, &big_bytes).unwrap();
+    let mut dec = Decoder::new(&dst);
+    assert_eq!(dec.next_tag().unwrap(), Some((2, WIRE_ARRAY)));
+    let mut got_bytes = Vec::new();
+    read_bytes_vec_field(&mut got_bytes, dec.data(), dec.position(), 0, false).unwrap();
+    assert_eq!(got_bytes, big_bytes);
+}

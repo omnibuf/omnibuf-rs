@@ -247,7 +247,16 @@ fn expand_struct(
     let mut value_schema_child_stmts = Vec::new();
 
     let encode_stmts = gen_encode_fields_batched(krate, &compiled);
-    let has_nested_containers = !compiled.iter().all(is_flat_compiled_field);
+    let fixed_max_total = compiled.iter().try_fold(0usize, |acc, cf| {
+        acc.checked_add(fixed_max_field_bytes_compiled(cf)?)
+    });
+    let has_nested_containers_item = if matches!(fixed_max_total, Some(sz) if sz <= 16_383) {
+        quote!(
+            const HAS_NESTED_CONTAINERS: bool = false;
+        )
+    } else {
+        quote!()
+    };
 
     for cf in &compiled {
         let f_ident = &cf.ident;
@@ -367,7 +376,6 @@ fn expand_struct(
     } else {
         quote!(#[inline])
     };
-    let encode_inline_attr = decode_inline_attr.clone();
 
     Ok(quote! {
         impl #impl_generics #krate::codec::IsEmpty for #ident #ty_generics #where_clause {
@@ -379,7 +387,7 @@ fn expand_struct(
         }
 
         impl #impl_generics #krate::Message for #ident #ty_generics #where_clause {
-            const HAS_NESTED_CONTAINERS: bool = #has_nested_containers;
+            #has_nested_containers_item
 
             #[inline]
             fn min_wire_size_bounded(&self, depth_rem: usize) -> usize {
@@ -389,7 +397,7 @@ fn expand_struct(
                 __sz
             }
 
-            #encode_inline_attr
+            #[inline]
             fn encode_omnibuf_append(
                 &self,
                 dst: &mut ::std::vec::Vec<u8>,
@@ -1930,6 +1938,27 @@ fn is_flat_compiled_field(cf: &CompiledField) -> bool {
     )
 }
 
+fn fixed_max_field_bytes_compiled(cf: &CompiledField) -> Option<usize> {
+    match &cf.shape {
+        FieldShape::Scalar { scalar, wire_wt } | FieldShape::OptScalar { scalar, wire_wt } => {
+            if matches!(scalar, ScalarType::String | ScalarType::Bytes) {
+                return None;
+            }
+            let tw = tag_varint_width(cf.id, *wire_wt);
+            match (scalar, *wire_wt) {
+                (ScalarType::Bool, _) => Some(tw),
+                (_, WIRE_FIXED32 | WIRE_SFIXED32 | WIRE_FLOAT32) => Some(tw + 4),
+                (_, WIRE_FIXED64 | WIRE_SFIXED64 | WIRE_FLOAT64) => Some(tw + 8),
+                _ => Some(tw + 9),
+            }
+        }
+        FieldShape::BuffaEnum { .. } | FieldShape::OptBuffaEnum { .. } => {
+            Some(tag_varint_width(cf.id, WIRE_SINT) + 9)
+        }
+        _ => None,
+    }
+}
+
 fn gen_raw_write_scalar_expr(
     f_id: u32,
     scalar: ScalarType,
@@ -1937,17 +1966,21 @@ fn gen_raw_write_scalar_expr(
     val_expr: TokenStream2,
 ) -> TokenStream2 {
     match (scalar, wire_wt) {
-        (ScalarType::Bool, _) => quote! { __w.write_bool(#f_id, *#val_expr); },
-        (ScalarType::String, _) => quote! { __w.write_string(#f_id, (#val_expr).as_str()); },
-        (ScalarType::Bytes, _) => quote! { __w.write_bytes(#f_id, (#val_expr).as_slice()); },
-        (ScalarType::F32, _) => quote! { __w.write_float32(#f_id, *#val_expr); },
-        (ScalarType::F64, _) => quote! { __w.write_float64(#f_id, *#val_expr); },
-        (_, WIRE_UINT) => quote! { __w.write_uint(#f_id, (*#val_expr) as u64); },
-        (_, WIRE_SINT) => quote! { __w.write_sint(#f_id, (*#val_expr) as i64); },
-        (_, WIRE_FIXED32) => quote! { __w.write_fixed32(#f_id, (*#val_expr) as u32); },
-        (_, WIRE_FIXED64) => quote! { __w.write_fixed64(#f_id, (*#val_expr) as u64); },
-        (_, WIRE_SFIXED32) => quote! { __w.write_sfixed32(#f_id, (*#val_expr) as i32); },
-        (_, WIRE_SFIXED64) => quote! { __w.write_sfixed64(#f_id, (*#val_expr) as i64); },
+        (ScalarType::Bool, _) => quote! { __w.write_bool_unchecked(#f_id, *#val_expr); },
+        (ScalarType::String, _) => {
+            quote! { __w.write_string_unchecked(#f_id, (#val_expr).as_str()); }
+        }
+        (ScalarType::Bytes, _) => {
+            quote! { __w.write_bytes_unchecked(#f_id, (#val_expr).as_slice()); }
+        }
+        (ScalarType::F32, _) => quote! { __w.write_float32_unchecked(#f_id, *#val_expr); },
+        (ScalarType::F64, _) => quote! { __w.write_float64_unchecked(#f_id, *#val_expr); },
+        (_, WIRE_UINT) => quote! { __w.write_uint_unchecked(#f_id, (*#val_expr) as u64); },
+        (_, WIRE_SINT) => quote! { __w.write_sint_unchecked(#f_id, (*#val_expr) as i64); },
+        (_, WIRE_FIXED32) => quote! { __w.write_fixed32_unchecked(#f_id, (*#val_expr) as u32); },
+        (_, WIRE_FIXED64) => quote! { __w.write_fixed64_unchecked(#f_id, (*#val_expr) as u64); },
+        (_, WIRE_SFIXED32) => quote! { __w.write_sfixed32_unchecked(#f_id, (*#val_expr) as i32); },
+        (_, WIRE_SFIXED64) => quote! { __w.write_sfixed64_unchecked(#f_id, (*#val_expr) as i64); },
         _ => unreachable!(),
     }
 }
@@ -1968,12 +2001,12 @@ fn gen_raw_encode_field(krate: &syn::Path, cf: &CompiledField) -> TokenStream2 {
             };
         }
         FieldShape::BuffaEnum { .. } => quote! {
-            __w.write_buffa_enum(#f_id, &self.#f_ident);
+            __w.write_buffa_enum_unchecked(#f_id, &self.#f_ident);
         },
         FieldShape::OptBuffaEnum { .. } => {
             return quote! {
                 if let ::core::option::Option::Some(ref val) = self.#f_ident {
-                    __w.write_buffa_enum(#f_id, val);
+                    __w.write_buffa_enum_unchecked(#f_id, val);
                 }
             };
         }
@@ -2034,9 +2067,9 @@ fn gen_encode_fields_batched(krate: &syn::Path, compiled: &[CompiledField]) -> V
                         (_, WIRE_FIXED32 | WIRE_SFIXED32 | WIRE_FLOAT32) => fixed_max += tw + 4,
                         (_, WIRE_FIXED64 | WIRE_SFIXED64 | WIRE_FLOAT64) => fixed_max += tw + 8,
                         (ScalarType::String | ScalarType::Bytes, _) => {
-                            let hdr = tw + 9;
+                            fixed_max += tw + 9;
                             dyn_exprs.push(quote!(
-                                self.#f_ident.as_ref().map_or(0usize, |__v| #hdr + __v.len())
+                                self.#f_ident.as_ref().map_or(0usize, |__v| __v.len())
                             ));
                         }
                         _ => fixed_max += tw + 9,
@@ -2049,14 +2082,30 @@ fn gen_encode_fields_batched(krate: &syn::Path, compiled: &[CompiledField]) -> V
             }
             write_stmts.push(gen_raw_encode_field(krate, cf));
         }
-        let mut max_expr = quote!(#fixed_max);
-        for d in dyn_exprs {
-            max_expr = quote!((#max_expr).saturating_add(#d));
-        }
+        let init_writer = if dyn_exprs.is_empty() {
+            quote! {
+                let mut __w = #krate::codec::RawBufWriter::new(dst, #fixed_max);
+            }
+        } else {
+            let first = &dyn_exprs[0];
+            let mut max_expr = quote!((#fixed_max).checked_add(#first));
+            for d in &dyn_exprs[1..] {
+                max_expr = quote!(#max_expr.and_then(|__n| __n.checked_add(#d)));
+            }
+            quote! {
+                let __max = #max_expr.expect("capacity overflow");
+                let mut __w = #krate::codec::RawBufWriter::new(dst, __max);
+            }
+        };
+        // SAFETY of generated block: `RawBufWriter::new` reserved at least the checked sum of
+        // worst-case encoded widths for every field written in this batch.
         out.push(quote! {
             {
-                let mut __w = #krate::codec::RawBufWriter::new(dst, #max_expr);
-                #(#write_stmts)*
+                #init_writer
+                #[allow(clippy::undocumented_unsafe_blocks)]
+                unsafe {
+                    #(#write_stmts)*
+                }
                 __w.finish();
             }
         });

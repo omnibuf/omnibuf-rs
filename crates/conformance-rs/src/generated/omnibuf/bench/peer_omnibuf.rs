@@ -33,9 +33,7 @@ impl Location {
 }
 
 impl ::omnibuf::Message for Location {
-    const HAS_NESTED_CONTAINERS: bool = false;
-
-    #[inline(always)]
+    #[inline]
     fn encode_omnibuf_append(
         &self,
         dst: &mut ::std::vec::Vec<u8>,
@@ -43,18 +41,21 @@ impl ::omnibuf::Message for Location {
     ) -> ::omnibuf::Result<()> {
         let _ = deterministic;
         {
-            let mut __w = ::omnibuf::codec::RawBufWriter::new(
-                dst,
-                (((50usize).saturating_add(self.region.len()))
-                    .saturating_add(self.datacenter.len()))
-                .saturating_add(self.city.len()),
-            );
-            __w.write_string(1, self.region.as_str());
-            __w.write_string(2, self.datacenter.as_str());
-            __w.write_string(3, self.city.as_str());
-            __w.write_uint(4, u64::from(self.rack));
-            __w.write_float32(5, self.latitude);
-            __w.write_float32(6, self.longitude);
+            let __max = (50usize)
+                .checked_add(self.region.len())
+                .and_then(|__n| __n.checked_add(self.datacenter.len()))
+                .and_then(|__n| __n.checked_add(self.city.len()))
+                .expect("capacity overflow");
+            let mut __w = ::omnibuf::codec::RawBufWriter::new(dst, __max);
+            // SAFETY: `RawBufWriter::new` reserved at least the sum of worst-case encoded widths for every field in this batch.
+            unsafe {
+                __w.write_string_unchecked(1, self.region.as_str());
+                __w.write_string_unchecked(2, self.datacenter.as_str());
+                __w.write_string_unchecked(3, self.city.as_str());
+                __w.write_uint_unchecked(4, u64::from(self.rack));
+                __w.write_float32_unchecked(5, self.latitude);
+                __w.write_float32_unchecked(6, self.longitude);
+            }
             __w.finish();
         }
         ::core::result::Result::Ok(())
@@ -534,9 +535,7 @@ impl Neighbor {
 }
 
 impl ::omnibuf::Message for Neighbor {
-    const HAS_NESTED_CONTAINERS: bool = false;
-
-    #[inline(always)]
+    #[inline]
     fn encode_omnibuf_append(
         &self,
         dst: &mut ::std::vec::Vec<u8>,
@@ -544,14 +543,17 @@ impl ::omnibuf::Message for Neighbor {
     ) -> ::omnibuf::Result<()> {
         let _ = deterministic;
         {
-            let mut __w = ::omnibuf::codec::RawBufWriter::new(
-                dst,
-                (31usize).saturating_add(self.router.len()),
-            );
-            __w.write_uint(1, u64::from(self.peer_asn));
-            __w.write_string(2, self.router.as_str());
-            __w.write_uint(3, u64::from(self.latency_us));
-            __w.write_bool(4, self.established);
+            let __max = (31usize)
+                .checked_add(self.router.len())
+                .expect("capacity overflow");
+            let mut __w = ::omnibuf::codec::RawBufWriter::new(dst, __max);
+            // SAFETY: `RawBufWriter::new` reserved at least the sum of worst-case encoded widths for every field in this batch.
+            unsafe {
+                __w.write_uint_unchecked(1, u64::from(self.peer_asn));
+                __w.write_string_unchecked(2, self.router.as_str());
+                __w.write_uint_unchecked(3, u64::from(self.latency_us));
+                __w.write_bool_unchecked(4, self.established);
+            }
             __w.finish();
         }
         ::core::result::Result::Ok(())
@@ -994,8 +996,6 @@ impl PeerUpdate {
 }
 
 impl ::omnibuf::Message for PeerUpdate {
-    const HAS_NESTED_CONTAINERS: bool = true;
-
     #[inline]
     fn encode_omnibuf_append(
         &self,
@@ -1004,16 +1004,19 @@ impl ::omnibuf::Message for PeerUpdate {
     ) -> ::omnibuf::Result<()> {
         let _ = deterministic;
         {
-            let mut __w = ::omnibuf::codec::RawBufWriter::new(
-                dst,
-                (50usize).saturating_add(self.router_id.len()),
-            );
-            __w.write_uint(1, u64::from(self.asn));
-            __w.write_string(2, self.router_id.as_str());
-            __w.write_bool(3, self.active);
-            __w.write_uint(4, self.uptime_sec);
-            __w.write_sint(5, i64::from(self.rssi_dbm));
-            __w.write_float64(6, self.cpu_load);
+            let __max = (50usize)
+                .checked_add(self.router_id.len())
+                .expect("capacity overflow");
+            let mut __w = ::omnibuf::codec::RawBufWriter::new(dst, __max);
+            // SAFETY: `RawBufWriter::new` reserved at least the sum of worst-case encoded widths for every field in this batch.
+            unsafe {
+                __w.write_uint_unchecked(1, u64::from(self.asn));
+                __w.write_string_unchecked(2, self.router_id.as_str());
+                __w.write_bool_unchecked(3, self.active);
+                __w.write_uint_unchecked(4, self.uptime_sec);
+                __w.write_sint_unchecked(5, i64::from(self.rssi_dbm));
+                __w.write_float64_unchecked(6, self.cpu_load);
+            }
             __w.finish();
         }
         ::omnibuf::codec::write_string_vec_field(dst, 7, &self.tags)?;

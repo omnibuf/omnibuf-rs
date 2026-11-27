@@ -1100,17 +1100,18 @@ fn emit_message_trait_impl(
     }
     ordered.sort_by_key(|(n, _)| *n);
 
-    let has_nested_containers = !oneofs.is_empty() || !fields.iter().all(is_flat_gen_field);
-    let _ = writeln!(code, "impl ::omnibuf::Message for {rust_name} {{");
-    let _ = writeln!(
-        code,
-        "    const HAS_NESTED_CONTAINERS: bool = {has_nested_containers};\n"
-    );
-    if oneofs.is_empty() && !fields.is_empty() && fields.len() <= 8 {
-        let _ = writeln!(code, "    #[inline(always)]");
+    let fixed_max_total: Option<usize> = if oneofs.is_empty() {
+        fields.iter().try_fold(0usize, |acc, gf| {
+            acc.checked_add(fixed_max_field_bytes_gen(gf)?)
+        })
     } else {
-        let _ = writeln!(code, "    #[inline]");
+        None
+    };
+    let _ = writeln!(code, "impl ::omnibuf::Message for {rust_name} {{");
+    if matches!(fixed_max_total, Some(sz) if sz <= 16_383) {
+        let _ = writeln!(code, "    const HAS_NESTED_CONTAINERS: bool = false;\n");
     }
+    let _ = writeln!(code, "    #[inline]");
     let _ = writeln!(
         code,
         "    fn encode_omnibuf_append(&self, dst: &mut ::std::vec::Vec<u8>, deterministic: bool) -> ::omnibuf::Result<()> {{"
@@ -1829,6 +1830,25 @@ fn is_flat_gen_field(gf: &GenField) -> bool {
     )
 }
 
+fn fixed_max_field_bytes_gen(gf: &GenField) -> Option<usize> {
+    let scalar = match gf.kind {
+        GenFieldKind::Scalar(s) | GenFieldKind::OptScalar(s) => s,
+        _ => return None,
+    };
+    let tw = tag_varint_width(gf.number, scalar.wire_type());
+    match scalar {
+        ProtoScalar::String | ProtoScalar::Bytes => None,
+        ProtoScalar::Bool => Some(tw),
+        ProtoScalar::Fixed32 | ProtoScalar::Sfixed32 | ProtoScalar::Float32 => Some(tw + 4),
+        ProtoScalar::Fixed64 | ProtoScalar::Sfixed64 | ProtoScalar::Float64 => Some(tw + 8),
+        ProtoScalar::Uint32
+        | ProtoScalar::Uint64
+        | ProtoScalar::Sint32
+        | ProtoScalar::Sint64
+        | ProtoScalar::Enum => Some(tw + 9),
+    }
+}
+
 fn emit_raw_scalar_write_call(
     code: &mut String,
     indent: &str,
@@ -1838,43 +1858,61 @@ fn emit_raw_scalar_write_call(
 ) {
     match scalar {
         ProtoScalar::Uint32 => {
-            let _ = writeln!(code, "{indent}__w.write_uint({fnum}, u64::from({expr}));");
+            let _ = writeln!(
+                code,
+                "{indent}__w.write_uint_unchecked({fnum}, u64::from({expr}));"
+            );
         }
         ProtoScalar::Uint64 => {
-            let _ = writeln!(code, "{indent}__w.write_uint({fnum}, {expr});");
+            let _ = writeln!(code, "{indent}__w.write_uint_unchecked({fnum}, {expr});");
         }
         ProtoScalar::Sint32 | ProtoScalar::Enum => {
-            let _ = writeln!(code, "{indent}__w.write_sint({fnum}, i64::from({expr}));");
+            let _ = writeln!(
+                code,
+                "{indent}__w.write_sint_unchecked({fnum}, i64::from({expr}));"
+            );
         }
         ProtoScalar::Sint64 => {
-            let _ = writeln!(code, "{indent}__w.write_sint({fnum}, {expr});");
+            let _ = writeln!(code, "{indent}__w.write_sint_unchecked({fnum}, {expr});");
         }
         ProtoScalar::Bool => {
-            let _ = writeln!(code, "{indent}__w.write_bool({fnum}, {expr});");
+            let _ = writeln!(code, "{indent}__w.write_bool_unchecked({fnum}, {expr});");
         }
         ProtoScalar::Fixed32 => {
-            let _ = writeln!(code, "{indent}__w.write_fixed32({fnum}, {expr});");
+            let _ = writeln!(code, "{indent}__w.write_fixed32_unchecked({fnum}, {expr});");
         }
         ProtoScalar::Fixed64 => {
-            let _ = writeln!(code, "{indent}__w.write_fixed64({fnum}, {expr});");
+            let _ = writeln!(code, "{indent}__w.write_fixed64_unchecked({fnum}, {expr});");
         }
         ProtoScalar::Sfixed32 => {
-            let _ = writeln!(code, "{indent}__w.write_sfixed32({fnum}, {expr});");
+            let _ = writeln!(
+                code,
+                "{indent}__w.write_sfixed32_unchecked({fnum}, {expr});"
+            );
         }
         ProtoScalar::Sfixed64 => {
-            let _ = writeln!(code, "{indent}__w.write_sfixed64({fnum}, {expr});");
+            let _ = writeln!(
+                code,
+                "{indent}__w.write_sfixed64_unchecked({fnum}, {expr});"
+            );
         }
         ProtoScalar::Float32 => {
-            let _ = writeln!(code, "{indent}__w.write_float32({fnum}, {expr});");
+            let _ = writeln!(code, "{indent}__w.write_float32_unchecked({fnum}, {expr});");
         }
         ProtoScalar::Float64 => {
-            let _ = writeln!(code, "{indent}__w.write_float64({fnum}, {expr});");
+            let _ = writeln!(code, "{indent}__w.write_float64_unchecked({fnum}, {expr});");
         }
         ProtoScalar::String => {
-            let _ = writeln!(code, "{indent}__w.write_string({fnum}, {expr}.as_str());");
+            let _ = writeln!(
+                code,
+                "{indent}__w.write_string_unchecked({fnum}, {expr}.as_str());"
+            );
         }
         ProtoScalar::Bytes => {
-            let _ = writeln!(code, "{indent}__w.write_bytes({fnum}, {expr}.as_slice());");
+            let _ = writeln!(
+                code,
+                "{indent}__w.write_bytes_unchecked({fnum}, {expr}.as_slice());"
+            );
         }
     }
 }
@@ -1940,9 +1978,9 @@ fn emit_encode_ordered_batched(code: &mut String, ordered: &[(u32, OrderedMember
                             fixed_max += tw + 8;
                         }
                         ProtoScalar::String | ProtoScalar::Bytes => {
-                            let hdr = tw + 9;
+                            fixed_max += tw + 9;
                             dyn_terms.push(format!(
-                                "self.{fident}.as_ref().map_or(0usize, |__v| {hdr}usize + __v.len())"
+                                "self.{fident}.as_ref().map_or(0usize, |__v| __v.len())"
                             ));
                         }
                         _ => fixed_max += tw + 9,
@@ -1951,15 +1989,31 @@ fn emit_encode_ordered_batched(code: &mut String, ordered: &[(u32, OrderedMember
                 _ => unreachable!(),
             }
         }
-        let mut max_expr = format!("{fixed_max}usize");
-        for term in &dyn_terms {
-            max_expr = format!("({max_expr}).saturating_add({term})");
-        }
         let _ = writeln!(code, "        {{");
+        if dyn_terms.is_empty() {
+            let _ = writeln!(
+                code,
+                "            let mut __w = ::omnibuf::codec::RawBufWriter::new(dst, {fixed_max}usize);"
+            );
+        } else {
+            let mut max_expr = format!("({fixed_max}usize).checked_add({})", dyn_terms[0]);
+            for term in &dyn_terms[1..] {
+                max_expr = format!("{max_expr}.and_then(|__n| __n.checked_add({term}))");
+            }
+            let _ = writeln!(
+                code,
+                "            let __max = {max_expr}.expect(\"capacity overflow\");"
+            );
+            let _ = writeln!(
+                code,
+                "            let mut __w = ::omnibuf::codec::RawBufWriter::new(dst, __max);"
+            );
+        }
         let _ = writeln!(
             code,
-            "            let mut __w = ::omnibuf::codec::RawBufWriter::new(dst, {max_expr});"
+            "            // SAFETY: `RawBufWriter::new` reserved at least the sum of worst-case encoded widths for every field in this batch."
         );
+        let _ = writeln!(code, "            unsafe {{");
         for (_, member) in &ordered[start..i] {
             let OrderedMember::Field(gf) = member else {
                 unreachable!()
@@ -1968,23 +2022,24 @@ fn emit_encode_ordered_batched(code: &mut String, ordered: &[(u32, OrderedMember
             let access = format!("self.{}", gf.rust_ident);
             match &gf.kind {
                 GenFieldKind::Scalar(s) => {
-                    emit_raw_scalar_write_call(code, "            ", fnum, *s, &access);
+                    emit_raw_scalar_write_call(code, "                ", fnum, *s, &access);
                 }
                 GenFieldKind::OptScalar(s) => {
                     let _ = writeln!(
                         code,
-                        "            if let ::core::option::Option::Some(ref v) = {access} {{"
+                        "                if let ::core::option::Option::Some(ref v) = {access} {{"
                     );
                     let expr = match s {
                         ProtoScalar::String | ProtoScalar::Bytes => "v",
                         _ => "*v",
                     };
-                    emit_raw_scalar_write_call(code, "                ", fnum, *s, expr);
-                    let _ = writeln!(code, "            }}");
+                    emit_raw_scalar_write_call(code, "                    ", fnum, *s, expr);
+                    let _ = writeln!(code, "                }}");
                 }
                 _ => unreachable!(),
             }
         }
+        let _ = writeln!(code, "            }}");
         let _ = writeln!(code, "            __w.finish();");
         let _ = writeln!(code, "        }}");
     }

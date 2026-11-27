@@ -39,9 +39,7 @@ impl Editions2023Child {
 }
 
 impl ::omnibuf::Message for Editions2023Child {
-    const HAS_NESTED_CONTAINERS: bool = false;
-
-    #[inline(always)]
+    #[inline]
     fn encode_omnibuf_append(
         &self,
         dst: &mut ::std::vec::Vec<u8>,
@@ -49,16 +47,18 @@ impl ::omnibuf::Message for Editions2023Child {
     ) -> ::omnibuf::Result<()> {
         let _ = deterministic;
         {
-            let mut __w = ::omnibuf::codec::RawBufWriter::new(
-                dst,
-                (10usize)
-                    .saturating_add(self.note.as_ref().map_or(0usize, |__v| 10usize + __v.len())),
-            );
-            if let ::core::option::Option::Some(ref v) = self.id {
-                __w.write_sint(1, i64::from(*v));
-            }
-            if let ::core::option::Option::Some(ref v) = self.note {
-                __w.write_string(2, v.as_str());
+            let __max = (20usize)
+                .checked_add(self.note.as_ref().map_or(0usize, |__v| __v.len()))
+                .expect("capacity overflow");
+            let mut __w = ::omnibuf::codec::RawBufWriter::new(dst, __max);
+            // SAFETY: `RawBufWriter::new` reserved at least the sum of worst-case encoded widths for every field in this batch.
+            unsafe {
+                if let ::core::option::Option::Some(ref v) = self.id {
+                    __w.write_sint_unchecked(1, i64::from(*v));
+                }
+                if let ::core::option::Option::Some(ref v) = self.note {
+                    __w.write_string_unchecked(2, v.as_str());
+                }
             }
             __w.finish();
         }
@@ -479,8 +479,6 @@ impl TestEditions2023 {
 }
 
 impl ::omnibuf::Message for TestEditions2023 {
-    const HAS_NESTED_CONTAINERS: bool = true;
-
     #[inline]
     fn encode_omnibuf_append(
         &self,
@@ -489,39 +487,40 @@ impl ::omnibuf::Message for TestEditions2023 {
     ) -> ::omnibuf::Result<()> {
         let _ = deterministic;
         {
-            let mut __w = ::omnibuf::codec::RawBufWriter::new(
-                dst,
-                ((42usize).saturating_add(
+            let __max = (62usize)
+                .checked_add(
                     self.explicit_string
                         .as_ref()
-                        .map_or(0usize, |__v| 10usize + __v.len()),
-                ))
-                .saturating_add(
-                    self.explicit_bytes
-                        .as_ref()
-                        .map_or(0usize, |__v| 10usize + __v.len()),
-                ),
-            );
-            if let ::core::option::Option::Some(ref v) = self.explicit_int {
-                __w.write_sint(1, i64::from(*v));
+                        .map_or(0usize, |__v| __v.len()),
+                )
+                .and_then(|__n| {
+                    __n.checked_add(self.explicit_bytes.as_ref().map_or(0usize, |__v| __v.len()))
+                })
+                .expect("capacity overflow");
+            let mut __w = ::omnibuf::codec::RawBufWriter::new(dst, __max);
+            // SAFETY: `RawBufWriter::new` reserved at least the sum of worst-case encoded widths for every field in this batch.
+            unsafe {
+                if let ::core::option::Option::Some(ref v) = self.explicit_int {
+                    __w.write_sint_unchecked(1, i64::from(*v));
+                }
+                if let ::core::option::Option::Some(ref v) = self.explicit_bool {
+                    __w.write_bool_unchecked(2, *v);
+                }
+                if let ::core::option::Option::Some(ref v) = self.explicit_string {
+                    __w.write_string_unchecked(3, v.as_str());
+                }
+                if let ::core::option::Option::Some(ref v) = self.explicit_bytes {
+                    __w.write_bytes_unchecked(4, v.as_slice());
+                }
+                if let ::core::option::Option::Some(ref v) = self.explicit_double {
+                    __w.write_float64_unchecked(5, *v);
+                }
+                if let ::core::option::Option::Some(ref v) = self.status {
+                    __w.write_sint_unchecked(6, i64::from(*v));
+                }
+                __w.write_sint_unchecked(7, i64::from(self.implicit_count));
+                __w.write_bool_unchecked(8, self.implicit_flag);
             }
-            if let ::core::option::Option::Some(ref v) = self.explicit_bool {
-                __w.write_bool(2, *v);
-            }
-            if let ::core::option::Option::Some(ref v) = self.explicit_string {
-                __w.write_string(3, v.as_str());
-            }
-            if let ::core::option::Option::Some(ref v) = self.explicit_bytes {
-                __w.write_bytes(4, v.as_slice());
-            }
-            if let ::core::option::Option::Some(ref v) = self.explicit_double {
-                __w.write_float64(5, *v);
-            }
-            if let ::core::option::Option::Some(ref v) = self.status {
-                __w.write_sint(6, i64::from(*v));
-            }
-            __w.write_sint(7, i64::from(self.implicit_count));
-            __w.write_bool(8, self.implicit_flag);
             __w.finish();
         }
         if let ::core::option::Option::Some(ref sub) = self.child {

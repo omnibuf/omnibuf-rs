@@ -58,8 +58,6 @@ impl ConformanceRequest {
 }
 
 impl ::omnibuf::Message for ConformanceRequest {
-    const HAS_NESTED_CONTAINERS: bool = false;
-
     #[inline]
     fn encode_omnibuf_append(
         &self,
@@ -68,22 +66,25 @@ impl ::omnibuf::Message for ConformanceRequest {
     ) -> ::omnibuf::Result<()> {
         let _ = deterministic;
         {
-            let mut __w = ::omnibuf::codec::RawBufWriter::new(
-                dst,
-                ((((65usize).saturating_add(self.test_name.len()))
-                    .saturating_add(self.message_type.len()))
-                .saturating_add(self.omnibuf_payload.len()))
-                .saturating_add(self.json_payload.len()),
-            );
-            __w.write_string(1, self.test_name.as_str());
-            __w.write_string(2, self.message_type.as_str());
-            __w.write_sint(3, i64::from(self.tier));
-            __w.write_sint(4, i64::from(self.requested_output_format));
-            __w.write_bytes(5, self.omnibuf_payload.as_slice());
-            __w.write_string(6, self.json_payload.as_str());
-            __w.write_bool(7, self.self_describing);
-            __w.write_bool(8, self.test_opaque_splice);
-            __w.write_bool(9, self.test_opaque_splice_shrink);
+            let __max = (65usize)
+                .checked_add(self.test_name.len())
+                .and_then(|__n| __n.checked_add(self.message_type.len()))
+                .and_then(|__n| __n.checked_add(self.omnibuf_payload.len()))
+                .and_then(|__n| __n.checked_add(self.json_payload.len()))
+                .expect("capacity overflow");
+            let mut __w = ::omnibuf::codec::RawBufWriter::new(dst, __max);
+            // SAFETY: `RawBufWriter::new` reserved at least the sum of worst-case encoded widths for every field in this batch.
+            unsafe {
+                __w.write_string_unchecked(1, self.test_name.as_str());
+                __w.write_string_unchecked(2, self.message_type.as_str());
+                __w.write_sint_unchecked(3, i64::from(self.tier));
+                __w.write_sint_unchecked(4, i64::from(self.requested_output_format));
+                __w.write_bytes_unchecked(5, self.omnibuf_payload.as_slice());
+                __w.write_string_unchecked(6, self.json_payload.as_str());
+                __w.write_bool_unchecked(7, self.self_describing);
+                __w.write_bool_unchecked(8, self.test_opaque_splice);
+                __w.write_bool_unchecked(9, self.test_opaque_splice_shrink);
+            }
             __w.finish();
         }
         ::core::result::Result::Ok(())
@@ -694,9 +695,7 @@ impl ConformanceResponse {
 }
 
 impl ::omnibuf::Message for ConformanceResponse {
-    const HAS_NESTED_CONTAINERS: bool = false;
-
-    #[inline(always)]
+    #[inline]
     fn encode_omnibuf_append(
         &self,
         dst: &mut ::std::vec::Vec<u8>,
@@ -704,21 +703,24 @@ impl ::omnibuf::Message for ConformanceResponse {
     ) -> ::omnibuf::Result<()> {
         let _ = deterministic;
         {
-            let mut __w = ::omnibuf::codec::RawBufWriter::new(
-                dst,
-                ((((((60usize).saturating_add(self.parse_error.len()))
-                    .saturating_add(self.serialize_error.len()))
-                .saturating_add(self.runtime_error.len()))
-                .saturating_add(self.skipped.len()))
-                .saturating_add(self.omnibuf_payload.len()))
-                .saturating_add(self.json_payload.len()),
-            );
-            __w.write_string(1, self.parse_error.as_str());
-            __w.write_string(2, self.serialize_error.as_str());
-            __w.write_string(3, self.runtime_error.as_str());
-            __w.write_string(4, self.skipped.as_str());
-            __w.write_bytes(5, self.omnibuf_payload.as_slice());
-            __w.write_string(6, self.json_payload.as_str());
+            let __max = (60usize)
+                .checked_add(self.parse_error.len())
+                .and_then(|__n| __n.checked_add(self.serialize_error.len()))
+                .and_then(|__n| __n.checked_add(self.runtime_error.len()))
+                .and_then(|__n| __n.checked_add(self.skipped.len()))
+                .and_then(|__n| __n.checked_add(self.omnibuf_payload.len()))
+                .and_then(|__n| __n.checked_add(self.json_payload.len()))
+                .expect("capacity overflow");
+            let mut __w = ::omnibuf::codec::RawBufWriter::new(dst, __max);
+            // SAFETY: `RawBufWriter::new` reserved at least the sum of worst-case encoded widths for every field in this batch.
+            unsafe {
+                __w.write_string_unchecked(1, self.parse_error.as_str());
+                __w.write_string_unchecked(2, self.serialize_error.as_str());
+                __w.write_string_unchecked(3, self.runtime_error.as_str());
+                __w.write_string_unchecked(4, self.skipped.as_str());
+                __w.write_bytes_unchecked(5, self.omnibuf_payload.as_slice());
+                __w.write_string_unchecked(6, self.json_payload.as_str());
+            }
             __w.finish();
         }
         ::core::result::Result::Ok(())
@@ -1209,9 +1211,7 @@ impl AllTypesSubMsg {
 }
 
 impl ::omnibuf::Message for AllTypesSubMsg {
-    const HAS_NESTED_CONTAINERS: bool = false;
-
-    #[inline(always)]
+    #[inline]
     fn encode_omnibuf_append(
         &self,
         dst: &mut ::std::vec::Vec<u8>,
@@ -1219,14 +1219,17 @@ impl ::omnibuf::Message for AllTypesSubMsg {
     ) -> ::omnibuf::Result<()> {
         let _ = deterministic;
         {
-            let mut __w = ::omnibuf::codec::RawBufWriter::new(
-                dst,
-                (31usize).saturating_add(self.label.len()),
-            );
-            __w.write_uint(1, u64::from(self.id));
-            __w.write_string(2, self.label.as_str());
-            __w.write_bool(3, self.flag);
-            __w.write_sint(4, self.score);
+            let __max = (31usize)
+                .checked_add(self.label.len())
+                .expect("capacity overflow");
+            let mut __w = ::omnibuf::codec::RawBufWriter::new(dst, __max);
+            // SAFETY: `RawBufWriter::new` reserved at least the sum of worst-case encoded widths for every field in this batch.
+            unsafe {
+                __w.write_uint_unchecked(1, u64::from(self.id));
+                __w.write_string_unchecked(2, self.label.as_str());
+                __w.write_bool_unchecked(3, self.flag);
+                __w.write_sint_unchecked(4, self.score);
+            }
             __w.finish();
         }
         ::core::result::Result::Ok(())
@@ -1683,8 +1686,6 @@ impl TestAllTypes {
 }
 
 impl ::omnibuf::Message for TestAllTypes {
-    const HAS_NESTED_CONTAINERS: bool = true;
-
     #[inline]
     fn encode_omnibuf_append(
         &self,
@@ -1693,18 +1694,21 @@ impl ::omnibuf::Message for TestAllTypes {
     ) -> ::omnibuf::Result<()> {
         let _ = deterministic;
         {
-            let mut __w = ::omnibuf::codec::RawBufWriter::new(
-                dst,
-                ((61usize).saturating_add(self.f6_string.len()))
-                    .saturating_add(self.f7_bytes.len()),
-            );
-            __w.write_uint(1, u64::from(self.f1_uint32));
-            __w.write_uint(2, self.f2_uint64);
-            __w.write_sint(3, i64::from(self.f3_sint32));
-            __w.write_sint(4, self.f4_sint64);
-            __w.write_bool(5, self.f5_bool);
-            __w.write_string(6, self.f6_string.as_str());
-            __w.write_bytes(7, self.f7_bytes.as_slice());
+            let __max = (61usize)
+                .checked_add(self.f6_string.len())
+                .and_then(|__n| __n.checked_add(self.f7_bytes.len()))
+                .expect("capacity overflow");
+            let mut __w = ::omnibuf::codec::RawBufWriter::new(dst, __max);
+            // SAFETY: `RawBufWriter::new` reserved at least the sum of worst-case encoded widths for every field in this batch.
+            unsafe {
+                __w.write_uint_unchecked(1, u64::from(self.f1_uint32));
+                __w.write_uint_unchecked(2, self.f2_uint64);
+                __w.write_sint_unchecked(3, i64::from(self.f3_sint32));
+                __w.write_sint_unchecked(4, self.f4_sint64);
+                __w.write_bool_unchecked(5, self.f5_bool);
+                __w.write_string_unchecked(6, self.f6_string.as_str());
+                __w.write_bytes_unchecked(7, self.f7_bytes.as_slice());
+            }
             __w.finish();
         }
         if let ::core::option::Option::Some(ref sub) = self.f8_sub_msg {
@@ -1732,15 +1736,18 @@ impl ::omnibuf::Message for TestAllTypes {
             },
         )?;
         {
-            let mut __w = ::omnibuf::codec::RawBufWriter::new(
-                dst,
-                (43usize).saturating_add(self.f20_overflow_str.len()),
-            );
-            __w.write_float32(13, self.f13_float32);
-            __w.write_float64(14, self.f14_float64);
-            __w.write_fixed32(15, self.f15_fixed32);
-            __w.write_fixed64(16, self.f16_fixed64);
-            __w.write_string(20, self.f20_overflow_str.as_str());
+            let __max = (43usize)
+                .checked_add(self.f20_overflow_str.len())
+                .expect("capacity overflow");
+            let mut __w = ::omnibuf::codec::RawBufWriter::new(dst, __max);
+            // SAFETY: `RawBufWriter::new` reserved at least the sum of worst-case encoded widths for every field in this batch.
+            unsafe {
+                __w.write_float32_unchecked(13, self.f13_float32);
+                __w.write_float64_unchecked(14, self.f14_float64);
+                __w.write_fixed32_unchecked(15, self.f15_fixed32);
+                __w.write_fixed64_unchecked(16, self.f16_fixed64);
+                __w.write_string_unchecked(20, self.f20_overflow_str.as_str());
+            }
             __w.finish();
         }
         ::core::result::Result::Ok(())

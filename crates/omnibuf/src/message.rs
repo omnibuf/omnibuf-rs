@@ -377,10 +377,11 @@ fn validate_entry_with_limits(
 
 /// Trait implemented by Rust types that serialize and deserialize in OmniBuf wire format.
 pub trait Message: Default + Sized + 'static {
-    /// Whether `Self` contains any nested sub-message, array, map, or oneof fields.
+    /// Whether `Self` may contain nested containers, oneofs, or variable-length fields
+    /// (`String` / `Bytes`) that can push an encoded message body past 16,383 bytes.
     ///
-    /// Leaf structs containing only scalar, string, or bytes fields set this to `false`
-    /// so container writers can skip redundant `min_wire_size()` pre-scans.
+    /// Fixed-bound leaf structs (no containers, oneofs, `String`, or `Bytes`, and maximum
+    /// encoded size `<= 16_383`) set this to `false`.
     const HAS_NESTED_CONTAINERS: bool = true;
 
     /// Appends the OmniBuf wire representation of `self` to `dst`.
@@ -872,38 +873,58 @@ pub mod codec {
             }
         }
 
+        /// Writes a zero-payload boolean field tag without checking remaining capacity.
+        ///
+        /// # Safety
+        /// At least `varint_len((u64::from(field_num) << 4) | 3)` writable bytes must remain at `self.ptr`.
+        #[doc(hidden)]
+        #[inline(always)]
+        pub unsafe fn write_bool_unchecked(&mut self, field_num: u32, v: bool) {
+            let tf = (u64::from(field_num) << 4) | u64::from(WIRE_BOOL_FALSE);
+            let tt = (u64::from(field_num) << 4) | u64::from(WIRE_BOOL_TRUE);
+            // SAFETY: Caller guarantees sufficient writable bytes at `self.ptr` for the encoded tag.
+            unsafe {
+                if tt <= 127 {
+                    *self.ptr = (((tf as u8) << 1) | 1) | ((u8::from(v)) << 1);
+                    self.ptr = self.ptr.add(1);
+                } else if tt <= 16_383 {
+                    let u = if v {
+                        ((tt as u16) << 2) | 2
+                    } else {
+                        ((tf as u16) << 2) | 2
+                    };
+                    core::ptr::write_unaligned(self.ptr.cast::<u16>(), u.to_le());
+                    self.ptr = self.ptr.add(2);
+                } else {
+                    let tag = if v { tt } else { tf };
+                    self.write_tag_unchecked(tag);
+                }
+            }
+        }
+
         /// Writes a zero-payload boolean field tag.
         #[inline(always)]
         pub fn write_bool(&mut self, field_num: u32, v: bool) {
-            let tf = (u64::from(field_num) << 4) | u64::from(WIRE_BOOL_FALSE);
             let tt = (u64::from(field_num) << 4) | u64::from(WIRE_BOOL_TRUE);
-            if tt <= 127 {
-                self.ensure(1);
-                // SAFETY: `self.ensure(1)` guarantees at least 1 writable byte at `self.ptr`.
-                unsafe {
-                    *self.ptr = (((tf as u8) << 1) | 1) | ((u8::from(v)) << 1);
-                    self.ptr = self.ptr.add(1);
-                }
-            } else if tt <= 16_383 {
-                self.ensure(2);
-                let u = if v {
-                    ((tt as u16) << 2) | 2
-                } else {
-                    ((tf as u16) << 2) | 2
-                };
-                // SAFETY: `self.ensure(2)` guarantees at least 2 writable bytes at `self.ptr`.
-                unsafe {
-                    core::ptr::write_unaligned(self.ptr.cast::<u16>(), u.to_le());
-                    self.ptr = self.ptr.add(2);
-                }
-            } else {
-                let tag = if v { tt } else { tf };
-                let tw = varint_len(tag);
-                self.ensure(tw);
-                // SAFETY: `self.ensure(tw)` guarantees `tw` writable bytes at `self.ptr`.
-                unsafe {
-                    self.write_tag_unchecked(tag);
-                }
+            let tw = varint_len(tt);
+            self.ensure(tw);
+            // SAFETY: `self.ensure(tw)` guarantees at least `tw` writable bytes at `self.ptr`.
+            unsafe {
+                self.write_bool_unchecked(field_num, v);
+            }
+        }
+
+        /// # Safety
+        /// At least `varint_len((u64::from(field_num) << 4) | u64::from(wt)) + 9` writable bytes
+        /// must remain at `self.ptr`.
+        #[inline(always)]
+        unsafe fn write_varint_with_wt_unchecked(&mut self, field_num: u32, wt: u8, v: u64) {
+            let tag = (u64::from(field_num) << 4) | u64::from(wt);
+            // SAFETY: Caller guarantees `varint_len(tag)` tag bytes plus at least 9 varint bytes.
+            unsafe {
+                self.write_tag_unchecked(tag);
+                let vn = put_varint_raw(self.ptr, v);
+                self.ptr = self.ptr.add(vn);
             }
         }
 
@@ -914,9 +935,21 @@ pub mod codec {
             self.ensure(tw + 9);
             // SAFETY: `self.ensure(tw + 9)` guarantees `tw` tag bytes plus at least 9 varint bytes.
             unsafe {
-                self.write_tag_unchecked(tag);
-                let vn = put_varint_raw(self.ptr, v);
-                self.ptr = self.ptr.add(vn);
+                self.write_varint_with_wt_unchecked(field_num, wt, v);
+            }
+        }
+
+        /// Writes a `WireUint` field without checking remaining capacity.
+        ///
+        /// # Safety
+        /// At least `varint_len((u64::from(field_num) << 4) | u64::from(WIRE_UINT)) + 9`
+        /// writable bytes must remain at `self.ptr`.
+        #[doc(hidden)]
+        #[inline(always)]
+        pub unsafe fn write_uint_unchecked(&mut self, field_num: u32, v: u64) {
+            // SAFETY: Caller upholds the capacity precondition.
+            unsafe {
+                self.write_varint_with_wt_unchecked(field_num, WIRE_UINT, v);
             }
         }
 
@@ -926,10 +959,52 @@ pub mod codec {
             self.write_varint_with_wt(field_num, WIRE_UINT, v);
         }
 
+        /// Writes a `WireSint` (ZigZag-encoded) field without checking remaining capacity.
+        ///
+        /// # Safety
+        /// At least `varint_len((u64::from(field_num) << 4) | u64::from(WIRE_SINT)) + 9`
+        /// writable bytes must remain at `self.ptr`.
+        #[doc(hidden)]
+        #[inline(always)]
+        pub unsafe fn write_sint_unchecked(&mut self, field_num: u32, v: i64) {
+            // SAFETY: Caller upholds the capacity precondition.
+            unsafe {
+                self.write_varint_with_wt_unchecked(field_num, WIRE_SINT, encode_zigzag(v));
+            }
+        }
+
         /// Writes a `WireSint` (ZigZag-encoded) field.
         #[inline(always)]
         pub fn write_sint(&mut self, field_num: u32, v: i64) {
             self.write_varint_with_wt(field_num, WIRE_SINT, encode_zigzag(v));
+        }
+
+        /// # Safety
+        /// At least `varint_len((u64::from(field_num) << 4) | u64::from(wt)) + 4` writable bytes
+        /// must remain at `self.ptr`.
+        #[inline(always)]
+        unsafe fn write_fixed32_with_wt_unchecked(&mut self, field_num: u32, wt: u8, v: u32) {
+            let tag = (u64::from(field_num) << 4) | u64::from(wt);
+            // SAFETY: Caller guarantees `varint_len(tag) + 4` writable bytes at `self.ptr`.
+            unsafe {
+                self.write_tag_unchecked(tag);
+                core::ptr::write_unaligned(self.ptr.cast::<u32>(), v.to_le());
+                self.ptr = self.ptr.add(4);
+            }
+        }
+
+        /// # Safety
+        /// At least `varint_len((u64::from(field_num) << 4) | u64::from(wt)) + 8` writable bytes
+        /// must remain at `self.ptr`.
+        #[inline(always)]
+        unsafe fn write_fixed64_with_wt_unchecked(&mut self, field_num: u32, wt: u8, v: u64) {
+            let tag = (u64::from(field_num) << 4) | u64::from(wt);
+            // SAFETY: Caller guarantees `varint_len(tag) + 8` writable bytes at `self.ptr`.
+            unsafe {
+                self.write_tag_unchecked(tag);
+                core::ptr::write_unaligned(self.ptr.cast::<u64>(), v.to_le());
+                self.ptr = self.ptr.add(8);
+            }
         }
 
         #[inline(always)]
@@ -939,9 +1014,7 @@ pub mod codec {
             self.ensure(tw + 4);
             // SAFETY: `self.ensure(tw + 4)` guarantees `tw + 4` writable bytes at `self.ptr`.
             unsafe {
-                self.write_tag_unchecked(tag);
-                core::ptr::write_unaligned(self.ptr.cast::<u32>(), v.to_le());
-                self.ptr = self.ptr.add(4);
+                self.write_fixed32_with_wt_unchecked(field_num, wt, v);
             }
         }
 
@@ -952,9 +1025,21 @@ pub mod codec {
             self.ensure(tw + 8);
             // SAFETY: `self.ensure(tw + 8)` guarantees `tw + 8` writable bytes at `self.ptr`.
             unsafe {
-                self.write_tag_unchecked(tag);
-                core::ptr::write_unaligned(self.ptr.cast::<u64>(), v.to_le());
-                self.ptr = self.ptr.add(8);
+                self.write_fixed64_with_wt_unchecked(field_num, wt, v);
+            }
+        }
+
+        /// Writes a `WireFixed32` field without checking remaining capacity.
+        ///
+        /// # Safety
+        /// At least `varint_len((u64::from(field_num) << 4) | u64::from(WIRE_FIXED32)) + 4`
+        /// writable bytes must remain at `self.ptr`.
+        #[doc(hidden)]
+        #[inline(always)]
+        pub unsafe fn write_fixed32_unchecked(&mut self, field_num: u32, v: u32) {
+            // SAFETY: Caller upholds the capacity precondition.
+            unsafe {
+                self.write_fixed32_with_wt_unchecked(field_num, WIRE_FIXED32, v);
             }
         }
 
@@ -964,10 +1049,38 @@ pub mod codec {
             self.write_fixed32_with_wt(field_num, WIRE_FIXED32, v);
         }
 
+        /// Writes a `WireFixed64` field without checking remaining capacity.
+        ///
+        /// # Safety
+        /// At least `varint_len((u64::from(field_num) << 4) | u64::from(WIRE_FIXED64)) + 8`
+        /// writable bytes must remain at `self.ptr`.
+        #[doc(hidden)]
+        #[inline(always)]
+        pub unsafe fn write_fixed64_unchecked(&mut self, field_num: u32, v: u64) {
+            // SAFETY: Caller upholds the capacity precondition.
+            unsafe {
+                self.write_fixed64_with_wt_unchecked(field_num, WIRE_FIXED64, v);
+            }
+        }
+
         /// Writes a `WireFixed64` field.
         #[inline(always)]
         pub fn write_fixed64(&mut self, field_num: u32, v: u64) {
             self.write_fixed64_with_wt(field_num, WIRE_FIXED64, v);
+        }
+
+        /// Writes a `WireSfixed32` field without checking remaining capacity.
+        ///
+        /// # Safety
+        /// At least `varint_len((u64::from(field_num) << 4) | u64::from(WIRE_SFIXED32)) + 4`
+        /// writable bytes must remain at `self.ptr`.
+        #[doc(hidden)]
+        #[inline(always)]
+        pub unsafe fn write_sfixed32_unchecked(&mut self, field_num: u32, v: i32) {
+            // SAFETY: Caller upholds the capacity precondition.
+            unsafe {
+                self.write_fixed32_with_wt_unchecked(field_num, WIRE_SFIXED32, v as u32);
+            }
         }
 
         /// Writes a `WireSfixed32` field.
@@ -976,10 +1089,38 @@ pub mod codec {
             self.write_fixed32_with_wt(field_num, WIRE_SFIXED32, v as u32);
         }
 
+        /// Writes a `WireSfixed64` field without checking remaining capacity.
+        ///
+        /// # Safety
+        /// At least `varint_len((u64::from(field_num) << 4) | u64::from(WIRE_SFIXED64)) + 8`
+        /// writable bytes must remain at `self.ptr`.
+        #[doc(hidden)]
+        #[inline(always)]
+        pub unsafe fn write_sfixed64_unchecked(&mut self, field_num: u32, v: i64) {
+            // SAFETY: Caller upholds the capacity precondition.
+            unsafe {
+                self.write_fixed64_with_wt_unchecked(field_num, WIRE_SFIXED64, v as u64);
+            }
+        }
+
         /// Writes a `WireSfixed64` field.
         #[inline(always)]
         pub fn write_sfixed64(&mut self, field_num: u32, v: i64) {
             self.write_fixed64_with_wt(field_num, WIRE_SFIXED64, v as u64);
+        }
+
+        /// Writes a `WireFloat32` field without checking remaining capacity.
+        ///
+        /// # Safety
+        /// At least `varint_len((u64::from(field_num) << 4) | u64::from(WIRE_FLOAT32)) + 4`
+        /// writable bytes must remain at `self.ptr`.
+        #[doc(hidden)]
+        #[inline(always)]
+        pub unsafe fn write_float32_unchecked(&mut self, field_num: u32, v: f32) {
+            // SAFETY: Caller upholds the capacity precondition.
+            unsafe {
+                self.write_fixed32_with_wt_unchecked(field_num, WIRE_FLOAT32, v.to_bits());
+            }
         }
 
         /// Writes a `WireFloat32` field.
@@ -988,10 +1129,46 @@ pub mod codec {
             self.write_fixed32_with_wt(field_num, WIRE_FLOAT32, v.to_bits());
         }
 
+        /// Writes a `WireFloat64` field without checking remaining capacity.
+        ///
+        /// # Safety
+        /// At least `varint_len((u64::from(field_num) << 4) | u64::from(WIRE_FLOAT64)) + 8`
+        /// writable bytes must remain at `self.ptr`.
+        #[doc(hidden)]
+        #[inline(always)]
+        pub unsafe fn write_float64_unchecked(&mut self, field_num: u32, v: f64) {
+            // SAFETY: Caller upholds the capacity precondition.
+            unsafe {
+                self.write_fixed64_with_wt_unchecked(field_num, WIRE_FLOAT64, v.to_bits());
+            }
+        }
+
         /// Writes a `WireFloat64` field.
         #[inline(always)]
         pub fn write_float64(&mut self, field_num: u32, v: f64) {
             self.write_fixed64_with_wt(field_num, WIRE_FLOAT64, v.to_bits());
+        }
+
+        /// # Safety
+        /// At least `varint_len((u64::from(field_num) << 4) | u64::from(wt)) + 9 + b.len()`
+        /// writable bytes must remain at `self.ptr`.
+        #[inline(always)]
+        unsafe fn write_bytes_with_wt_unchecked(&mut self, field_num: u32, wt: u8, b: &[u8]) {
+            let tag = (u64::from(field_num) << 4) | u64::from(wt);
+            let blen = b.len();
+            // SAFETY: Caller guarantees enough writable bytes for tag, length varint (up to 9),
+            // and `blen` payload bytes; `b` is disjoint from `self.dst`.
+            unsafe {
+                self.write_tag_unchecked(tag);
+                let dst_ptr = if blen <= 127 {
+                    *self.ptr = ((blen as u8) << 1) | 1;
+                    self.ptr.add(1)
+                } else {
+                    self.ptr.add(put_varint_raw(self.ptr, blen as u64))
+                };
+                core::ptr::copy_nonoverlapping(b.as_ptr(), dst_ptr, blen);
+                self.ptr = dst_ptr.add(blen);
+            }
         }
 
         #[inline(always)]
@@ -1004,15 +1181,21 @@ pub mod codec {
             // SAFETY: `self.ensure(tw + 9 + blen)` guarantees enough writable bytes for tag,
             // length varint, and payload; `b` is disjoint from `self.dst`.
             unsafe {
-                self.write_tag_unchecked(tag);
-                let dst_ptr = if blen <= 127 {
-                    *self.ptr = ((blen as u8) << 1) | 1;
-                    self.ptr.add(1)
-                } else {
-                    self.ptr.add(put_varint_raw(self.ptr, blen as u64))
-                };
-                copy_bytes_fast(b.as_ptr(), dst_ptr, blen);
-                self.ptr = dst_ptr.add(blen);
+                self.write_bytes_with_wt_unchecked(field_num, wt, b);
+            }
+        }
+
+        /// Writes a `WireString` field without checking remaining capacity.
+        ///
+        /// # Safety
+        /// At least `varint_len((u64::from(field_num) << 4) | u64::from(WIRE_STRING)) + 9 + s.len()`
+        /// writable bytes must remain at `self.ptr`.
+        #[doc(hidden)]
+        #[inline(always)]
+        pub unsafe fn write_string_unchecked(&mut self, field_num: u32, s: &str) {
+            // SAFETY: Caller upholds the capacity precondition.
+            unsafe {
+                self.write_bytes_with_wt_unchecked(field_num, WIRE_STRING, s.as_bytes());
             }
         }
 
@@ -1022,10 +1205,43 @@ pub mod codec {
             self.write_bytes_with_wt(field_num, WIRE_STRING, s.as_bytes());
         }
 
+        /// Writes a `WireBytes` field without checking remaining capacity.
+        ///
+        /// # Safety
+        /// At least `varint_len((u64::from(field_num) << 4) | u64::from(WIRE_BYTES)) + 9 + b.len()`
+        /// writable bytes must remain at `self.ptr`.
+        #[doc(hidden)]
+        #[inline(always)]
+        pub unsafe fn write_bytes_unchecked(&mut self, field_num: u32, b: &[u8]) {
+            // SAFETY: Caller upholds the capacity precondition.
+            unsafe {
+                self.write_bytes_with_wt_unchecked(field_num, WIRE_BYTES, b);
+            }
+        }
+
         /// Writes a `WireBytes` field.
         #[inline(always)]
         pub fn write_bytes(&mut self, field_num: u32, b: &[u8]) {
             self.write_bytes_with_wt(field_num, WIRE_BYTES, b);
+        }
+
+        /// Writes a `buffa::EnumValue<E>` field as `WireSint` without checking remaining capacity.
+        ///
+        /// # Safety
+        /// At least `varint_len((u64::from(field_num) << 4) | u64::from(WIRE_SINT)) + 9`
+        /// writable bytes must remain at `self.ptr`.
+        #[cfg(feature = "buffa")]
+        #[doc(hidden)]
+        #[inline(always)]
+        pub unsafe fn write_buffa_enum_unchecked<E: ::buffa::Enumeration>(
+            &mut self,
+            field_num: u32,
+            val: &::buffa::EnumValue<E>,
+        ) {
+            // SAFETY: Caller upholds the capacity precondition.
+            unsafe {
+                self.write_sint_unchecked(field_num, i64::from(val.to_i32()));
+            }
         }
 
         /// Writes a `buffa::EnumValue<E>` field as `WireSint`.
@@ -1392,14 +1608,14 @@ pub mod codec {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn write_sub_msg_field<M: Message>(
         dst: &mut Vec<u8>,
         field_num: u32,
         msg: &M,
         deterministic: bool,
     ) -> Result<()> {
-        if M::HAS_NESTED_CONTAINERS && dst.capacity() > 16_383 {
+        if dst.capacity() > 16_383 {
             let min_body = msg.min_wire_size();
             if min_body > 16_383 {
                 dst.reserve(min_body.saturating_add(16));
@@ -1801,14 +2017,80 @@ pub mod codec {
         }
     }
 
+    #[inline]
+    fn write_len_prefixed_vec_exact<T, F>(
+        dst: &mut Vec<u8>,
+        field_num: u32,
+        elem_wt: u8,
+        items: &[T],
+        as_bytes: F,
+    ) where
+        F: Fn(&T) -> &[u8],
+    {
+        let count = items.len();
+        let mut payload_bytes = 0usize;
+        for item in items {
+            let n = as_bytes(item).len();
+            payload_bytes = payload_bytes
+                .checked_add(varint_len(n as u64))
+                .and_then(|v| v.checked_add(n))
+                .expect("capacity overflow");
+        }
+        let cn = varint_len(count as u64);
+        let sub_len = 1usize
+            .checked_add(cn)
+            .and_then(|v| v.checked_add(payload_bytes))
+            .expect("capacity overflow");
+        let tag = (u64::from(field_num) << 4) | u64::from(WIRE_ARRAY);
+        let tw = varint_len(tag);
+        let lw = container_len_width(sub_len);
+        let exact = tw
+            .checked_add(lw)
+            .and_then(|v| v.checked_add(sub_len))
+            .expect("capacity overflow");
+        let need = exact.checked_add(8).expect("capacity overflow");
+        let start_len = dst.len();
+        if dst.capacity() - start_len < need {
+            dst.reserve(need);
+        }
+        // SAFETY: At least `exact + 8` writable bytes exist at `start_len` (providing at least
+        // 9 writable bytes at every `put_varint_raw` / `put_container_len_raw` call), all item
+        // slices are disjoint from `dst`, and exactly `exact` bytes are written before `set_len`.
+        unsafe {
+            let mut ptr = dst.as_mut_ptr().add(start_len);
+            ptr = ptr.add(put_varint_raw(ptr, tag));
+            ptr = ptr.add(put_container_len_raw(ptr, sub_len));
+            *ptr = elem_wt;
+            ptr = ptr.add(1);
+            ptr = ptr.add(put_varint_raw(ptr, count as u64));
+            for item in items {
+                let b = as_bytes(item);
+                let n = b.len();
+                if n <= 127 {
+                    *ptr = ((n as u8) << 1) | 1;
+                    ptr = ptr.add(1);
+                } else {
+                    ptr = ptr.add(put_varint_raw(ptr, n as u64));
+                }
+                core::ptr::copy_nonoverlapping(b.as_ptr(), ptr, n);
+                ptr = ptr.add(n);
+            }
+            dst.set_len(start_len + exact);
+        }
+    }
+
     /// Encodes `Vec<String>` as `WireArray(WireString)` in a single-pass raw-pointer loop.
-    #[inline(always)]
+    #[inline]
     pub fn write_string_vec_field(
         dst: &mut Vec<u8>,
         field_num: u32,
         items: &[String],
     ) -> Result<()> {
         let count = items.len();
+        if dst.capacity() > 16_383 && count > 0 {
+            write_len_prefixed_vec_exact(dst, field_num, WIRE_STRING, items, String::as_bytes);
+            return Ok(());
+        }
         let len_pos = begin_tagged_array(dst, field_num, WIRE_STRING, count);
         let cur_len = dst.len();
         // SAFETY: `cur_len <= dst.capacity()` always holds.
@@ -1834,7 +2116,7 @@ pub mod codec {
                 } else {
                     ptr = ptr.add(put_varint_raw(ptr, n as u64));
                 }
-                copy_bytes_fast(b.as_ptr(), ptr, n);
+                core::ptr::copy_nonoverlapping(b.as_ptr(), ptr, n);
                 ptr = ptr.add(n);
             }
         }
@@ -1848,13 +2130,17 @@ pub mod codec {
     }
 
     /// Encodes `Vec<Vec<u8>>` as `WireArray(WireBytes)` in a single-pass raw-pointer loop.
-    #[inline(always)]
+    #[inline]
     pub fn write_bytes_vec_field(
         dst: &mut Vec<u8>,
         field_num: u32,
         items: &[Vec<u8>],
     ) -> Result<()> {
         let count = items.len();
+        if dst.capacity() > 16_383 && count > 0 {
+            write_len_prefixed_vec_exact(dst, field_num, WIRE_BYTES, items, Vec::as_slice);
+            return Ok(());
+        }
         let len_pos = begin_tagged_array(dst, field_num, WIRE_BYTES, count);
         let cur_len = dst.len();
         // SAFETY: `cur_len <= dst.capacity()` always holds.
@@ -1879,7 +2165,7 @@ pub mod codec {
                 } else {
                     ptr = ptr.add(put_varint_raw(ptr, n as u64));
                 }
-                copy_bytes_fast(b.as_ptr(), ptr, n);
+                core::ptr::copy_nonoverlapping(b.as_ptr(), ptr, n);
                 ptr = ptr.add(n);
             }
         }
@@ -2572,26 +2858,50 @@ pub mod codec {
         deterministic: bool,
     ) -> Result<()> {
         let count = items.len();
-        if dst.capacity() > 16_383 && (count >= 32 || (M::HAS_NESTED_CONTAINERS && count > 0)) {
-            let mut elems_min = 0usize;
-            for m in items {
-                let em = m.min_wire_size();
-                elems_min = elems_min.saturating_add(container_len_width(em).saturating_add(em));
-                if elems_min > 16_383 {
-                    break;
+        if dst.capacity() > 16_383 && count > 0 {
+            if count <= 32 {
+                let mut elem_mins = [0usize; 32];
+                let mut elems_min = 0usize;
+                for (slot, m) in elem_mins[..count].iter_mut().zip(items.iter()) {
+                    let em = m.min_wire_size();
+                    *slot = em;
+                    elems_min =
+                        elems_min.saturating_add(container_len_width(em).saturating_add(em));
                 }
-            }
-            let min_body = 1usize
-                .saturating_add(varint_len(count as u64))
-                .saturating_add(elems_min);
-            if min_body > 16_383 {
-                dst.reserve(min_body.saturating_add(64));
-                let len_pos = begin_tagged_array_4b(dst, field_num, WIRE_SUB_MSG, count);
-                for item in items {
-                    write_sub_msg_elem(dst, item, deterministic)?;
+                let min_body = 1usize
+                    .saturating_add(varint_len(count as u64))
+                    .saturating_add(elems_min);
+                if min_body > 16_383 {
+                    dst.reserve(min_body.saturating_add(64));
+                    let len_pos = begin_tagged_array_4b(dst, field_num, WIRE_SUB_MSG, count);
+                    for (item, &em) in items.iter().zip(elem_mins[..count].iter()) {
+                        write_sub_msg_elem_with_min(dst, item, em, deterministic)?;
+                    }
+                    backpatch_container_len_4b(dst, len_pos);
+                    return Ok(());
                 }
-                backpatch_container_len_4b(dst, len_pos);
-                return Ok(());
+            } else {
+                let mut elems_min = 0usize;
+                for m in items {
+                    let em = m.min_wire_size();
+                    elems_min =
+                        elems_min.saturating_add(container_len_width(em).saturating_add(em));
+                    if elems_min > 16_383 {
+                        break;
+                    }
+                }
+                let min_body = 1usize
+                    .saturating_add(varint_len(count as u64))
+                    .saturating_add(elems_min);
+                if min_body > 16_383 {
+                    dst.reserve(min_body.saturating_add(64));
+                    let len_pos = begin_tagged_array_4b(dst, field_num, WIRE_SUB_MSG, count);
+                    for item in items {
+                        write_sub_msg_elem(dst, item, deterministic)?;
+                    }
+                    backpatch_container_len_4b(dst, len_pos);
+                    return Ok(());
+                }
             }
         }
         let len_pos = begin_tagged_array(dst, field_num, WIRE_SUB_MSG, count);
@@ -2625,26 +2935,50 @@ pub mod codec {
         deterministic: bool,
     ) -> Result<()> {
         let count = items.len();
-        if dst.capacity() > 16_383 && (count >= 32 || (M::HAS_NESTED_CONTAINERS && count > 0)) {
-            let mut elems_min = 0usize;
-            for m in items {
-                let em = m.min_wire_size();
-                elems_min = elems_min.saturating_add(container_len_width(em).saturating_add(em));
-                if elems_min > 16_383 {
-                    break;
+        if dst.capacity() > 16_383 && count > 0 {
+            if count <= 32 {
+                let mut elem_mins = [0usize; 32];
+                let mut elems_min = 0usize;
+                for (slot, m) in elem_mins[..count].iter_mut().zip(items.iter()) {
+                    let em = m.min_wire_size();
+                    *slot = em;
+                    elems_min =
+                        elems_min.saturating_add(container_len_width(em).saturating_add(em));
                 }
-            }
-            let min_body = 1usize
-                .saturating_add(varint_len(count as u64))
-                .saturating_add(elems_min);
-            if min_body > 16_383 {
-                dst.reserve(min_body.saturating_add(24));
-                let len_pos = begin_tagged_array_4b(dst, field_num, WIRE_SUB_MSG, count);
-                for item in items {
-                    write_sub_msg_elem(dst, item.as_ref(), deterministic)?;
+                let min_body = 1usize
+                    .saturating_add(varint_len(count as u64))
+                    .saturating_add(elems_min);
+                if min_body > 16_383 {
+                    dst.reserve(min_body.saturating_add(24));
+                    let len_pos = begin_tagged_array_4b(dst, field_num, WIRE_SUB_MSG, count);
+                    for (item, &em) in items.iter().zip(elem_mins[..count].iter()) {
+                        write_sub_msg_elem_with_min(dst, item.as_ref(), em, deterministic)?;
+                    }
+                    backpatch_container_len_4b(dst, len_pos);
+                    return Ok(());
                 }
-                backpatch_container_len_4b(dst, len_pos);
-                return Ok(());
+            } else {
+                let mut elems_min = 0usize;
+                for m in items {
+                    let em = m.min_wire_size();
+                    elems_min =
+                        elems_min.saturating_add(container_len_width(em).saturating_add(em));
+                    if elems_min > 16_383 {
+                        break;
+                    }
+                }
+                let min_body = 1usize
+                    .saturating_add(varint_len(count as u64))
+                    .saturating_add(elems_min);
+                if min_body > 16_383 {
+                    dst.reserve(min_body.saturating_add(24));
+                    let len_pos = begin_tagged_array_4b(dst, field_num, WIRE_SUB_MSG, count);
+                    for item in items {
+                        write_sub_msg_elem(dst, item.as_ref(), deterministic)?;
+                    }
+                    backpatch_container_len_4b(dst, len_pos);
+                    return Ok(());
+                }
             }
         }
         let len_pos = begin_tagged_array(dst, field_num, WIRE_SUB_MSG, count);
@@ -2836,7 +3170,7 @@ pub mod codec {
         msg: &M,
         deterministic: bool,
     ) -> Result<()> {
-        let min_sub = if M::HAS_NESTED_CONTAINERS && dst.capacity() > 16_383 {
+        let min_sub = if dst.capacity() > 16_383 {
             msg.min_wire_size()
         } else {
             0

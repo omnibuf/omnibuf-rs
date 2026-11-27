@@ -336,7 +336,7 @@ pub fn write_bytes_tagged<const N: usize>(dst: &mut Vec<u8>, tag: [u8; N], b: &[
         let ptr = dst.as_mut_ptr().add(len);
         core::ptr::copy_nonoverlapping(tag.as_ptr(), ptr, N);
         let vn = put_varint_raw(ptr.add(N), blen as u64);
-        copy_bytes_fast(b.as_ptr(), ptr.add(N + vn), blen);
+        core::ptr::copy_nonoverlapping(b.as_ptr(), ptr.add(N + vn), blen);
         dst.set_len(len + N + vn + blen);
     }
 }
@@ -355,7 +355,7 @@ pub fn append_bytes_elem(dst: &mut Vec<u8>, b: &[u8]) {
     unsafe {
         let ptr = dst.as_mut_ptr().add(len);
         let vn = put_varint_raw(ptr, blen as u64);
-        copy_bytes_fast(b.as_ptr(), ptr.add(vn), blen);
+        core::ptr::copy_nonoverlapping(b.as_ptr(), ptr.add(vn), blen);
         dst.set_len(len + vn + blen);
     }
 }
